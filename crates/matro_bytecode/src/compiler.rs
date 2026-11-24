@@ -5,7 +5,7 @@ use matro_parser::{
 };
 use matro_types::{MatroError, Result, Value};
 
-use crate::op::{Chunk, ClassProto, FunctionProto, OpCode};
+use crate::op::{Chunk, ClassProto, CompiledArgSpec, FunctionProto, OpCode, PropProto};
 
 struct LoopContext {
     is_for: bool,
@@ -206,6 +206,11 @@ impl Compiler {
                     self.has_nested = true;
                     self.alloc_local(name);
                 }
+                StmtKind::Arguments { entries, .. } => {
+                    for e in entries {
+                        self.alloc_local(&e.target);
+                    }
+                }
                 StmtKind::Expr(_)
                 | StmtKind::ClassDef { .. }
                 | StmtKind::Global(_)
@@ -271,8 +276,51 @@ impl Compiler {
 
         sub.collect_locals_in_stmts(body);
 
+        let mut arg_specs = Vec::new();
         for s in body {
-            sub.compile_stmt(s)?;
+            if let StmtKind::Arguments { repeating, entries } = &s.kind {
+                for e in entries {
+                    let target_slot = sub.lookup_local(&e.target);
+                    let default = if let Some(expr) = &e.default {
+                        Some(Self::compile_standalone_expr(expr, "__arg_default")?)
+                    } else {
+                        None
+                    };
+                    let mut validators = Vec::with_capacity(e.validators.len());
+                    for (vname, vargs) in &e.validators {
+                        let mut chunks = Vec::with_capacity(vargs.len());
+                        for (idx, va) in vargs.iter().enumerate() {
+                            // In MATLAB `arguments`, `mustBeMember(opts.Mode, {...})` passes the target as arg 1
+                            if idx == 0 {
+                                let is_self_ref = match &va.kind {
+                                    ExprKind::Ident(id) => id == &e.target && e.field.is_none(),
+                                    ExprKind::FieldAccess { object, field } => {
+                                        matches!(&object.kind, ExprKind::Ident(id) if id == &e.target)
+                                            && e.field.as_deref() == Some(field.as_str())
+                                    }
+                                    _ => false,
+                                };
+                                if is_self_ref {
+                                    continue;
+                                }
+                            }
+                            chunks.push(Self::compile_standalone_expr(va, "__arg_default")?);
+                        }
+                        validators.push((vname.clone(), chunks));
+                    }
+                    arg_specs.push(CompiledArgSpec {
+                        target: e.target.clone(),
+                        target_slot,
+                        field: e.field.clone(),
+                        repeating: *repeating,
+                        class_name: e.class_name.clone(),
+                        validators,
+                        default,
+                    });
+                }
+            } else {
+                sub.compile_stmt(s)?;
+            }
         }
         sub.chunk.emit(OpCode::Return, 0);
 
@@ -287,9 +335,28 @@ impl Compiler {
             varargin_slot,
             varargout_slot,
             has_nested: sub.has_nested,
+            arg_specs,
             local_names: sub.local_names,
             chunk: sub.chunk,
         })
+    }
+
+    fn compile_standalone_expr(expr: &Expr, target_var: &str) -> Result<Chunk> {
+        let mut sub = Self {
+            chunk: Chunk::new(),
+            loops: Vec::new(),
+            locals: None,
+            local_names: Vec::new(),
+            globals_declared: HashSet::new(),
+            persistents_declared: HashSet::new(),
+            outer_locals: HashSet::new(),
+            has_nested: false,
+        };
+        sub.compile_expr(expr, 1, None)?;
+        let idx = sub.chunk.add_name(target_var);
+        sub.chunk.emit(OpCode::StoreVar(idx), expr.span.line as u32);
+        sub.chunk.emit(OpCode::Return, expr.span.line as u32);
+        Ok(sub.chunk)
     }
 
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<()> {
@@ -298,7 +365,21 @@ impl Compiler {
             StmtKind::Expr(expr) => {
                 if matches!(
                     &expr.kind,
-                    ExprKind::CallOrIndex { callee, .. } if matches!(callee.as_str(), "bode" | "step")
+                    ExprKind::CallOrIndex { callee, .. }
+                        if matches!(
+                            callee.as_str(),
+                            "bode"
+                                | "step"
+                                | "plot"
+                                | "semilogx"
+                                | "semilogy"
+                                | "loglog"
+                                | "scatter"
+                                | "bar"
+                                | "stem"
+                                | "dir"
+                                | "ls"
+                        )
                 ) {
                     self.compile_expr(expr, 0, None)?;
                     return Ok(());
@@ -852,36 +933,33 @@ impl Compiler {
             }
             StmtKind::ClassDef {
                 name,
-                superclass,
+                superclasses,
                 properties,
                 methods,
+                enumerations,
+                events,
             } => {
                 let mut compiled_props = Vec::with_capacity(properties.len());
-                for (prop_name, default_expr) in properties {
-                    let default_chunk = if let Some(expr) = default_expr {
-                        let mut sub = Self {
-                            chunk: Chunk::new(),
-                            loops: Vec::new(),
-                            locals: None,
-                            local_names: Vec::new(),
-                            globals_declared: HashSet::new(),
-                            persistents_declared: HashSet::new(),
-                            outer_locals: HashSet::new(),
-                            has_nested: false,
-                        };
-                        sub.compile_expr(expr, 1, None)?;
-                        let idx = sub.chunk.add_name("__prop_default");
-                        sub.chunk.emit(OpCode::StoreVar(idx), expr.span.line as u32);
-                        sub.chunk.emit(OpCode::Return, expr.span.line as u32);
-                        Some(sub.chunk)
+                for p in properties {
+                    let default_chunk = if let Some(expr) = &p.default {
+                        Some(Self::compile_standalone_expr(expr, "__prop_default")?)
                     } else {
                         None
                     };
-                    compiled_props.push((prop_name.clone(), default_chunk));
+                    compiled_props.push(PropProto {
+                        name: p.name.clone(),
+                        default: default_chunk,
+                        dependent: p.dependent,
+                        constant: p.constant,
+                    });
                 }
 
                 let mut compiled_methods = Vec::with_capacity(methods.len());
+                let mut static_methods = Vec::new();
                 for m in methods {
+                    if m.is_static {
+                        static_methods.push(m.name.clone());
+                    }
                     let proto = Self::compile_function_body(
                         m.name.clone(),
                         m.params.clone(),
@@ -891,14 +969,27 @@ impl Compiler {
                     compiled_methods.push(proto);
                 }
 
+                let mut compiled_enums = Vec::with_capacity(enumerations.len());
+                for (ename, eargs) in enumerations {
+                    let mut arg_chunks = Vec::with_capacity(eargs.len());
+                    for ea in eargs {
+                        arg_chunks.push(Self::compile_standalone_expr(ea, "__enum_arg")?);
+                    }
+                    compiled_enums.push((ename.clone(), arg_chunks));
+                }
+
                 let idx = self.chunk.add_class(ClassProto {
                     name: name.clone(),
-                    superclass: superclass.clone(),
+                    superclasses: superclasses.clone(),
                     properties: compiled_props,
                     methods: compiled_methods,
+                    static_methods,
+                    enumerations: compiled_enums,
+                    events: events.clone(),
                 });
                 self.chunk.emit(OpCode::DefineClass(idx), line);
             }
+            StmtKind::Arguments { .. } => {}
             StmtKind::Global(names) => {
                 for n in names {
                     self.globals_declared.insert(n.clone());
@@ -1064,8 +1155,31 @@ impl Compiler {
                 sub.chunk.emit(OpCode::StoreLocal(ret_slot), line);
                 sub.chunk.emit(OpCode::Return, line);
 
+                let proto_name = if params.len() == 1 && params[0] == "varargin" {
+                    if let ExprKind::CallOrIndex { callee, args } = &body.kind {
+                        if args.len() == 1
+                            && matches!(
+                                &args[0],
+                                IndexArg::Expr(Expr {
+                                    kind: ExprKind::CellIndex { target, indices },
+                                    ..
+                                }) if matches!(&target.kind, ExprKind::Ident(id) if id == "varargin")
+                                    && matches!(indices.as_slice(), [IndexArg::Colon])
+                            )
+                        {
+                            format!("@{callee}")
+                        } else {
+                            "<anonymous>".to_string()
+                        }
+                    } else {
+                        "<anonymous>".to_string()
+                    }
+                } else {
+                    "<anonymous>".to_string()
+                };
+
                 let proto = FunctionProto {
-                    name: "<anonymous>".to_string(),
+                    name: proto_name,
                     params: params.clone(),
                     returns: vec!["__anon_ret".to_string()],
                     param_slots,
@@ -1075,6 +1189,7 @@ impl Compiler {
                     varargin_slot,
                     varargout_slot: None,
                     has_nested: false,
+                    arg_specs: Vec::new(),
                     local_names: sub.local_names,
                     chunk: sub.chunk,
                 };

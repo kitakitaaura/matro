@@ -9,7 +9,7 @@ pub mod plot;
 pub mod sparse;
 
 pub use complex::Complex;
-pub use matrix::Matrix;
+pub use matrix::{Matrix, NumericClass};
 pub use plot::{PlotFigure, PlotKind, PlotPanel, PlotSeries};
 pub use sparse::SparseMatrix;
 
@@ -528,9 +528,10 @@ impl Value {
 
     pub fn type_name(&self) -> &str {
         match self {
-            Self::Matrix(m) if m.is_logical() => "logical",
-            Self::Matrix(m) if m.is_complex() => "complex double",
-            Self::Matrix(_) => "double",
+            Self::Matrix(m) if m.dtype() == NumericClass::Logical => "logical",
+            Self::Matrix(m) if m.dtype() == NumericClass::Single && m.is_complex() => "complex single",
+            Self::Matrix(m) if m.dtype() == NumericClass::Double && m.is_complex() => "complex double",
+            Self::Matrix(m) => m.dtype().name(),
             Self::Sparse(_) => "sparse double",
             Self::String(_) => "char",
             Self::Struct(_) | Self::StructArray(_) => "struct",

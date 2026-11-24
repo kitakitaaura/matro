@@ -37,6 +37,7 @@ pub struct PlotSeries {
     pub y: Vec<f64>,
     pub color: String,
     pub dashed: bool,
+    pub line_width: f64,
     pub label: Option<String>,
 }
 
@@ -87,6 +88,7 @@ pub struct PlotPanel {
     pub log_y: bool,
     pub xlim: Option<(f64, f64)>,
     pub ylim: Option<(f64, f64)>,
+    pub zlim: Option<(f64, f64)>,
     pub view_az: f64,
     pub view_el: f64,
     pub series: Vec<PlotSeries>,
@@ -110,6 +112,7 @@ impl Default for PlotPanel {
             log_y: false,
             xlim: None,
             ylim: None,
+            zlim: None,
             view_az: -37.5,
             view_el: 30.0,
             series: Vec::new(),
@@ -162,6 +165,7 @@ impl PlotPanel {
             y,
             color,
             dashed,
+            line_width: 1.8,
             label: None,
         });
     }
@@ -711,8 +715,8 @@ fn render_panel(svg: &mut String, panel: &PlotPanel, width: f64, height: f64) {
                     ""
                 };
                 svg.push_str(&format!(
-                    "<polyline fill=\"none\" stroke=\"{}\" stroke-width=\"1.8\" stroke-linejoin=\"round\" stroke-linecap=\"round\"{dash} points=\"{pts}\"/>",
-                    ser.color
+                    "<polyline fill=\"none\" stroke=\"{}\" stroke-width=\"{:.2}\" stroke-linejoin=\"round\" stroke-linecap=\"round\"{dash} points=\"{pts}\"/>",
+                    ser.color, ser.line_width
                 ));
             }
             PlotKind::Scatter => {

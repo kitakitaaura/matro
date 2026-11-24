@@ -99,6 +99,17 @@ pub enum OpCode {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct CompiledArgSpec {
+    pub target: String,
+    pub target_slot: Option<u16>,
+    pub field: Option<String>,
+    pub repeating: bool,
+    pub class_name: Option<String>,
+    pub validators: Vec<(String, Vec<Chunk>)>,
+    pub default: Option<Chunk>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct FunctionProto {
     pub name: String,
     pub params: Vec<String>,
@@ -114,18 +125,30 @@ pub struct FunctionProto {
     pub varargout_slot: Option<u16>,
     /// True if this function defines nested functions that share its mutable frame env.
     pub has_nested: bool,
+    /// Optional MATLAB `arguments ... end` validation & default specifications.
+    pub arg_specs: Vec<CompiledArgSpec>,
     /// Names of all local slots `0..local_names.len()` (for disassembly & closure capture).
     pub local_names: Vec<String>,
     pub chunk: Chunk,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct PropProto {
+    pub name: String,
+    pub default: Option<Chunk>,
+    pub dependent: bool,
+    pub constant: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ClassProto {
     pub name: String,
-    pub superclass: Option<String>,
-    /// `(property_name, optional_default_value_chunk)` where default chunk stores into `__prop_default`.
-    pub properties: Vec<(String, Option<Chunk>)>,
+    pub superclasses: Vec<String>,
+    pub properties: Vec<PropProto>,
     pub methods: Vec<FunctionProto>,
+    pub static_methods: Vec<String>,
+    pub enumerations: Vec<(String, Vec<Chunk>)>,
+    pub events: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

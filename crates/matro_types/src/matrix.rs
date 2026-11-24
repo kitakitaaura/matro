@@ -3,8 +3,158 @@ use std::fmt;
 use crate::complex::{Complex, format_complex, format_real};
 use crate::{MatroError, Result};
 
-/// Column-major N-D array supporting pure real (`im: None`), complex (`im: Some(...)`),
-/// and MATLAB logical mask semantics (`logical: true`).
+/// MATLAB numeric / logical element storage class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NumericClass {
+    #[default]
+    Double,
+    Single,
+    Logical,
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    Uint8,
+    Uint16,
+    Uint32,
+    Uint64,
+}
+
+impl NumericClass {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Double => "double",
+            Self::Single => "single",
+            Self::Logical => "logical",
+            Self::Int8 => "int8",
+            Self::Int16 => "int16",
+            Self::Int32 => "int32",
+            Self::Int64 => "int64",
+            Self::Uint8 => "uint8",
+            Self::Uint16 => "uint16",
+            Self::Uint32 => "uint32",
+            Self::Uint64 => "uint64",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "double" => Some(Self::Double),
+            "single" => Some(Self::Single),
+            "logical" => Some(Self::Logical),
+            "int8" => Some(Self::Int8),
+            "int16" => Some(Self::Int16),
+            "int32" => Some(Self::Int32),
+            "int64" => Some(Self::Int64),
+            "uint8" => Some(Self::Uint8),
+            "uint16" => Some(Self::Uint16),
+            "uint32" => Some(Self::Uint32),
+            "uint64" => Some(Self::Uint64),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn is_integer(self) -> bool {
+        matches!(
+            self,
+            Self::Int8
+                | Self::Int16
+                | Self::Int32
+                | Self::Int64
+                | Self::Uint8
+                | Self::Uint16
+                | Self::Uint32
+                | Self::Uint64
+        )
+    }
+
+    #[inline]
+    pub fn is_float(self) -> bool {
+        matches!(self, Self::Double | Self::Single)
+    }
+
+    #[inline]
+    pub fn clamp_round(self, v: f64) -> f64 {
+        match self {
+            Self::Double => v,
+            Self::Single => (v as f32) as f64,
+            Self::Logical => {
+                if v != 0.0 && !v.is_nan() {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            Self::Int8 => {
+                if v.is_nan() { 0.0 } else { v.round().clamp(i8::MIN as f64, i8::MAX as f64) }
+            }
+            Self::Int16 => {
+                if v.is_nan() { 0.0 } else { v.round().clamp(i16::MIN as f64, i16::MAX as f64) }
+            }
+            Self::Int32 => {
+                if v.is_nan() { 0.0 } else { v.round().clamp(i32::MIN as f64, i32::MAX as f64) }
+            }
+            Self::Int64 => {
+                if v.is_nan() { 0.0 } else { v.round().clamp(i64::MIN as f64, i64::MAX as f64) }
+            }
+            Self::Uint8 => {
+                if v.is_nan() { 0.0 } else { v.round().clamp(0.0, u8::MAX as f64) }
+            }
+            Self::Uint16 => {
+                if v.is_nan() { 0.0 } else { v.round().clamp(0.0, u16::MAX as f64) }
+            }
+            Self::Uint32 => {
+                if v.is_nan() { 0.0 } else { v.round().clamp(0.0, u32::MAX as f64) }
+            }
+            Self::Uint64 => {
+                if v.is_nan() { 0.0 } else { v.round().clamp(0.0, u64::MAX as f64) }
+            }
+        }
+    }
+
+    pub fn bounds(self) -> Option<(f64, f64)> {
+        match self {
+            Self::Int8 => Some((i8::MIN as f64, i8::MAX as f64)),
+            Self::Int16 => Some((i16::MIN as f64, i16::MAX as f64)),
+            Self::Int32 => Some((i32::MIN as f64, i32::MAX as f64)),
+            Self::Int64 => Some((i64::MIN as f64, i64::MAX as f64)),
+            Self::Uint8 => Some((0.0, u8::MAX as f64)),
+            Self::Uint16 => Some((0.0, u16::MAX as f64)),
+            Self::Uint32 => Some((0.0, u32::MAX as f64)),
+            Self::Uint64 => Some((0.0, u64::MAX as f64)),
+            _ => None,
+        }
+    }
+
+    /// Combine two numeric classes according to MATLAB arithmetic promotion rules.
+    pub fn combine(a: Self, b: Self) -> Result<Self> {
+        if a == b {
+            return Ok(if a == Self::Logical { Self::Double } else { a });
+        }
+        match (a, b) {
+            (Self::Logical, other) | (other, Self::Logical) => {
+                Ok(if other == Self::Logical { Self::Double } else { other })
+            }
+            (Self::Double, other) | (other, Self::Double) => Ok(other),
+            (x, y) if x.is_integer() && y.is_integer() => Err(MatroError::runtime(format!(
+                "Integers can only be combined with integers of the same class or scalar doubles (got {} and {})",
+                x.name(),
+                y.name()
+            ))),
+            (Self::Single, x) | (x, Self::Single) if x.is_integer() => {
+                Err(MatroError::runtime(format!(
+                    "Cannot combine {} and single directly",
+                    x.name()
+                )))
+            }
+            _ => Ok(Self::Double),
+        }
+    }
+}
+
+/// Column-major N-D array supporting real (`im: None`), complex (`im: Some(...)`),
+/// logical masks, `single`, and saturating MATLAB integer classes (`int8`..`uint64`).
 /// 2D matrices keep `extra_dims: None` for zero overhead; 3D+ arrays store `[d3, d4, ...]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Matrix {
@@ -13,7 +163,7 @@ pub struct Matrix {
     extra_dims: Option<Vec<usize>>,
     re: Vec<f64>,
     im: Option<Vec<f64>>,
-    logical: bool,
+    dtype: NumericClass,
 }
 
 impl Matrix {
@@ -46,7 +196,7 @@ impl Matrix {
             extra_dims,
             re: data,
             im: None,
-            logical: false,
+            dtype: NumericClass::Double,
         })
     }
 
@@ -83,7 +233,7 @@ impl Matrix {
             extra_dims,
             re,
             im: if has_imag { Some(im) } else { None },
-            logical: false,
+            dtype: NumericClass::Double,
         })
     }
 
@@ -157,7 +307,7 @@ impl Matrix {
             extra_dims: None,
             re: data,
             im: None,
-            logical: false,
+            dtype: NumericClass::Double,
         })
     }
 
@@ -182,7 +332,7 @@ impl Matrix {
             extra_dims: None,
             re,
             im: if has_imag { Some(im) } else { None },
-            logical: false,
+            dtype: NumericClass::Double,
         })
     }
 
@@ -206,7 +356,7 @@ impl Matrix {
             extra_dims: None,
             re,
             im: None,
-            logical: false,
+            dtype: NumericClass::Double,
         })
     }
 
@@ -217,7 +367,7 @@ impl Matrix {
             extra_dims: None,
             re: vec![v],
             im: None,
-            logical: false,
+            dtype: NumericClass::Double,
         }
     }
 
@@ -228,7 +378,7 @@ impl Matrix {
             extra_dims: None,
             re: vec![if b { 1.0 } else { 0.0 }],
             im: None,
-            logical: true,
+            dtype: NumericClass::Logical,
         }
     }
 
@@ -242,7 +392,7 @@ impl Matrix {
                 extra_dims: None,
                 re: vec![c.re],
                 im: Some(vec![c.im]),
-                logical: false,
+                dtype: NumericClass::Double,
             }
         }
     }
@@ -254,7 +404,7 @@ impl Matrix {
             extra_dims: None,
             re: Vec::new(),
             im: None,
-            logical: false,
+            dtype: NumericClass::Double,
         }
     }
 
@@ -265,7 +415,7 @@ impl Matrix {
             extra_dims: None,
             re: vec![0.0; rows * cols],
             im: None,
-            logical: false,
+            dtype: NumericClass::Double,
         }
     }
 
@@ -277,7 +427,7 @@ impl Matrix {
             extra_dims: None,
             re: vec![0.0; len],
             im: Some(vec![0.0; len]),
-            logical: false,
+            dtype: NumericClass::Double,
         }
     }
 
@@ -288,7 +438,7 @@ impl Matrix {
             extra_dims: None,
             re: vec![1.0; rows * cols],
             im: None,
-            logical: false,
+            dtype: NumericClass::Double,
         }
     }
 
@@ -310,7 +460,7 @@ impl Matrix {
             extra_dims: None,
             re: data,
             im: None,
-            logical: false,
+            dtype: NumericClass::Double,
         }
     }
 
@@ -323,7 +473,7 @@ impl Matrix {
             extra_dims: None,
             re: data,
             im: None,
-            logical: false,
+            dtype: NumericClass::Double,
         }
     }
 
@@ -343,7 +493,7 @@ impl Matrix {
             extra_dims: None,
             re,
             im,
-            logical: false,
+            dtype: NumericClass::Double,
         }
     }
 
@@ -363,26 +513,46 @@ impl Matrix {
             extra_dims: None,
             re,
             im,
-            logical: false,
+            dtype: NumericClass::Double,
         }
     }
 
     #[inline]
-    pub fn is_logical(&self) -> bool {
-        self.logical
+    pub fn dtype(&self) -> NumericClass {
+        self.dtype
     }
 
-    pub fn into_logical(mut self) -> Self {
-        self.logical = true;
-        self.im = None;
+    #[inline]
+    pub fn is_logical(&self) -> bool {
+        self.dtype == NumericClass::Logical
+    }
+
+    pub fn cast_to(mut self, target: NumericClass) -> Self {
+        self.dtype = target;
+        if target == NumericClass::Logical || target.is_integer() {
+            self.im = None;
+        }
         for v in &mut self.re {
-            *v = if *v != 0.0 && !v.is_nan() { 1.0 } else { 0.0 };
+            *v = target.clamp_round(*v);
+        }
+        if let Some(im) = &mut self.im {
+            for v in im {
+                *v = target.clamp_round(*v);
+            }
         }
         self
     }
 
+    pub fn into_logical(self) -> Self {
+        self.cast_to(NumericClass::Logical)
+    }
+
     pub fn with_logical(mut self, logical: bool) -> Self {
-        self.logical = logical;
+        self.dtype = if logical {
+            NumericClass::Logical
+        } else {
+            NumericClass::Double
+        };
         self
     }
 
@@ -407,7 +577,12 @@ impl Matrix {
 
     #[inline]
     pub fn is_real_non_logical_scalar(&self) -> Option<f64> {
-        if self.rows == 1 && self.cols == 1 && self.extra_dims.is_none() && self.im.is_none() && !self.logical {
+        if self.rows == 1
+            && self.cols == 1
+            && self.extra_dims.is_none()
+            && self.im.is_none()
+            && self.dtype == NumericClass::Double
+        {
             Some(self.re[0])
         } else {
             None
@@ -416,7 +591,12 @@ impl Matrix {
 
     #[inline]
     pub fn set_scalar_in_place(&mut self, val: f64) -> bool {
-        if self.rows == 1 && self.cols == 1 && self.extra_dims.is_none() && self.im.is_none() && !self.logical {
+        if self.rows == 1
+            && self.cols == 1
+            && self.extra_dims.is_none()
+            && self.im.is_none()
+            && self.dtype == NumericClass::Double
+        {
             self.re[0] = val;
             true
         } else {
@@ -547,7 +727,7 @@ impl Matrix {
             extra_dims: self.extra_dims.clone(),
             re: self.re.clone(),
             im: None,
-            logical: false,
+            dtype: NumericClass::Double,
         }
     }
 
@@ -562,7 +742,7 @@ impl Matrix {
             extra_dims: self.extra_dims.clone(),
             re: data,
             im: None,
-            logical: false,
+            dtype: NumericClass::Double,
         }
     }
 
@@ -575,7 +755,7 @@ impl Matrix {
                 extra_dims: self.extra_dims.clone(),
                 re: self.re.clone(),
                 im: Some(im.iter().map(|&x| -x).collect()),
-                logical: false,
+                dtype: NumericClass::Double,
             },
         }
     }
@@ -587,7 +767,7 @@ impl Matrix {
             extra_dims: self.extra_dims.clone(),
             re: self.re.iter().map(|&x| f(x)).collect(),
             im: None,
-            logical: false,
+            dtype: NumericClass::Double,
         }
     }
 
@@ -609,7 +789,7 @@ impl Matrix {
             extra_dims: self.extra_dims.clone(),
             re,
             im: if any_im { Some(im) } else { None },
-            logical: false,
+            dtype: NumericClass::Double,
         }
     }
 
@@ -621,7 +801,7 @@ impl Matrix {
             extra_dims: self.extra_dims.clone(),
             re,
             im: None,
-            logical: false,
+            dtype: NumericClass::Double,
         }
     }
 
@@ -640,7 +820,7 @@ impl Matrix {
                 extra_dims: self.extra_dims.clone(),
                 re,
                 im: None,
-                logical: false,
+                dtype: NumericClass::Double,
             });
         }
         if let Some(a) = self.as_scalar() {
@@ -672,8 +852,17 @@ impl Matrix {
         )))
     }
 
-    /// Complex-aware element-wise binary operation with full N-D & singleton broadcasting.
+    /// Complex-aware element-wise binary operation with full N-D & singleton broadcasting,
+    /// preserving MATLAB integer saturation and single-precision promotion rules.
     pub fn elementwise_c(&self, other: &Self, f: impl Fn(Complex, Complex) -> Complex) -> Result<Self> {
+        let out_dtype = NumericClass::combine(self.dtype, other.dtype)?;
+        let finish = |m: Self| -> Self {
+            if out_dtype == NumericClass::Double {
+                m.normalize()
+            } else {
+                m.cast_to(out_dtype).normalize()
+            }
+        };
         if self.dims() == other.dims() {
             let mut re = Vec::with_capacity(self.len());
             let mut im = Vec::with_capacity(self.len());
@@ -686,21 +875,20 @@ impl Matrix {
                     any_im = true;
                 }
             }
-            return Ok(Self {
+            return Ok(finish(Self {
                 rows: self.rows,
                 cols: self.cols,
                 extra_dims: self.extra_dims.clone(),
                 re,
                 im: if any_im { Some(im) } else { None },
-                logical: false,
-            }
-            .normalize());
+                dtype: NumericClass::Double,
+            }));
         }
         if let Some(a) = self.as_complex_scalar() {
-            return Ok(other.map_c(|b| f(a, b)).normalize());
+            return Ok(finish(other.map_c(|b| f(a, b))));
         }
         if let Some(b) = other.as_complex_scalar() {
-            return Ok(self.map_c(|a| f(a, b)).normalize());
+            return Ok(finish(self.map_c(|a| f(a, b))));
         }
         let rows_ok = self.rows == other.rows || self.rows == 1 || other.rows == 1;
         let cols_ok = self.cols == other.cols || self.cols == 1 || other.cols == 1;
@@ -732,7 +920,7 @@ impl Matrix {
                     out.set_c(r, c, f(self.get_c(r1, c1), other.get_c(r2, c2)));
                 }
             }
-            return Ok(out.normalize());
+            return Ok(finish(out));
         }
 
         // General N-D implicit broadcasting (MATLAB R2016b+)
@@ -918,14 +1106,30 @@ impl Matrix {
                 }
             }
         }
-        Ok(Self {
+        let first_dtype = non_empty[0].dtype;
+        let out_dtype = if non_empty.iter().all(|m| m.dtype == first_dtype) {
+            first_dtype
+        } else if let Some(non_dbl) = non_empty
+            .iter()
+            .map(|m| m.dtype)
+            .find(|&d| d != NumericClass::Double && d != NumericClass::Logical)
+        {
+            non_dbl
+        } else {
+            NumericClass::Double
+        };
+        let mut out = Self {
             rows,
             cols: total_cols,
             extra_dims: None,
             re,
             im,
-            logical: non_empty.iter().all(|m| m.logical),
-        })
+            dtype: NumericClass::Double,
+        };
+        if out_dtype != NumericClass::Double {
+            out = out.cast_to(out_dtype);
+        }
+        Ok(out)
     }
 
     /// Vertical concatenation `[A; B; ...]`.

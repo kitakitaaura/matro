@@ -237,6 +237,7 @@
       <option value="stiff_dsp">Example: Stiff ODE15s, Filter, Regexp &amp; File I/O</option>
       <option value="surf_tables">Example: 3D Surf, Tables, Map &amp; Nested Closures</option>
       <option value="toolboxes">Example: Toolboxes (Butterworth, PCA, fsolve, Bode)</option>
+      <option value="core_full">Example: Spline/PCHIP, BVP4C, OOP Overloads &amp; Handle Graphics</option>
       <option value="linalg">Example: Linear Algebra (LU / QR / SVD / Eig)</option>
       <option value="fft">Example: Complex &amp; FFT</option>
       <option value="vfs">Example: Multi-file VFS, Masks &amp; Solvers</option>
@@ -604,6 +605,70 @@ rot = [0 -1; 1 0];
 eigs_rot = eig(rot)
 z = 3 + 4i;
 fprintf('|3 + 4i| = %.2f, conj = %s\\n', abs(z), z');
+`
+      },
+      core_full: {
+        files: {},
+        code: `% Core MATLAB: arguments, OOP overloads, datetime, spline/pchip, bvp4c & handle graphics
+classdef Vec2
+    properties
+        x = 0
+        y = 0
+    end
+    properties (Dependent)
+        Norm
+    end
+    methods
+        function obj = Vec2(x, y)
+            if nargin >= 1, obj.x = x; end
+            if nargin >= 2, obj.y = y; end
+        end
+        function n = get.Norm(obj)
+            n = sqrt(obj.x^2 + obj.y^2);
+        end
+        function r = plus(a, b)
+            r = Vec2(a.x + b.x, a.y + b.y);
+        end
+    end
+end
+
+function out = evalCurve(xq, opts)
+    arguments
+        xq double {mustBeFinite}
+        opts.Scale (1,1) double {mustBePositive} = 1
+    end
+    out = opts.Scale * sin(xq);
+end
+
+v = Vec2(3, 4) + Vec2(1, -1);
+t0 = datetime(2026, 11, 24, 9, 0, 0) + hours(3);
+fprintf('Vec2 sum = (%.0f, %.0f), Norm = %.3f | Hour = %d\\n', v.x, v.y, v.Norm, hour(t0));
+fprintf('Saturating uint8(200) + uint8(100) = %d\\n', double(uint8(200) + uint8(100)));
+
+% 1. Step interpolation: PCHIP (monotone) vs Not-a-Knot Cubic Spline
+subplot(2, 1, 1);
+xk = [0, 1, 2, 3, 4, 5];
+yk = [0, 0, 0, 1, 1, 1];
+xq = linspace(0, 5, 80);
+h1 = plot(xq, pchip(xk, yk, xq), LineWidth=2.5, Color='#0072bd', DisplayName='PCHIP');
+hold('on');
+h2 = plot(xq, spline(xk, yk, xq), LineStyle='--', LineWidth=1.8, Color='#d95319', DisplayName='Spline');
+scatter(xk, yk, 'k');
+legend('PCHIP (monotone)', 'Cubic Spline');
+title('PCHIP vs Not-a-Knot Cubic Spline (Handle Graphics)');
+
+% 2. Two-point BVP (bvp4c): y'' + y = 0, y(0) = 0, y(pi/2) = 1
+subplot(2, 1, 2);
+sol = bvp4c(@(x, y) [y(2); -y(1)], @(ya, yb) [ya(1); yb(1) - 1], bvpinit(linspace(0, pi/2, 11), [0.5; 0.5]));
+xf = linspace(0, pi/2, 50);
+yf = deval(sol, xf);
+h3 = plot(xf, yf(1, :), LineWidth=2.2);
+set(h3, 'Color', '#77ac30', 'DisplayName', 'bvp4c y(x)');
+hold('on');
+plot(xf, evalCurve(xf, Scale=1), 'k--');
+legend('bvp4c', 'exact sin(x)');
+title('bvp4c Lobatto IIIA Collocation Solution');
+fprintf('bvp4c max error vs sin(x): %.2e\\n', max(abs(yf(1, :) - sin(xf))));
 `
       },
       vfs: {

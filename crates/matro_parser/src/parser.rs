@@ -111,6 +111,16 @@ impl Parser {
                 self.bump();
                 StmtKind::Return
             }
+            TokenKind::Ident(kw)
+                if kw == "arguments"
+                    && matches!(
+                        self.peek_at(1).kind(),
+                        TokenKind::Newline | TokenKind::Semicolon | TokenKind::LParen
+                    )
+                    && self.looks_like_arguments_block() =>
+            {
+                self.parse_arguments_block()?
+            }
             _ => self.parse_expr_or_assign()?,
         };
 
@@ -283,7 +293,7 @@ impl Parser {
             self.bump(); // `=`
         }
 
-        let name = match self.bump() {
+        let mut name = match self.bump() {
             Token {
                 kind: TokenKind::Ident(n),
                 ..
@@ -292,6 +302,14 @@ impl Parser {
                 return Err(MatroError::syntax(other.span, "Expected function name"));
             }
         };
+        // Support `get.Prop` and `set.Prop` property accessor method names
+        if *self.peek_kind() == TokenKind::Dot && (name == "get" || name == "set") {
+            self.bump();
+            if let TokenKind::Ident(prop) = self.bump().kind {
+                name.push('.');
+                name.push_str(&prop);
+            }
+        }
 
         let mut params = Vec::new();
         if *self.peek_kind() == TokenKind::LParen {
@@ -326,46 +344,71 @@ impl Parser {
 
     fn parse_classdef(&mut self) -> Result<StmtKind> {
         self.bump(); // `classdef`
+        if *self.peek_kind() == TokenKind::LParen {
+            self.skip_paren_group()?;
+        }
         let name = match self.bump() {
             Token {
                 kind: TokenKind::Ident(n),
                 ..
             } => n,
             other => {
-                return Err(MatroError::syntax(other.span, "Expected class name after 'classdef'"));
+                return Err(MatroError::syntax(
+                    other.span,
+                    "Expected class name after 'classdef'",
+                ));
             }
         };
-        // Optional inheritance `< Base`
-        let superclass = if *self.peek_kind() == TokenKind::Lt {
+        // Optional single or multiple inheritance: `< Base1 & Base2 & pkg.Mixin`
+        let mut superclasses = Vec::new();
+        if *self.peek_kind() == TokenKind::Lt {
             self.bump();
-            match self.bump() {
-                Token {
-                    kind: TokenKind::Ident(sup),
-                    ..
-                } => Some(sup),
-                other => {
-                    return Err(MatroError::syntax(
-                        other.span,
-                        "Expected superclass name after '<'",
-                    ));
+            loop {
+                let mut sup = match self.bump() {
+                    Token {
+                        kind: TokenKind::Ident(s),
+                        ..
+                    } => s,
+                    other => {
+                        return Err(MatroError::syntax(
+                            other.span,
+                            "Expected superclass name after '<' or '&'",
+                        ));
+                    }
+                };
+                while *self.peek_kind() == TokenKind::Dot {
+                    self.bump();
+                    if let TokenKind::Ident(part) = self.bump().kind {
+                        sup.push('.');
+                        sup.push_str(&part);
+                    }
+                }
+                superclasses.push(sup);
+                if *self.peek_kind() == TokenKind::Amp {
+                    self.bump();
+                } else {
+                    break;
                 }
             }
-        } else {
-            None
-        };
+        }
         self.skip_separators();
 
         let mut properties = Vec::new();
         let mut methods = Vec::new();
+        let mut enumerations = Vec::new();
+        let mut events = Vec::new();
 
         while *self.peek_kind() != TokenKind::End && *self.peek_kind() != TokenKind::Eof {
             match self.peek_kind().clone() {
                 TokenKind::Ident(ref kw) if kw == "properties" => {
                     self.bump();
-                    // Optional attributes `(Access = public)`
-                    if *self.peek_kind() == TokenKind::LParen {
-                        self.skip_paren_group()?;
-                    }
+                    let attrs = if *self.peek_kind() == TokenKind::LParen {
+                        self.parse_attr_names()?
+                    } else {
+                        Vec::new()
+                    };
+                    let dependent = attrs.iter().any(|a| a.eq_ignore_ascii_case("Dependent"));
+                    let constant = attrs.iter().any(|a| a.eq_ignore_ascii_case("Constant"));
                     self.skip_separators();
                     while *self.peek_kind() != TokenKind::End && *self.peek_kind() != TokenKind::Eof
                     {
@@ -381,22 +424,40 @@ impl Parser {
                                 ));
                             }
                         };
-                        let default_expr = if *self.peek_kind() == TokenKind::Assign {
+                        // Optional MATLAB property size/type/validator annotations before `=`
+                        if *self.peek_kind() == TokenKind::LParen {
+                            self.skip_paren_group()?;
+                        }
+                        if matches!(self.peek_kind(), TokenKind::Ident(_)) {
+                            self.bump();
+                        }
+                        if *self.peek_kind() == TokenKind::LBrace {
+                            self.skip_brace_group()?;
+                        }
+                        let default = if *self.peek_kind() == TokenKind::Assign {
                             self.bump();
                             Some(self.parse_expr()?)
                         } else {
                             None
                         };
-                        properties.push((prop_name, default_expr));
+                        properties.push(PropDef {
+                            name: prop_name,
+                            default,
+                            dependent,
+                            constant,
+                        });
                         self.skip_separators();
                     }
                     self.expect(TokenKind::End, "'end' for properties block")?;
                 }
                 TokenKind::Ident(ref kw) if kw == "methods" => {
                     self.bump();
-                    if *self.peek_kind() == TokenKind::LParen {
-                        self.skip_paren_group()?;
-                    }
+                    let attrs = if *self.peek_kind() == TokenKind::LParen {
+                        self.parse_attr_names()?
+                    } else {
+                        Vec::new()
+                    };
+                    let is_static = attrs.iter().any(|a| a.eq_ignore_ascii_case("Static"));
                     self.skip_separators();
                     while *self.peek_kind() != TokenKind::End && *self.peek_kind() != TokenKind::Eof
                     {
@@ -413,6 +474,7 @@ impl Parser {
                                     params,
                                     returns,
                                     body,
+                                    is_static,
                                 });
                             }
                         } else {
@@ -425,10 +487,62 @@ impl Parser {
                     }
                     self.expect(TokenKind::End, "'end' for methods block")?;
                 }
+                TokenKind::Ident(ref kw) if kw == "enumeration" => {
+                    self.bump();
+                    self.skip_separators();
+                    while *self.peek_kind() != TokenKind::End && *self.peek_kind() != TokenKind::Eof
+                    {
+                        let ename = match self.bump() {
+                            Token {
+                                kind: TokenKind::Ident(e),
+                                ..
+                            } => e,
+                            other => {
+                                return Err(MatroError::syntax(
+                                    other.span,
+                                    "Expected enumeration member name",
+                                ));
+                            }
+                        };
+                        let mut eargs = Vec::new();
+                        if *self.peek_kind() == TokenKind::LParen {
+                            self.bump();
+                            while *self.peek_kind() != TokenKind::RParen
+                                && *self.peek_kind() != TokenKind::Eof
+                            {
+                                eargs.push(self.parse_expr()?);
+                                if *self.peek_kind() == TokenKind::Comma {
+                                    self.bump();
+                                } else {
+                                    break;
+                                }
+                            }
+                            self.expect(TokenKind::RParen, "')'")?;
+                        }
+                        enumerations.push((ename, eargs));
+                        self.skip_separators();
+                    }
+                    self.expect(TokenKind::End, "'end' for enumeration block")?;
+                }
+                TokenKind::Ident(ref kw) if kw == "events" => {
+                    self.bump();
+                    if *self.peek_kind() == TokenKind::LParen {
+                        self.skip_paren_group()?;
+                    }
+                    self.skip_separators();
+                    while *self.peek_kind() != TokenKind::End && *self.peek_kind() != TokenKind::Eof
+                    {
+                        if let TokenKind::Ident(ev) = self.bump().kind {
+                            events.push(ev);
+                        }
+                        self.skip_separators();
+                    }
+                    self.expect(TokenKind::End, "'end' for events block")?;
+                }
                 _ => {
                     return Err(MatroError::syntax(
                         self.peek().span,
-                        "Expected 'properties', 'methods', or 'end' in classdef",
+                        "Expected 'properties', 'methods', 'enumeration', 'events', or 'end' in classdef",
                     ));
                 }
             }
@@ -437,10 +551,157 @@ impl Parser {
         self.expect(TokenKind::End, "'end' for classdef")?;
         Ok(StmtKind::ClassDef {
             name,
-            superclass,
+            superclasses,
             properties,
             methods,
+            enumerations,
+            events,
         })
+    }
+
+    fn parse_attr_names(&mut self) -> Result<Vec<String>> {
+        self.expect(TokenKind::LParen, "'('")?;
+        let mut names = Vec::new();
+        let mut depth = 1usize;
+        while depth > 0 && *self.peek_kind() != TokenKind::Eof {
+            match self.bump().kind {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => depth -= 1,
+                TokenKind::Ident(n) if depth == 1 => names.push(n),
+                _ => {}
+            }
+        }
+        Ok(names)
+    }
+
+    fn skip_brace_group(&mut self) -> Result<()> {
+        self.expect(TokenKind::LBrace, "'{'")?;
+        let mut depth = 1usize;
+        while depth > 0 && *self.peek_kind() != TokenKind::Eof {
+            match self.bump().kind {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => depth -= 1,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn looks_like_arguments_block(&self) -> bool {
+        match self.peek_at(1).kind() {
+            TokenKind::Newline | TokenKind::Semicolon => true,
+            TokenKind::LParen => matches!(
+                self.peek_at(2).kind(),
+                TokenKind::Ident(s) if s.eq_ignore_ascii_case("Repeating")
+                    || s.eq_ignore_ascii_case("Input")
+                    || s.eq_ignore_ascii_case("Output")
+            ),
+            _ => false,
+        }
+    }
+
+    fn parse_arguments_block(&mut self) -> Result<StmtKind> {
+        self.bump(); // `arguments`
+        let attrs = if *self.peek_kind() == TokenKind::LParen {
+            self.parse_attr_names()?
+        } else {
+            Vec::new()
+        };
+        let repeating = attrs.iter().any(|a| a.eq_ignore_ascii_case("Repeating"));
+        self.skip_separators();
+
+        let mut entries = Vec::new();
+        while *self.peek_kind() != TokenKind::End && *self.peek_kind() != TokenKind::Eof {
+            let target = match self.bump() {
+                Token {
+                    kind: TokenKind::Ident(n),
+                    ..
+                } => n,
+                other => {
+                    return Err(MatroError::syntax(
+                        other.span,
+                        "Expected argument name inside 'arguments' block",
+                    ));
+                }
+            };
+            let field = if *self.peek_kind() == TokenKind::Dot {
+                self.bump();
+                match self.bump() {
+                    Token {
+                        kind: TokenKind::Ident(f),
+                        ..
+                    } => Some(f),
+                    other => {
+                        return Err(MatroError::syntax(
+                            other.span,
+                            "Expected field name after '.' in 'arguments' block",
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            // Optional size spec `(1, 1)` or `(1, :)`
+            if *self.peek_kind() == TokenKind::LParen {
+                self.skip_paren_group()?;
+            }
+            // Optional class name (`double`, `string`, `char`, etc.)
+            let class_name = if let TokenKind::Ident(cn) = self.peek_kind().clone() {
+                self.bump();
+                Some(cn)
+            } else {
+                None
+            };
+            // Optional validator cell `{mustBePositive, mustBeMember(x, {'a','b'})}`
+            let mut validators = Vec::new();
+            if *self.peek_kind() == TokenKind::LBrace {
+                self.bump();
+                while *self.peek_kind() != TokenKind::RBrace && *self.peek_kind() != TokenKind::Eof
+                {
+                    if let TokenKind::Ident(vname) = self.peek_kind().clone() {
+                        self.bump();
+                        let mut vargs = Vec::new();
+                        if *self.peek_kind() == TokenKind::LParen {
+                            self.bump();
+                            while *self.peek_kind() != TokenKind::RParen
+                                && *self.peek_kind() != TokenKind::Eof
+                            {
+                                vargs.push(self.parse_expr()?);
+                                if *self.peek_kind() == TokenKind::Comma {
+                                    self.bump();
+                                } else {
+                                    break;
+                                }
+                            }
+                            self.expect(TokenKind::RParen, "')'")?;
+                        }
+                        validators.push((vname, vargs));
+                    } else {
+                        self.bump();
+                    }
+                    if *self.peek_kind() == TokenKind::Comma {
+                        self.bump();
+                    }
+                }
+                self.expect(TokenKind::RBrace, "'}'")?;
+            }
+            let default = if *self.peek_kind() == TokenKind::Assign {
+                self.bump();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            entries.push(ArgSpec {
+                target,
+                field,
+                class_name,
+                validators,
+                default,
+            });
+            self.skip_separators();
+        }
+        self.expect(TokenKind::End, "'end' for arguments block")?;
+        Ok(StmtKind::Arguments { repeating, entries })
     }
 
     fn parse_scope_decl(&mut self, is_persistent: bool) -> Result<StmtKind> {
@@ -1038,6 +1299,21 @@ impl Parser {
             {
                 self.bump();
                 args.push(IndexArg::Colon);
+            } else if close == TokenKind::RParen
+                && matches!(self.peek_kind(), TokenKind::Ident(_))
+                && *self.peek_at(1).kind() == TokenKind::Assign
+            {
+                // MATLAB R2021a+ Name=Value argument syntax: desugar `Key=Val` -> `'Key', Val`
+                let key_tok = self.bump();
+                self.bump(); // `=`
+                let val_expr = self.parse_expr()?;
+                if let TokenKind::Ident(k) = key_tok.kind {
+                    args.push(IndexArg::Expr(Expr {
+                        kind: ExprKind::String(k),
+                        span: key_tok.span,
+                    }));
+                }
+                args.push(IndexArg::Expr(val_expr));
             } else {
                 args.push(IndexArg::Expr(self.parse_expr()?));
             }

@@ -2,13 +2,18 @@ use std::collections::BTreeMap;
 
 use matro_loader::ModuleLoader;
 use matro_types::{
-    CellArray, Complex, MatroError, Matrix, PlotFigure, PlotKind, Result, Rng, SparseMatrix, Value,
+    CellArray, Complex, MatroError, Matrix, NumericClass, PlotFigure, PlotKind, Result, Rng,
+    SparseMatrix, Value,
 };
 
 mod extras;
+pub mod fs_media;
+pub mod interp;
+pub mod modern_types;
 mod opt_ctrl;
 mod regex;
 mod signal;
+mod sparse_eig;
 mod stats;
 pub mod tables;
 
@@ -49,8 +54,46 @@ pub fn call_intrinsic(
         "angle" => fn_unary_mat(name, args, |m| Ok(m.map_c_to_real(Complex::arg))),
         "isreal" => fn_isreal(args),
 
-        // Logical & predicate helpers
-        "logical" => fn_unary_mat(name, args, |m| Ok(m.clone().into_logical())),
+        // Logical, numeric class casting & type predicates
+        "logical" => fn_cast_class("logical", args, NumericClass::Logical),
+        "double" => fn_cast_class("double", args, NumericClass::Double),
+        "char" => fn_char(args),
+        "single" => fn_cast_class("single", args, NumericClass::Single),
+        "int8" => fn_cast_class("int8", args, NumericClass::Int8),
+        "int16" => fn_cast_class("int16", args, NumericClass::Int16),
+        "int32" => fn_cast_class("int32", args, NumericClass::Int32),
+        "int64" => fn_cast_class("int64", args, NumericClass::Int64),
+        "uint8" => fn_cast_class("uint8", args, NumericClass::Uint8),
+        "uint16" => fn_cast_class("uint16", args, NumericClass::Uint16),
+        "uint32" => fn_cast_class("uint32", args, NumericClass::Uint32),
+        "uint64" => fn_cast_class("uint64", args, NumericClass::Uint64),
+        "cast" => fn_cast_named(args),
+        "intmin" => fn_int_bound("intmin", args, false),
+        "intmax" => fn_int_bound("intmax", args, true),
+        "isinteger" => fn_val_pred("isinteger", args, |v| {
+            matches!(v, Value::Matrix(m) if m.dtype().is_integer())
+        }),
+        "isfloat" => fn_val_pred("isfloat", args, |v| {
+            matches!(v, Value::Matrix(m) if m.dtype().is_float()) || matches!(v, Value::Sparse(_))
+        }),
+        "isnumeric" => fn_val_pred("isnumeric", args, |v| {
+            matches!(v, Value::Matrix(m) if m.dtype() != NumericClass::Logical)
+                || matches!(v, Value::Sparse(_))
+        }),
+        "islogical" => fn_val_pred("islogical", args, |v| {
+            matches!(v, Value::Matrix(m) if m.dtype() == NumericClass::Logical)
+        }),
+        "ischar" => fn_val_pred("ischar", args, |v| matches!(v, Value::String(_))),
+        "iscell" => fn_val_pred("iscell", args, |v| matches!(v, Value::Cell(_))),
+        "isstruct" => fn_val_pred("isstruct", args, |v| {
+            matches!(v, Value::Struct(_) | Value::StructArray(_))
+        }),
+        "bitand" => fn_bit_bin("bitand", args, |a, b| a & b),
+        "bitor" => fn_bit_bin("bitor", args, |a, b| a | b),
+        "bitxor" => fn_bit_bin("bitxor", args, |a, b| a ^ b),
+        "bitshift" => fn_bitshift(args),
+        "bitget" => fn_bitget(args),
+        "bitset" => fn_bitset(args),
         "find" => fn_find(args, nargout),
         "any" => fn_any_all(name, args, false),
         "all" => fn_any_all(name, args, true),
@@ -69,6 +112,7 @@ pub fn call_intrinsic(
         "linspace" => fn_linspace(args),
         "logspace" => fn_logspace(args),
         "meshgrid" => fn_meshgrid(args),
+        "ndgrid" => fn_ndgrid(args),
         "diag" => fn_diag(args),
         "magic" => fn_magic(args),
         "cell" => fn_cell(args),
@@ -96,7 +140,7 @@ pub fn call_intrinsic(
         "lower" => fn_str1(name, args, str::to_lowercase),
         "strfind" => extras::fn_strfind(args),
         "strrep" => extras::fn_strrep(args),
-        "startsWith" | "endsWith" | "contains" => extras::fn_str_pred(name, args),
+        "contains" => extras::fn_str_pred(name, args),
         "regexp" => regex::fn_regexp(args, false),
         "regexpi" => regex::fn_regexp(args, true),
         "regexprep" => regex::fn_regexprep(args),
@@ -131,6 +175,8 @@ pub fn call_intrinsic(
         "qr" => fn_qr(args, nargout),
         "svd" => fn_svd(args, nargout),
         "eig" => fn_eig(args, nargout),
+        "eigs" => sparse_eig::fn_eigs(args, nargout, ctx.rng),
+        "svds" => sparse_eig::fn_svds(args, nargout, ctx.rng),
         "chol" => fn_unary_mat(name, args, |m| m.chol()),
         "rank" => fn_rank(args),
         "cond" => fn_cond(args),
@@ -148,8 +194,13 @@ pub fn call_intrinsic(
         "conv" => fn_conv(args),
         "conv2" => extras::fn_conv2(args),
         "filter" => extras::fn_filter(args),
-        "interp1" => fn_interp1(args),
+        "interp1" => interp::fn_interp1(args),
         "interp2" => extras::fn_interp2(args),
+        "pchip" => interp::fn_pchip(args),
+        "spline" => interp::fn_spline(args),
+        "mkpp" => interp::fn_mkpp(args),
+        "ppval" => interp::fn_ppval(args),
+        "griddedInterpolant" => interp::fn_gridded_interpolant(args),
         "sort" => fn_sort(args, nargout),
         "unique" => extras::fn_unique(args),
         "ismember" => extras::fn_ismember(args),
@@ -262,6 +313,48 @@ pub fn call_intrinsic(
         "keys" => tables::fn_keys(args),
         "values" => tables::fn_values(args),
 
+        // Modern MATLAB data types: datetime, duration, categorical, timetable, string arrays
+        "datetime" => modern_types::fn_datetime(args),
+        "duration" => modern_types::fn_duration(args),
+        "seconds" => modern_types::fn_duration_unit("seconds", args, 1.0),
+        "milliseconds" => modern_types::fn_duration_unit("milliseconds", args, 1e-3),
+        "minutes" => modern_types::fn_duration_unit("minutes", args, 60.0),
+        "hours" => modern_types::fn_duration_unit("hours", args, 3600.0),
+        "days" => modern_types::fn_duration_unit("days", args, 86400.0),
+        "year" => modern_types::fn_datetime_part(args, "Year"),
+        "month" => modern_types::fn_datetime_part(args, "Month"),
+        "day" => modern_types::fn_datetime_part(args, "Day"),
+        "hour" => modern_types::fn_datetime_part(args, "Hour"),
+        "minute" => modern_types::fn_datetime_part(args, "Minute"),
+        "second" => modern_types::fn_datetime_part(args, "Second"),
+        "posixtime" => modern_types::fn_datetime_part(args, "EpochSec"),
+        "datestr" => modern_types::fn_datetime_part(args, "datestr"),
+        "isdatetime" => fn_val_pred("isdatetime", args, |v| {
+            matches!(v, Value::Object(o) if o.class_name == "datetime")
+        }),
+        "isduration" => fn_val_pred("isduration", args, |v| {
+            matches!(v, Value::Object(o) if o.class_name == "duration")
+        }),
+        "categorical" => modern_types::fn_categorical(args),
+        "categories" => modern_types::fn_categories(args),
+        "countcats" => modern_types::fn_countcats(args),
+        "iscategorical" => fn_val_pred("iscategorical", args, |v| {
+            matches!(v, Value::Object(o) if o.class_name == "categorical")
+        }),
+        "timetable" => modern_types::fn_timetable(args),
+        "string" => modern_types::fn_string(args),
+        "isstring" => fn_val_pred("isstring", args, |v| {
+            matches!(v, Value::Object(o) if o.class_name == "string")
+        }),
+        "strlength" => modern_types::fn_strlength(args),
+        "split" => modern_types::fn_split(args),
+        "join" => modern_types::fn_join(args),
+        "startsWith" => modern_types::fn_starts_ends_with("startsWith", args, false),
+        "endsWith" => modern_types::fn_starts_ends_with("endsWith", args, true),
+        "erase" => modern_types::fn_erase(args),
+        "strip" => modern_types::fn_strip(args),
+        "replace" => extras::fn_strrep(args),
+
         // Functional operator builtins (useful with bsxfun / @plus / etc.)
         "plus" => tables::fn_binop_c("plus", args, |a, b| a + b),
         "minus" => tables::fn_binop_c("minus", args, |a, b| a - b),
@@ -276,14 +369,14 @@ pub fn call_intrinsic(
         "gt" => tables::fn_binop_cmp("gt", args, |a, b| a > b),
         "ge" => tables::fn_binop_cmp("ge", args, |a, b| a >= b),
 
-        // Plotting
-        "plot" => fn_plot(PlotKind::Line, args, ctx.figure, false, false),
-        "semilogx" => fn_plot(PlotKind::Line, args, ctx.figure, true, false),
-        "semilogy" => fn_plot(PlotKind::Line, args, ctx.figure, false, true),
-        "loglog" => fn_plot(PlotKind::Line, args, ctx.figure, true, true),
-        "scatter" => fn_plot(PlotKind::Scatter, args, ctx.figure, false, false),
-        "bar" => fn_plot(PlotKind::Bar, args, ctx.figure, false, false),
-        "stem" => fn_plot(PlotKind::Stem, args, ctx.figure, false, false),
+        // Plotting & Handle Graphics
+        "plot" => fn_plot(PlotKind::Line, args, nargout, ctx.figure, false, false),
+        "semilogx" => fn_plot(PlotKind::Line, args, nargout, ctx.figure, true, false),
+        "semilogy" => fn_plot(PlotKind::Line, args, nargout, ctx.figure, false, true),
+        "loglog" => fn_plot(PlotKind::Line, args, nargout, ctx.figure, true, true),
+        "scatter" => fn_plot(PlotKind::Scatter, args, nargout, ctx.figure, false, false),
+        "bar" => fn_plot(PlotKind::Bar, args, nargout, ctx.figure, false, false),
+        "stem" => fn_plot(PlotKind::Stem, args, nargout, ctx.figure, false, false),
         "histogram" => extras::fn_histogram(args, ctx.figure),
         "contour" => extras::fn_contour(args, ctx.figure),
         "imagesc" => fn_imagesc(args, ctx.figure),
@@ -296,6 +389,11 @@ pub fn call_intrinsic(
         "legend" => fn_legend(args, ctx.figure),
         "xlim" => fn_axis_lim("xlim", args, &mut ctx.figure.panel_mut().xlim),
         "ylim" => fn_axis_lim("ylim", args, &mut ctx.figure.panel_mut().ylim),
+        "zlim" => fn_axis_lim("zlim", args, &mut ctx.figure.panel_mut().zlim),
+        "gcf" => fs_media::fn_gcf(args),
+        "gca" => fs_media::fn_gca(args, ctx.figure),
+        "set" => fs_media::fn_set(args, ctx.figure),
+        "get" => fs_media::fn_get(args, ctx.figure),
         "title" => fn_plot_label("title", args, |s| ctx.figure.panel_mut().title = s),
         "xlabel" => fn_plot_label("xlabel", args, |s| ctx.figure.panel_mut().xlabel = s),
         "ylabel" => fn_plot_label("ylabel", args, |s| ctx.figure.panel_mut().ylabel = s),
@@ -306,6 +404,24 @@ pub fn call_intrinsic(
             ctx.figure.clear();
             Ok(vec![])
         }
+
+        // Filesystem utilities & pure-Rust Media I/O (BMP, PNG, WAV)
+        "fullfile" => fs_media::fn_fullfile(args),
+        "fileparts" => fs_media::fn_fileparts(args, nargout),
+        "isfile" => fs_media::fn_isfile(args, ctx.loader),
+        "isfolder" => fs_media::fn_isfolder(args, ctx.loader),
+        "dir" => fs_media::fn_dir(args, nargout, ctx.loader, ctx.stdout),
+        "ls" => fs_media::fn_ls(args, nargout, ctx.loader, ctx.stdout),
+        "pwd" => fs_media::fn_pwd(ctx.loader),
+        "cd" => fs_media::fn_cd(args, ctx.loader),
+        "mkdir" => fs_media::fn_mkdir(args, ctx.loader),
+        "delete" => fs_media::fn_delete(args, ctx.loader),
+        "copyfile" => fs_media::fn_copyfile(args, ctx.loader),
+        "movefile" => fs_media::fn_movefile(args, ctx.loader),
+        "imread" => fs_media::fn_imread(args, ctx.loader),
+        "imwrite" => fs_media::fn_imwrite(args, ctx.loader),
+        "audioread" => fs_media::fn_audioread(args, nargout, ctx.loader),
+        "audiowrite" => fs_media::fn_audiowrite(args, ctx.loader),
 
         _ => return None,
     };
@@ -1239,36 +1355,27 @@ fn fn_conv(args: &[Value]) -> Result<Vec<Value>> {
     ok1(Value::matrix(Matrix::complex_row_vec(out).normalize()))
 }
 
-fn fn_interp1(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 3 {
-        return Err(MatroError::arity("interp1", "3", args.len()));
+fn fn_ndgrid(args: &[Value]) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity("ndgrid", "1 or 2", args.len()));
     }
-    let x = args[0].as_matrix()?.data();
-    let y = args[1].as_matrix()?.data();
-    let xq = args[2].as_matrix()?;
-    if x.len() != y.len() || x.len() < 2 {
-        return Err(MatroError::dimension(
-            "interp1: x and y must have equal length >= 2",
-        ));
+    let xv = args[0].to_dense_matrix()?;
+    let yv = if args.len() == 2 {
+        args[1].to_dense_matrix()?
+    } else {
+        xv.clone()
+    };
+    let nx = xv.len();
+    let ny = yv.len();
+    let mut x_out = Matrix::zeros(nx, ny);
+    let mut y_out = Matrix::zeros(nx, ny);
+    for c in 0..ny {
+        for r in 0..nx {
+            x_out.set(r, c, xv.data()[r]);
+            y_out.set(r, c, yv.data()[c]);
+        }
     }
-    let out = xq.map(|q| {
-        if q < x[0] || q > x[x.len() - 1] {
-            return f64::NAN;
-        }
-        let mut lo = 0;
-        let mut hi = x.len() - 1;
-        while lo + 1 < hi {
-            let mid = (lo + hi) / 2;
-            if x[mid] <= q {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        let t = (q - x[lo]) / (x[hi] - x[lo]);
-        y[lo] + t * (y[hi] - y[lo])
-    });
-    ok1(Value::matrix(out))
+    Ok(vec![Value::matrix(x_out), Value::matrix(y_out)])
 }
 
 fn fn_sort(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
@@ -1660,9 +1767,17 @@ fn fn_fileread(args: &[Value], loader: &ModuleLoader) -> Result<Vec<Value>> {
     ok1(Value::String(text))
 }
 
+fn is_plot_prop_key(s: &str) -> bool {
+    matches!(
+        s.to_ascii_lowercase().as_str(),
+        "color" | "linewidth" | "linestyle" | "displayname"
+    )
+}
+
 fn fn_plot(
     kind: PlotKind,
     args: &[Value],
+    nargout: usize,
     figure: &mut PlotFigure,
     log_x: bool,
     log_y: bool,
@@ -1670,44 +1785,84 @@ fn fn_plot(
     if args.is_empty() {
         return Err(MatroError::arity(kind.as_str(), ">= 1", 0));
     }
+    let panel_idx = figure.active;
     let panel = figure.panel_mut();
     panel.log_x = log_x;
     panel.log_y = log_y;
 
+    let mut added_indices = Vec::new();
+    let mut prop_pairs: Vec<(&str, &Value)> = Vec::new();
+
     if args.len() == 1 {
-        let y = args[0].as_matrix()?.data().to_vec();
+        let y = args[0].to_dense_matrix()?.data().to_vec();
         let x: Vec<f64> = (1..=y.len()).map(|i| i as f64).collect();
         panel.add_series(kind, x, y, None);
-        return Ok(vec![]);
+        added_indices.push(panel.series.len() - 1);
+    } else {
+        let orig_hold = panel.hold;
+        let mut i = 0;
+        let mut first = true;
+        while i < args.len() {
+            if let Ok(k) = args[i].as_str() {
+                if is_plot_prop_key(k) && i + 1 < args.len() {
+                    prop_pairs.push((k, &args[i + 1]));
+                    i += 2;
+                    continue;
+                }
+            }
+            let x = args[i].to_dense_matrix()?.data().to_vec();
+            let Some(y_val) = args.get(i + 1) else {
+                return Err(MatroError::arity(
+                    kind.as_str(),
+                    "paired x, y vectors",
+                    args.len(),
+                ));
+            };
+            let y = y_val.to_dense_matrix()?.data().to_vec();
+            i += 2;
+            let style = if let Some(Value::String(s)) = args.get(i) {
+                if !is_plot_prop_key(s) {
+                    i += 1;
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if !first {
+                panel.hold = true;
+            }
+            panel.add_series(kind, x, y, style);
+            added_indices.push(panel.series.len() - 1);
+            first = false;
+        }
+        panel.hold = orig_hold;
     }
 
-    let orig_hold = panel.hold;
-    let mut i = 0;
-    let mut first = true;
-    while i < args.len() {
-        let x = args[i].as_matrix()?.data().to_vec();
-        let Some(y_val) = args.get(i + 1) else {
-            return Err(MatroError::arity(
-                kind.as_str(),
-                "paired x, y vectors",
-                args.len(),
-            ));
-        };
-        let y = y_val.as_matrix()?.data().to_vec();
-        i += 2;
-        let style = if let Some(Value::String(s)) = args.get(i) {
-            i += 1;
-            Some(s.as_str())
-        } else {
-            None
-        };
-        if !first {
-            panel.hold = true;
+    for &(k, val) in &prop_pairs {
+        let key = k.to_ascii_lowercase();
+        for &si in &added_indices {
+            if let Some(ser) = panel.series.get_mut(si) {
+                match key.as_str() {
+                    "color" => ser.color = fs_media::parse_color_val(val)?,
+                    "linewidth" => ser.line_width = val.as_scalar()?.max(0.2),
+                    "linestyle" => {
+                        let ls = val.as_str()?;
+                        ser.dashed = ls.contains("--") || ls.contains(':');
+                    }
+                    "displayname" => ser.label = Some(val.as_str()?.to_string()),
+                    _ => {}
+                }
+            }
         }
-        panel.add_series(kind, x, y, style);
-        first = false;
     }
-    panel.hold = orig_hold;
+
+    if nargout >= 1 {
+        if let Some(&last_si) = added_indices.last() {
+            return Ok(vec![fs_media::make_line_handle(panel_idx, last_si)]);
+        }
+    }
     Ok(vec![])
 }
 
@@ -1908,4 +2063,155 @@ fn fn_view(args: &[Value], figure: &mut PlotFigure) -> Result<Vec<Value>> {
     panel.view_az = az;
     panel.view_el = el;
     Ok(vec![])
+}
+
+
+fn fn_cast_class(name: &str, args: &[Value], target: NumericClass) -> Result<Vec<Value>> {
+    if args.len() != 1 {
+        return Err(MatroError::arity(name, "1", args.len()));
+    }
+    match &args[0] {
+        Value::String(s) => {
+            let codes: Vec<f64> = s.chars().map(|c| c as u32 as f64).collect();
+            ok1(Value::matrix(Matrix::row_vec(codes).cast_to(target)))
+        }
+        other => ok1(Value::matrix(other.to_dense_matrix()?.cast_to(target))),
+    }
+}
+
+fn fn_char(args: &[Value]) -> Result<Vec<Value>> {
+    if args.len() != 1 {
+        return Err(MatroError::arity("char", "1", args.len()));
+    }
+    match &args[0] {
+        Value::String(s) => ok1(Value::String(s.clone())),
+        Value::Object(o) if o.class_name == "string" => {
+            if let Some(Value::Cell(c)) = o.fields.get("Data") {
+                if let Some(first) = c.data.first() {
+                    if let Ok(s) = first.as_str() {
+                        return ok1(Value::String(s.to_string()));
+                    }
+                }
+            }
+            ok1(Value::String(String::new()))
+        }
+        Value::Matrix(m) => {
+            let s: String = m
+                .data()
+                .iter()
+                .filter_map(|&x| char::from_u32(x.max(0.0).round() as u32))
+                .collect();
+            ok1(Value::String(s))
+        }
+        other => ok1(Value::String(format!("{other}"))),
+    }
+}
+
+fn fn_cast_named(args: &[Value]) -> Result<Vec<Value>> {
+    if args.len() != 2 {
+        return Err(MatroError::arity("cast", "2 (A, newclass)", args.len()));
+    }
+    let cname = args[1].as_str()?;
+    if cname == "char" {
+        return fn_char(&args[0..1]);
+    }
+    let target = NumericClass::from_name(cname)
+        .ok_or_else(|| MatroError::runtime(format!("cast: unknown class '{cname}'")))?;
+    fn_cast_class("cast", &args[0..1], target)
+}
+
+fn fn_int_bound(name: &str, args: &[Value], is_max: bool) -> Result<Vec<Value>> {
+    let cname = if args.is_empty() {
+        "int32"
+    } else if args.len() == 1 {
+        args[0].as_str()?
+    } else {
+        return Err(MatroError::arity(name, "0 or 1", args.len()));
+    };
+    let cls = NumericClass::from_name(cname)
+        .ok_or_else(|| MatroError::runtime(format!("{name}: unknown integer class '{cname}'")))?;
+    let Some((lo, hi)) = cls.bounds() else {
+        return Err(MatroError::runtime(format!(
+            "{name}: '{cname}' is not an integer class"
+        )));
+    };
+    let val = if is_max { hi } else { lo };
+    ok1(Value::matrix(Matrix::scalar(val).cast_to(cls)))
+}
+
+fn fn_val_pred(name: &str, args: &[Value], pred: impl Fn(&Value) -> bool) -> Result<Vec<Value>> {
+    if args.len() != 1 {
+        return Err(MatroError::arity(name, "1", args.len()));
+    }
+    ok1(Value::bool(pred(&args[0])))
+}
+
+fn fn_bit_bin(name: &str, args: &[Value], op: impl Fn(u64, u64) -> u64) -> Result<Vec<Value>> {
+    if args.len() != 2 {
+        return Err(MatroError::arity(name, "2", args.len()));
+    }
+    let a = args[0].as_matrix()?;
+    let b = args[1].as_matrix()?;
+    let out_dtype = NumericClass::combine(a.dtype(), b.dtype())?;
+    let res = a.elementwise(b, |x, y| op(x.max(0.0).round() as u64, y.max(0.0).round() as u64) as f64)?;
+    ok1(Value::matrix(res.cast_to(out_dtype)))
+}
+
+fn fn_bitshift(args: &[Value]) -> Result<Vec<Value>> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(MatroError::arity("bitshift", "2 or 3", args.len()));
+    }
+    let a = args[0].as_matrix()?;
+    let k = args[1].as_matrix()?;
+    let dtype = a.dtype();
+    let res = a.elementwise(k, |x, sh| {
+        let v = x.max(0.0).round() as u64;
+        let s = sh.round() as i32;
+        let shifted = if s >= 0 {
+            v.checked_shl(s as u32).unwrap_or(0)
+        } else {
+            v.checked_shr((-s) as u32).unwrap_or(0)
+        };
+        shifted as f64
+    })?;
+    ok1(Value::matrix(res.cast_to(dtype)))
+}
+
+fn fn_bitget(args: &[Value]) -> Result<Vec<Value>> {
+    if args.len() != 2 {
+        return Err(MatroError::arity("bitget", "2 (A, bit)", args.len()));
+    }
+    let a = args[0].as_matrix()?;
+    let bit = args[1].as_matrix()?;
+    let res = a.elementwise(bit, |x, b| {
+        let v = x.max(0.0).round() as u64;
+        let pos = (b.round() as isize - 1).max(0) as u32;
+        if pos < 64 { ((v >> pos) & 1) as f64 } else { 0.0 }
+    })?;
+    ok1(Value::matrix(res))
+}
+
+fn fn_bitset(args: &[Value]) -> Result<Vec<Value>> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(MatroError::arity("bitset", "2 or 3 (A, bit [, val])", args.len()));
+    }
+    let a = args[0].as_matrix()?;
+    let bit = args[1].as_matrix()?;
+    let set_one = args
+        .get(2)
+        .map(|v| v.as_scalar().map(|s| s != 0.0))
+        .transpose()?
+        .unwrap_or(true);
+    let dtype = a.dtype();
+    let res = a.elementwise(bit, |x, b| {
+        let v = x.max(0.0).round() as u64;
+        let pos = (b.round() as isize - 1).max(0) as u32;
+        let out = if pos < 64 {
+            if set_one { v | (1u64 << pos) } else { v & !(1u64 << pos) }
+        } else {
+            v
+        };
+        out as f64
+    })?;
+    ok1(Value::matrix(res.cast_to(dtype)))
 }

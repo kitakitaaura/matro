@@ -1,6 +1,6 @@
 //! Pluggable virtual filesystem (`Vfs`), MATLAB Level 5 `.mat` I/O, and `.m` module loader.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Debug;
 
 use matro_bytecode::{Chunk, compile};
@@ -27,6 +27,22 @@ pub trait Vfs: Debug {
         self.read_bytes(path).is_some()
     }
 
+    fn is_dir(&self, _path: &str) -> bool {
+        false
+    }
+
+    fn mkdir(&mut self, _path: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn cwd(&self) -> String {
+        "/".to_string()
+    }
+
+    fn set_cwd(&mut self, _path: &str) -> Result<()> {
+        Ok(())
+    }
+
     fn list_files(&self) -> Vec<String>;
     fn remove(&mut self, path: &str);
     fn clear(&mut self);
@@ -36,6 +52,8 @@ pub trait Vfs: Debug {
 #[derive(Debug, Default, Clone)]
 pub struct MemoryVfs {
     files: BTreeMap<String, Vec<u8>>,
+    dirs: BTreeSet<String>,
+    cwd: String,
 }
 
 impl MemoryVfs {
@@ -45,7 +63,7 @@ impl MemoryVfs {
 
     pub fn normalize(path: &str) -> String {
         let p = path.trim().replace('\\', "/");
-        p.trim_start_matches("./").trim_start_matches('/').to_string()
+        p.trim_start_matches("./").trim_start_matches('/').trim_end_matches('/').to_string()
     }
 }
 
@@ -57,6 +75,9 @@ impl Vfs for MemoryVfs {
 
     fn write_bytes(&mut self, path: &str, data: &[u8]) -> Result<()> {
         let key = Self::normalize(path);
+        if let Some(pos) = key.rfind('/') {
+            self.dirs.insert(key[..pos].to_string());
+        }
         self.files.insert(key, data.to_vec());
         Ok(())
     }
@@ -66,6 +87,52 @@ impl Vfs for MemoryVfs {
         self.files.contains_key(&key)
     }
 
+    fn is_dir(&self, path: &str) -> bool {
+        let key = Self::normalize(path);
+        if key.is_empty() || key == "." {
+            return true;
+        }
+        if self.dirs.contains(&key) {
+            return true;
+        }
+        let prefix = format!("{key}/");
+        self.files.keys().any(|k| k.starts_with(&prefix))
+    }
+
+    fn mkdir(&mut self, path: &str) -> Result<()> {
+        let key = Self::normalize(path);
+        if !key.is_empty() {
+            self.dirs.insert(key);
+        }
+        Ok(())
+    }
+
+    fn cwd(&self) -> String {
+        if self.cwd.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", self.cwd)
+        }
+    }
+
+    fn set_cwd(&mut self, path: &str) -> Result<()> {
+        let key = Self::normalize(path);
+        if key.is_empty() || key == "." {
+            self.cwd.clear();
+            return Ok(());
+        }
+        if key == ".." {
+            if let Some(pos) = self.cwd.rfind('/') {
+                self.cwd.truncate(pos);
+            } else {
+                self.cwd.clear();
+            }
+            return Ok(());
+        }
+        self.cwd = key;
+        Ok(())
+    }
+
     fn list_files(&self) -> Vec<String> {
         self.files.keys().cloned().collect()
     }
@@ -73,10 +140,13 @@ impl Vfs for MemoryVfs {
     fn remove(&mut self, path: &str) {
         let key = Self::normalize(path);
         self.files.remove(&key);
+        self.dirs.remove(&key);
     }
 
     fn clear(&mut self) {
         self.files.clear();
+        self.dirs.clear();
+        self.cwd.clear();
     }
 }
 
@@ -106,15 +176,48 @@ impl Vfs for OsVfs {
     }
 
     fn exists(&self, path: &str) -> bool {
-        self.overlay.exists(path) || std::path::Path::new(path).exists()
+        self.overlay.exists(path) || std::path::Path::new(path).is_file()
+    }
+
+    fn is_dir(&self, path: &str) -> bool {
+        self.overlay.is_dir(path) || std::path::Path::new(path).is_dir()
+    }
+
+    fn mkdir(&mut self, path: &str) -> Result<()> {
+        std::fs::create_dir_all(path)
+            .map_err(|e| MatroError::runtime(format!("mkdir '{path}' failed: {e}")))
+    }
+
+    fn cwd(&self) -> String {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "/".to_string())
+    }
+
+    fn set_cwd(&mut self, path: &str) -> Result<()> {
+        std::env::set_current_dir(path)
+            .map_err(|e| MatroError::runtime(format!("cd '{path}' failed: {e}")))
     }
 
     fn list_files(&self) -> Vec<String> {
-        self.overlay.list_files()
+        let mut out = self.overlay.list_files();
+        if let Ok(rd) = std::fs::read_dir(".") {
+            for ent in rd.flatten() {
+                if let Some(name) = ent.file_name().to_str() {
+                    let s = name.to_string();
+                    if !out.contains(&s) {
+                        out.push(s);
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     fn remove(&mut self, path: &str) {
         self.overlay.remove(path);
+        let _ = std::fs::remove_file(path);
     }
 
     fn clear(&mut self) {

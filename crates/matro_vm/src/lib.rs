@@ -10,7 +10,9 @@ use matro_types::{
 };
 
 mod fileio;
+mod oop;
 mod solvers;
+mod solvers_ext;
 
 /// Result of evaluating a script or REPL line.
 #[derive(Debug, Clone, Default)]
@@ -240,6 +242,7 @@ pub struct Vm {
     functions: HashMap<String, FunctionProto>,
     classes: HashMap<String, ClassProto>,
     handles: Vec<ObjectInstance>,
+    listeners: HashMap<(usize, String), Vec<ClosureHandle>>,
     closures: Vec<FunctionProto>,
     envs: Vec<BTreeMap<String, Value>>,
     figure: PlotFigure,
@@ -267,6 +270,7 @@ impl Vm {
             functions: HashMap::new(),
             classes: HashMap::new(),
             handles: Vec::new(),
+            listeners: HashMap::new(),
             closures: Vec::new(),
             envs: Vec::new(),
             figure: PlotFigure::default(),
@@ -342,6 +346,7 @@ impl Vm {
         self.functions.clear();
         self.classes.clear();
         self.handles.clear();
+        self.listeners.clear();
         self.closures.clear();
         self.envs.clear();
         self.figure.clear();
@@ -628,15 +633,33 @@ impl Vm {
                     let mut rets = self.call_user_func(&func, &[], 1, None, stdout)?;
                     stack.push(StackItem::Val(rets.pop().unwrap_or_else(Value::empty)));
                 } else if let Some(cls) = self.classes.get(&name).cloned() {
-                    let obj = self.instantiate_class(&cls, &[], stdout)?;
-                    stack.push(StackItem::Val(obj));
+                    if self.class_has_static_or_enum_or_const(&name) {
+                        let mut f = BTreeMap::new();
+                        f.insert("__name".to_string(), Value::String(name));
+                        stack.push(StackItem::Val(Value::Object(ObjectInstance {
+                            class_name: "__class_ref".to_string(),
+                            fields: f,
+                        })));
+                    } else {
+                        let obj = self.instantiate_class(&cls, &[], stdout)?;
+                        stack.push(StackItem::Val(obj));
+                    }
                 } else if self.try_autoload_symbol(&name, stdout)? {
                     if let Some(func) = self.functions.get(&name).cloned() {
                         let mut rets = self.call_user_func(&func, &[], 1, None, stdout)?;
                         stack.push(StackItem::Val(rets.pop().unwrap_or_else(Value::empty)));
                     } else if let Some(cls) = self.classes.get(&name).cloned() {
-                        let obj = self.instantiate_class(&cls, &[], stdout)?;
-                        stack.push(StackItem::Val(obj));
+                        if self.class_has_static_or_enum_or_const(&name) {
+                            let mut f = BTreeMap::new();
+                            f.insert("__name".to_string(), Value::String(name));
+                            stack.push(StackItem::Val(Value::Object(ObjectInstance {
+                                class_name: "__class_ref".to_string(),
+                                fields: f,
+                            })));
+                        } else {
+                            let obj = self.instantiate_class(&cls, &[], stdout)?;
+                            stack.push(StackItem::Val(obj));
+                        }
                     } else {
                         return Err(MatroError::undefined(name));
                     }
@@ -766,218 +789,44 @@ impl Vm {
                 if let Some(StackItem::Scalar(x)) = stack.last_mut() {
                     *x = -*x;
                 } else {
-                    let v = pop_val(stack)?;
-                    let out = match v {
-                        Value::Sparse(s) => Value::sparse(s.scale(-1.0)),
-                        other => Value::matrix(other.as_matrix()?.map_c(|c| -c)),
-                    };
-                    stack.push(StackItem::Val(out));
+                    self.exec_unop_slow(op, stack, stdout)?;
                 }
             }
             OpCode::Pos => {
                 // unary `+` is a no-op on numeric scalars/matrices
             }
             OpCode::Not => {
-                let m = pop_val(stack)?
-                    .to_dense_matrix()?
-                    .map_c_to_real(|c| if c.is_zero() { 1.0 } else { 0.0 })
-                    .with_logical(true);
-                stack.push(StackItem::Val(Value::matrix(m)));
+                self.exec_unop_slow(op, stack, stdout)?;
             }
-            OpCode::CTranspose => {
-                if matches!(stack.last(), Some(StackItem::Scalar(_))) {
-                    // real scalar conjugate transpose is itself
-                } else {
-                    let v = pop_val(stack)?;
-                    let out = match v {
-                        Value::Sparse(s) => Value::sparse(s.transpose()),
-                        other => Value::matrix(other.as_matrix()?.ctranspose()),
-                    };
-                    stack.push(StackItem::Val(out));
+            OpCode::CTranspose | OpCode::Transpose => {
+                if !matches!(stack.last(), Some(StackItem::Scalar(_))) {
+                    self.exec_unop_slow(op, stack, stdout)?;
                 }
             }
-            OpCode::Transpose => {
-                if matches!(stack.last(), Some(StackItem::Scalar(_))) {
-                    // real scalar transpose is itself
-                } else {
-                    let v = pop_val(stack)?;
-                    let out = match v {
-                        Value::Sparse(s) => Value::sparse(s.transpose()),
-                        other => Value::matrix(other.as_matrix()?.transpose()),
-                    };
-                    stack.push(StackItem::Val(out));
-                }
-            }
-            OpCode::Add => {
+            OpCode::Add | OpCode::Sub | OpCode::ElemMul | OpCode::ElemDiv | OpCode::Mul | OpCode::Div => {
                 let b_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
                 let a_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
                 if let (Some(x), Some(y)) = (a_item.as_fast_scalar(), b_item.as_fast_scalar()) {
-                    stack.push(StackItem::Scalar(x + y));
-                } else {
-                    let a = a_item.into_val()?;
-                    let b = b_item.into_val()?;
-                    let out = match (&a, &b) {
-                        (Value::Sparse(sa), Value::Sparse(sb)) => Value::sparse(sa.add_scaled(sb, 1.0)?),
-                        _ => Value::matrix(
-                            a.to_dense_matrix()?
-                                .elementwise_c(&b.to_dense_matrix()?, |x, y| x + y)?,
-                        ),
+                    let v = match op {
+                        OpCode::Add => x + y,
+                        OpCode::Sub => x - y,
+                        OpCode::ElemMul | OpCode::Mul => x * y,
+                        _ => x / y,
                     };
-                    stack.push(StackItem::Val(out));
+                    stack.push(StackItem::Scalar(v));
+                } else {
+                    self.exec_binop_slow(op, a_item, b_item, stack, stdout)?;
                 }
             }
-            OpCode::Sub => {
+            OpCode::ElemPow | OpCode::LeftDiv | OpCode::Pow | OpCode::Eq | OpCode::Ne => {
                 let b_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
                 let a_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
-                if let (Some(x), Some(y)) = (a_item.as_fast_scalar(), b_item.as_fast_scalar()) {
-                    stack.push(StackItem::Scalar(x - y));
-                } else {
-                    let a = a_item.into_val()?;
-                    let b = b_item.into_val()?;
-                    let out = match (&a, &b) {
-                        (Value::Sparse(sa), Value::Sparse(sb)) => {
-                            Value::sparse(sa.add_scaled(sb, -1.0)?)
-                        }
-                        _ => Value::matrix(
-                            a.to_dense_matrix()?
-                                .elementwise_c(&b.to_dense_matrix()?, |x, y| x - y)?,
-                        ),
-                    };
-                    stack.push(StackItem::Val(out));
-                }
+                self.exec_binop_slow(op, a_item, b_item, stack, stdout)?;
             }
-            OpCode::ElemMul => {
-                let b_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
-                let a_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
-                if let (Some(x), Some(y)) = (a_item.as_fast_scalar(), b_item.as_fast_scalar()) {
-                    stack.push(StackItem::Scalar(x * y));
-                } else {
-                    let a = a_item.into_val()?;
-                    let b = b_item.into_val()?;
-                    let out = match (&a, &b) {
-                        (Value::Sparse(sa), Value::Sparse(sb)) => Value::sparse(sa.elem_mul(sb)?),
-                        (Value::Sparse(sa), Value::Matrix(mb)) if mb.as_scalar().is_some() => {
-                            Value::sparse(sa.scale(mb.as_scalar().unwrap()))
-                        }
-                        (Value::Matrix(ma), Value::Sparse(sb)) if ma.as_scalar().is_some() => {
-                            Value::sparse(sb.scale(ma.as_scalar().unwrap()))
-                        }
-                        _ => Value::matrix(
-                            a.to_dense_matrix()?
-                                .elementwise_c(&b.to_dense_matrix()?, |x, y| x * y)?,
-                        ),
-                    };
-                    stack.push(StackItem::Val(out));
-                }
-            }
-            OpCode::ElemDiv => {
-                let b_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
-                let a_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
-                if let (Some(x), Some(y)) = (a_item.as_fast_scalar(), b_item.as_fast_scalar()) {
-                    stack.push(StackItem::Scalar(x / y));
-                } else {
-                    let a = a_item.into_val()?;
-                    let b = b_item.into_val()?;
-                    let res = a.to_dense_matrix()?.elementwise_c(&b.to_dense_matrix()?, |x, y| x / y)?;
-                    stack.push(StackItem::Val(Value::matrix(res)));
-                }
-            }
-            OpCode::ElemPow => bin_elem_c(stack, Complex::powc)?,
-            OpCode::Mul => {
-                let b_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
-                let a_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
-                if let (Some(x), Some(y)) = (a_item.as_fast_scalar(), b_item.as_fast_scalar()) {
-                    stack.push(StackItem::Scalar(x * y));
-                } else {
-                    let a = a_item.into_val()?;
-                    let b = b_item.into_val()?;
-                    let out = match (&a, &b) {
-                        (Value::Sparse(sa), Value::Sparse(sb)) => Value::sparse(sa.matmul_sparse(sb)?),
-                        (Value::Sparse(sa), Value::Matrix(mb)) => {
-                            if let Some(sc) = mb.as_scalar() {
-                                Value::sparse(sa.scale(sc))
-                            } else {
-                                Value::matrix(sa.matmul_dense(mb)?)
-                            }
-                        }
-                        (Value::Matrix(ma), Value::Sparse(sb)) => {
-                            if let Some(sc) = ma.as_scalar() {
-                                Value::sparse(sb.scale(sc))
-                            } else {
-                                Value::matrix(ma.matmul(&sb.to_dense())?)
-                            }
-                        }
-                        _ => Value::matrix(a.as_matrix()?.matmul(b.as_matrix()?)?),
-                    };
-                    stack.push(StackItem::Val(out));
-                }
-            }
-            OpCode::Div => {
-                let b_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
-                let a_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
-                if let (Some(x), Some(y)) = (a_item.as_fast_scalar(), b_item.as_fast_scalar()) {
-                    stack.push(StackItem::Scalar(x / y));
-                } else {
-                    let a = a_item.into_val()?;
-                    let b = b_item.into_val()?;
-                    let out = match (&a, &b) {
-                        (Value::Sparse(sa), Value::Matrix(mb)) if mb.as_scalar().is_some() => {
-                            Value::sparse(sa.scale(1.0 / mb.as_scalar().unwrap()))
-                        }
-                        _ => Value::matrix(a.to_dense_matrix()?.rdivide(&b.to_dense_matrix()?)?),
-                    };
-                    stack.push(StackItem::Val(out));
-                }
-            }
-            OpCode::LeftDiv => {
-                let b = pop_val(stack)?;
-                let a = pop_val(stack)?;
-                let out = match (&a, &b) {
-                    (Value::Sparse(sa), _) => Value::matrix(sa.solve_dense(&b.to_dense_matrix()?)?),
-                    _ => Value::matrix(a.to_dense_matrix()?.solve(&b.to_dense_matrix()?)?),
-                };
-                stack.push(StackItem::Val(out));
-            }
-            OpCode::Pow => {
-                let b = pop_val(stack)?;
-                let a = pop_val(stack)?;
-                let res = a.to_dense_matrix()?.matpow(&b.to_dense_matrix()?)?;
-                stack.push(StackItem::Val(Value::matrix(res)));
-            }
-            OpCode::Eq => {
-                let b = pop_val(stack)?;
-                let a = pop_val(stack)?;
-                let res = match (&a, &b) {
-                    (Value::String(sa), Value::String(sb)) => Value::bool(sa == sb),
-                    _ => Value::matrix(
-                        a.to_dense_matrix()?
-                            .elementwise_c(&b.to_dense_matrix()?, |x, y| {
-                                Complex::from_real(if x == y { 1.0 } else { 0.0 })
-                            })?
-                            .with_logical(true),
-                    ),
-                };
-                stack.push(StackItem::Val(res));
-            }
-            OpCode::Ne => {
-                let b = pop_val(stack)?;
-                let a = pop_val(stack)?;
-                let res = match (&a, &b) {
-                    (Value::String(sa), Value::String(sb)) => Value::bool(sa != sb),
-                    _ => Value::matrix(
-                        a.to_dense_matrix()?
-                            .elementwise_c(&b.to_dense_matrix()?, |x, y| {
-                                Complex::from_real(if x != y { 1.0 } else { 0.0 })
-                            })?
-                            .with_logical(true),
-                    ),
-                };
-                stack.push(StackItem::Val(res));
-            }
-            OpCode::Lt => bin_logical(stack, |a, b| a < b)?,
-            OpCode::Le => bin_logical(stack, |a, b| a <= b)?,
-            OpCode::Gt => bin_logical(stack, |a, b| a > b)?,
-            OpCode::Ge => bin_logical(stack, |a, b| a >= b)?,
+            OpCode::Lt => self.exec_cmp_op(stack, "lt", |a, b| a < b, stdout)?,
+            OpCode::Le => self.exec_cmp_op(stack, "le", |a, b| a <= b, stdout)?,
+            OpCode::Gt => self.exec_cmp_op(stack, "gt", |a, b| a > b, stdout)?,
+            OpCode::Ge => self.exec_cmp_op(stack, "ge", |a, b| a >= b, stdout)?,
             OpCode::And => bin_logical(stack, |a, b| a != 0.0 && b != 0.0)?,
             OpCode::Or => bin_logical(stack, |a, b| a != 0.0 || b != 0.0)?,
             OpCode::Jump(target) => {
@@ -1321,7 +1170,7 @@ impl Vm {
                 let receiver = pop_val(stack)?;
                 let method_name = chunk.names[method_idx as usize].clone();
 
-                // 0. Built-in namespace / native handle / map methods
+                // 0. Built-in namespace / class static / native handle / map methods
                 if let Value::Object(ref o) = receiver {
                     if o.class_name == "__ns_containers" && method_name == "Map" {
                         let call_args = flatten_call_args(raw_args)?;
@@ -1329,12 +1178,47 @@ impl Vm {
                         push_call_results(stack, vec![map_val], nargout as usize);
                         return Ok(true);
                     }
+                    if o.class_name == "__class_ref" {
+                        let cname = o
+                            .fields
+                            .get("__name")
+                            .and_then(|v| v.as_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        if let Some(proto) = self.find_class_method(&cname, &method_name) {
+                            let call_args = flatten_call_args(raw_args)?;
+                            let results = self.call_user_func(
+                                &proto,
+                                &call_args,
+                                nargout as usize,
+                                None,
+                                stdout,
+                            )?;
+                            push_call_results(stack, results, nargout as usize);
+                            return Ok(true);
+                        }
+                        return Err(MatroError::runtime(format!(
+                            "No static method '{method_name}' on class '{cname}'"
+                        )));
+                    }
                 }
                 if let Value::Handle(ref h) = receiver {
                     if h.class_name == "inputParser" {
                         let call_args = flatten_call_args(raw_args)?;
                         let res = self.call_input_parser_method(h.id, &method_name, &call_args)?;
                         push_call_results(stack, res, nargout as usize);
+                        return Ok(true);
+                    }
+                    if method_name == "addlistener" {
+                        let call_args = flatten_call_args(raw_args)?;
+                        self.add_event_listener(h.id, &call_args)?;
+                        push_call_results(stack, vec![], nargout as usize);
+                        return Ok(true);
+                    }
+                    if method_name == "notify" {
+                        let call_args = flatten_call_args(raw_args)?;
+                        self.notify_event(h, &call_args, stdout)?;
+                        push_call_results(stack, vec![], nargout as usize);
                         return Ok(true);
                     }
                 }
@@ -1374,9 +1258,14 @@ impl Vm {
                 if let Some(cname) = class_name {
                     if let Some(proto) = self.find_class_method(&cname, &method_name) {
                         let expanded = flatten_call_args(raw_args)?;
-                        let mut call_args = Vec::with_capacity(expanded.len() + 1);
-                        call_args.push(receiver);
-                        call_args.extend(expanded);
+                        let call_args = if self.is_static_method(&cname, &method_name) {
+                            expanded
+                        } else {
+                            let mut v = Vec::with_capacity(expanded.len() + 1);
+                            v.push(receiver);
+                            v.extend(expanded);
+                            v
+                        };
                         let results =
                             self.call_user_func(&proto, &call_args, nargout as usize, None, stdout)?;
                         push_call_results(stack, results, nargout as usize);
@@ -1472,6 +1361,16 @@ impl Vm {
                         let extracted = extract_table_braces(&t, &raw_args)?;
                         stack.push(StackItem::Val(extracted));
                     }
+                    Value::Object(ref o) if o.class_name == "string" => {
+                        let vals = oop::index_string_braces(o, &raw_args)?;
+                        if nargout > 1 {
+                            push_call_results(stack, vals, nargout as usize);
+                        } else if vals.len() == 1 {
+                            stack.push(StackItem::Val(vals.into_iter().next().unwrap()));
+                        } else {
+                            stack.push(StackItem::Spread(vals));
+                        }
+                    }
                     other => {
                         return Err(MatroError::runtime(format!(
                             "Brace indexing '{{}}' requires a cell array or table, got {}",
@@ -1512,20 +1411,67 @@ impl Vm {
                 f.set(slot, Value::Cell(cell));
             }
             OpCode::GetField(field_idx) => {
-                let field = &chunk.names[field_idx as usize];
+                let field = chunk.names[field_idx as usize].clone();
                 let obj = pop_val(stack)?;
+                let cur_fn = frame.as_deref().map(|f| f.func_name);
                 let val = match obj {
-                    Value::Struct(map) => map.get(field).cloned(),
-                    Value::Object(inst) => inst.fields.get(field).cloned(),
-                    Value::Handle(h) => self
-                        .handles
-                        .get(h.id)
-                        .and_then(|inst| inst.fields.get(field).cloned()),
+                    Value::Struct(map) => map.get(&field).cloned(),
+                    Value::Object(ref inst) if inst.class_name == "__class_ref" => {
+                        let cname = inst
+                            .fields
+                            .get("__name")
+                            .and_then(|v| v.as_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        self.resolve_class_ref_field(&cname, &field, stdout)?
+                    }
+                    Value::Object(inst) => {
+                        let getter = format!("get.{field}");
+                        if cur_fn != Some(getter.as_str()) {
+                            if let Some(proto) = self.find_class_method(&inst.class_name, &getter) {
+                                let rets = self.call_user_func(
+                                    &proto,
+                                    &[Value::Object(inst)],
+                                    1,
+                                    None,
+                                    stdout,
+                                )?;
+                                Some(rets.into_iter().next().unwrap_or_else(Value::empty))
+                            } else {
+                                inst.fields.get(&field).cloned()
+                            }
+                        } else {
+                            inst.fields.get(&field).cloned()
+                        }
+                    }
+                    Value::Handle(h) => {
+                        let getter = format!("get.{field}");
+                        if cur_fn != Some(getter.as_str()) {
+                            if let Some(proto) = self.find_class_method(&h.class_name, &getter) {
+                                let rets = self.call_user_func(
+                                    &proto,
+                                    &[Value::Handle(h)],
+                                    1,
+                                    None,
+                                    stdout,
+                                )?;
+                                Some(rets.into_iter().next().unwrap_or_else(Value::empty))
+                            } else {
+                                self.handles
+                                    .get(h.id)
+                                    .and_then(|inst| inst.fields.get(&field).cloned())
+                            }
+                        } else {
+                            self.handles
+                                .get(h.id)
+                                .and_then(|inst| inst.fields.get(&field).cloned())
+                        }
+                    }
                     Value::StructArray(sa) => {
                         let items: Vec<Value> = sa
                             .items
                             .iter()
-                            .map(|m| m.get(field).cloned().unwrap_or_else(Value::empty))
+                            .map(|m| m.get(&field).cloned().unwrap_or_else(Value::empty))
                             .collect();
                         if items.iter().all(|v| v.as_scalar().is_ok()) {
                             let nums: Vec<f64> =
@@ -1552,7 +1498,7 @@ impl Vm {
                             props.insert("VariableNames".to_string(), Value::Cell(cell));
                             Some(Value::Struct(props))
                         } else {
-                            t.get_col(field).cloned()
+                            t.get_col(&field).cloned()
                         }
                     }
                     Value::Map(m) => match field.as_str() {
@@ -1573,9 +1519,40 @@ impl Vm {
                 let rhs = pop_val(stack)?;
                 let name = chunk.names[name_idx as usize].clone();
                 let path = &chunk.field_paths[path_idx as usize];
+                let cur_fn = frame.as_deref().map(|f| f.func_name.to_string());
                 let mut root = lookup_var(&name, frame.as_deref(), &self.globals)
                     .cloned()
                     .unwrap_or_else(|| Value::Struct(BTreeMap::new()));
+                if path.len() == 1 {
+                    let setter = format!("set.{}", path[0]);
+                    if cur_fn.as_deref() != Some(setter.as_str()) {
+                        let cname = match &root {
+                            Value::Object(o) => Some(o.class_name.clone()),
+                            Value::Handle(h) => Some(h.class_name.clone()),
+                            _ => None,
+                        };
+                        if let Some(cls) = cname {
+                            if let Some(proto) = self.find_class_method(&cls, &setter) {
+                                let is_handle = matches!(root, Value::Handle(_));
+                                let rets = self.call_user_func(
+                                    &proto,
+                                    &[root.clone(), rhs],
+                                    if is_handle { 0 } else { 1 },
+                                    None,
+                                    stdout,
+                                )?;
+                                if !is_handle {
+                                    let updated = rets.into_iter().next().unwrap_or(root);
+                                    *last_value = Some(updated.clone());
+                                    store_var(name, updated, frame.as_deref_mut(), &mut self.globals);
+                                } else {
+                                    *last_value = Some(root);
+                                }
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
                 if let Value::Handle(ref h) = root {
                     let inst = self
                         .handles
@@ -1592,12 +1569,44 @@ impl Vm {
             OpCode::StoreFieldLocal { slot, path_idx } => {
                 let rhs = pop_val(stack)?;
                 let path = &chunk.field_paths[path_idx as usize];
-                let f = frame
+                let cur_fn = frame.as_deref().map(|f| f.func_name.to_string());
+                let mut root = frame
                     .as_deref_mut()
-                    .ok_or_else(|| MatroError::runtime("StoreFieldLocal outside function"))?;
-                let mut root = f
+                    .ok_or_else(|| MatroError::runtime("StoreFieldLocal outside function"))?
                     .take(slot)
                     .unwrap_or_else(|| Value::Struct(BTreeMap::new()));
+                if path.len() == 1 {
+                    let setter = format!("set.{}", path[0]);
+                    if cur_fn.as_deref() != Some(setter.as_str()) {
+                        let cname = match &root {
+                            Value::Object(o) => Some(o.class_name.clone()),
+                            Value::Handle(h) => Some(h.class_name.clone()),
+                            _ => None,
+                        };
+                        if let Some(cls) = cname {
+                            if let Some(proto) = self.find_class_method(&cls, &setter) {
+                                let is_handle = matches!(root, Value::Handle(_));
+                                let rets = self.call_user_func(
+                                    &proto,
+                                    &[root.clone(), rhs],
+                                    if is_handle { 0 } else { 1 },
+                                    None,
+                                    stdout,
+                                )?;
+                                let updated = if is_handle {
+                                    root
+                                } else {
+                                    rets.into_iter().next().unwrap_or(root)
+                                };
+                                *last_value = Some(updated.clone());
+                                if let Some(f) = frame.as_deref_mut() {
+                                    f.set(slot, updated);
+                                }
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
                 if let Value::Handle(ref h) = root {
                     let inst = self
                         .handles
@@ -1605,11 +1614,15 @@ impl Vm {
                         .ok_or_else(|| MatroError::runtime("Invalid object handle"))?;
                     set_nested_field_map(&mut inst.fields, path, rhs)?;
                     *last_value = Some(root.clone());
-                    f.set(slot, root);
+                    if let Some(f) = frame.as_deref_mut() {
+                        f.set(slot, root);
+                    }
                 } else {
                     set_nested_field(&mut root, path, rhs)?;
                     *last_value = Some(root.clone());
-                    f.set(slot, root);
+                    if let Some(f) = frame.as_deref_mut() {
+                        f.set(slot, root);
+                    }
                 }
             }
             OpCode::StoreIndexedField {
@@ -1749,6 +1762,60 @@ impl Vm {
                 })?;
                 stack.push(StackItem::Val(val));
             }
+            Value::Object(o) => {
+                if let Some(res) = oop::index_modern_object(&o, &raw_args)? {
+                    stack.push(StackItem::Val(res));
+                } else if let Some(proto) = self.find_class_method(&o.class_name, "subsref") {
+                    let subs = flatten_call_args(raw_args)?;
+                    let mut s_map = BTreeMap::new();
+                    s_map.insert("type".to_string(), Value::String("()".to_string()));
+                    let cell = if subs.is_empty() {
+                        CellArray::empty()
+                    } else {
+                        CellArray::from_rows(vec![subs])?
+                    };
+                    s_map.insert("subs".to_string(), Value::Cell(cell));
+                    let results = self.call_user_func(
+                        &proto,
+                        &[Value::Object(o), Value::Struct(s_map)],
+                        nargout,
+                        None,
+                        stdout,
+                    )?;
+                    push_call_results(stack, results, nargout);
+                } else {
+                    return Err(MatroError::runtime(format!(
+                        "Cannot call or index object of class '{}'",
+                        o.class_name
+                    )));
+                }
+            }
+            Value::Handle(h) => {
+                if let Some(proto) = self.find_class_method(&h.class_name, "subsref") {
+                    let subs = flatten_call_args(raw_args)?;
+                    let mut s_map = BTreeMap::new();
+                    s_map.insert("type".to_string(), Value::String("()".to_string()));
+                    let cell = if subs.is_empty() {
+                        CellArray::empty()
+                    } else {
+                        CellArray::from_rows(vec![subs])?
+                    };
+                    s_map.insert("subs".to_string(), Value::Cell(cell));
+                    let results = self.call_user_func(
+                        &proto,
+                        &[Value::Handle(h), Value::Struct(s_map)],
+                        nargout,
+                        None,
+                        stdout,
+                    )?;
+                    push_call_results(stack, results, nargout);
+                } else {
+                    return Err(MatroError::runtime(format!(
+                        "Cannot call or index handle of class '{}'",
+                        h.class_name
+                    )));
+                }
+            }
             other => {
                 return Err(MatroError::runtime(format!(
                     "Cannot call or index value of type {}",
@@ -1759,68 +1826,373 @@ impl Vm {
         Ok(())
     }
 
+    #[inline(never)]
+    fn exec_unop_slow(
+        &mut self,
+        op: OpCode,
+        stack: &mut Vec<StackItem>,
+        stdout: &mut String,
+    ) -> Result<()> {
+        let v = pop_val(stack)?;
+        let out = match op {
+            OpCode::Neg => {
+                if let Some(ov) = oop::try_object_unop(self, "uminus", &v, stdout)? {
+                    ov
+                } else {
+                    match v {
+                        Value::Sparse(s) => Value::sparse(s.scale(-1.0)),
+                        other => Value::matrix(other.as_matrix()?.map_c(|c| -c)),
+                    }
+                }
+            }
+            OpCode::Not => Value::matrix(
+                v.to_dense_matrix()?
+                    .map_c_to_real(|c| if c.is_zero() { 1.0 } else { 0.0 })
+                    .with_logical(true),
+            ),
+            OpCode::CTranspose => {
+                if let Some(ov) = oop::try_object_unop(self, "ctranspose", &v, stdout)? {
+                    ov
+                } else {
+                    match v {
+                        Value::Sparse(s) => Value::sparse(s.transpose()),
+                        other => Value::matrix(other.as_matrix()?.ctranspose()),
+                    }
+                }
+            }
+            OpCode::Transpose => {
+                if let Some(ov) = oop::try_object_unop(self, "transpose", &v, stdout)? {
+                    ov
+                } else {
+                    match v {
+                        Value::Sparse(s) => Value::sparse(s.transpose()),
+                        other => Value::matrix(other.as_matrix()?.transpose()),
+                    }
+                }
+            }
+            _ => unreachable!(),
+        };
+        stack.push(StackItem::Val(out));
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn exec_binop_slow(
+        &mut self,
+        op: OpCode,
+        a_item: StackItem,
+        b_item: StackItem,
+        stack: &mut Vec<StackItem>,
+        stdout: &mut String,
+    ) -> Result<()> {
+        let a = a_item.into_val()?;
+        let b = b_item.into_val()?;
+        let op_name = match op {
+            OpCode::Add => "plus",
+            OpCode::Sub => "minus",
+            OpCode::ElemMul => "times",
+            OpCode::ElemDiv => "rdivide",
+            OpCode::ElemPow => "power",
+            OpCode::Mul => "mtimes",
+            OpCode::Div => "mrdivide",
+            OpCode::LeftDiv => "mldivide",
+            OpCode::Pow => "mpower",
+            OpCode::Eq => "eq",
+            OpCode::Ne => "ne",
+            _ => unreachable!(),
+        };
+        if let Some(ov) = oop::try_object_binop(self, op_name, &a, &b, stdout)? {
+            stack.push(StackItem::Val(ov));
+            return Ok(());
+        }
+        let out = match op {
+            OpCode::Add => match (&a, &b) {
+                (Value::Sparse(sa), Value::Sparse(sb)) => Value::sparse(sa.add_scaled(sb, 1.0)?),
+                _ => Value::matrix(
+                    a.to_dense_matrix()?
+                        .elementwise_c(&b.to_dense_matrix()?, |x, y| x + y)?,
+                ),
+            },
+            OpCode::Sub => match (&a, &b) {
+                (Value::Sparse(sa), Value::Sparse(sb)) => Value::sparse(sa.add_scaled(sb, -1.0)?),
+                _ => Value::matrix(
+                    a.to_dense_matrix()?
+                        .elementwise_c(&b.to_dense_matrix()?, |x, y| x - y)?,
+                ),
+            },
+            OpCode::ElemMul => match (&a, &b) {
+                (Value::Sparse(sa), Value::Sparse(sb)) => Value::sparse(sa.elem_mul(sb)?),
+                (Value::Sparse(sa), Value::Matrix(mb)) if mb.as_scalar().is_some() => {
+                    Value::sparse(sa.scale(mb.as_scalar().unwrap()))
+                }
+                (Value::Matrix(ma), Value::Sparse(sb)) if ma.as_scalar().is_some() => {
+                    Value::sparse(sb.scale(ma.as_scalar().unwrap()))
+                }
+                _ => Value::matrix(
+                    a.to_dense_matrix()?
+                        .elementwise_c(&b.to_dense_matrix()?, |x, y| x * y)?,
+                ),
+            },
+            OpCode::ElemDiv => Value::matrix(
+                a.to_dense_matrix()?
+                    .elementwise_c(&b.to_dense_matrix()?, |x, y| x / y)?,
+            ),
+            OpCode::ElemPow => Value::matrix(
+                a.to_dense_matrix()?
+                    .elementwise_c(&b.to_dense_matrix()?, Complex::powc)?,
+            ),
+            OpCode::Mul => match (&a, &b) {
+                (Value::Sparse(sa), Value::Sparse(sb)) => Value::sparse(sa.matmul_sparse(sb)?),
+                (Value::Sparse(sa), Value::Matrix(mb)) => {
+                    if let Some(sc) = mb.as_scalar() {
+                        Value::sparse(sa.scale(sc))
+                    } else {
+                        Value::matrix(sa.matmul_dense(mb)?)
+                    }
+                }
+                (Value::Matrix(ma), Value::Sparse(sb)) => {
+                    if let Some(sc) = ma.as_scalar() {
+                        Value::sparse(sb.scale(sc))
+                    } else {
+                        Value::matrix(ma.matmul(&sb.to_dense())?)
+                    }
+                }
+                _ => Value::matrix(a.as_matrix()?.matmul(b.as_matrix()?)?),
+            },
+            OpCode::Div => match (&a, &b) {
+                (Value::Sparse(sa), Value::Matrix(mb)) if mb.as_scalar().is_some() => {
+                    Value::sparse(sa.scale(1.0 / mb.as_scalar().unwrap()))
+                }
+                _ => Value::matrix(a.to_dense_matrix()?.rdivide(&b.to_dense_matrix()?)?),
+            },
+            OpCode::LeftDiv => match (&a, &b) {
+                (Value::Sparse(sa), _) => Value::matrix(sa.solve_dense(&b.to_dense_matrix()?)?),
+                _ => Value::matrix(a.to_dense_matrix()?.solve(&b.to_dense_matrix()?)?),
+            },
+            OpCode::Pow => Value::matrix(a.to_dense_matrix()?.matpow(&b.to_dense_matrix()?)?),
+            OpCode::Eq => match (&a, &b) {
+                (Value::String(sa), Value::String(sb)) => Value::bool(sa == sb),
+                _ => Value::matrix(
+                    a.to_dense_matrix()?
+                        .elementwise_c(&b.to_dense_matrix()?, |x, y| {
+                            Complex::from_real(if x == y { 1.0 } else { 0.0 })
+                        })?
+                        .with_logical(true),
+                ),
+            },
+            OpCode::Ne => match (&a, &b) {
+                (Value::String(sa), Value::String(sb)) => Value::bool(sa != sb),
+                _ => Value::matrix(
+                    a.to_dense_matrix()?
+                        .elementwise_c(&b.to_dense_matrix()?, |x, y| {
+                            Complex::from_real(if x != y { 1.0 } else { 0.0 })
+                        })?
+                        .with_logical(true),
+                ),
+            },
+            _ => unreachable!(),
+        };
+        stack.push(StackItem::Val(out));
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn exec_cmp_op(
+        &mut self,
+        stack: &mut Vec<StackItem>,
+        op: &str,
+        f: impl Fn(f64, f64) -> bool,
+        stdout: &mut String,
+    ) -> Result<()> {
+        let b = pop_val(stack)?;
+        let a = pop_val(stack)?;
+        if let Some(ov) = oop::try_object_binop(self, op, &a, &b, stdout)? {
+            stack.push(StackItem::Val(ov));
+            return Ok(());
+        }
+        let res = a
+            .to_dense_matrix()?
+            .elementwise(&b.to_dense_matrix()?, |x, y| if f(x, y) { 1.0 } else { 0.0 })?
+            .with_logical(true);
+        stack.push(StackItem::Val(Value::matrix(res)));
+        Ok(())
+    }
+
+    fn all_ancestors(&self, class_name: &str) -> Vec<String> {
+        let mut visited = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(class_name.to_string());
+        while let Some(name) = queue.pop_front() {
+            if visited.contains(&name) || visited.len() > 64 {
+                continue;
+            }
+            visited.push(name.clone());
+            if let Some(cls) = self.classes.get(&name) {
+                for sup in &cls.superclasses {
+                    queue.push_back(sup.clone());
+                }
+            }
+        }
+        visited
+    }
+
     fn is_handle_class(&self, class_name: &str) -> bool {
-        let mut cur = Some(class_name);
-        let mut guard = 0;
-        while let Some(name) = cur {
-            if name == "handle" {
-                return true;
+        self.all_ancestors(class_name)
+            .iter()
+            .any(|n| n == "handle")
+    }
+
+    fn class_has_static_or_enum_or_const(&self, class_name: &str) -> bool {
+        for anc in self.all_ancestors(class_name) {
+            if let Some(cls) = self.classes.get(&anc) {
+                if !cls.static_methods.is_empty()
+                    || !cls.enumerations.is_empty()
+                    || cls.properties.iter().any(|p| p.constant)
+                {
+                    return true;
+                }
             }
-            guard += 1;
-            if guard > 32 {
-                break;
-            }
-            cur = self
-                .classes
-                .get(name)
-                .and_then(|c| c.superclass.as_deref());
         }
         false
     }
 
-    fn isa_class(&self, val: &Value, expected: &str) -> bool {
-        let mut cur = match val {
+    fn is_static_method(&self, class_name: &str, method_name: &str) -> bool {
+        for anc in self.all_ancestors(class_name) {
+            if let Some(cls) = self.classes.get(&anc) {
+                if cls.static_methods.iter().any(|m| m == method_name) {
+                    return true;
+                }
+                if cls.methods.iter().any(|m| m.name == method_name) {
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
+    fn resolve_class_ref_field(
+        &mut self,
+        class_name: &str,
+        field: &str,
+        stdout: &mut String,
+    ) -> Result<Option<Value>> {
+        // 1. Enumeration member
+        if let Some(cls) = self.classes.get(class_name).cloned() {
+            if let Some((_, arg_chunks)) = cls.enumerations.iter().find(|(n, _)| n == field) {
+                let mut eval_args = Vec::with_capacity(arg_chunks.len());
+                for ch in arg_chunks {
+                    eval_args.push(oop::eval_standalone_chunk(self, ch, "__enum_arg", stdout)?);
+                }
+                let mut obj = self.instantiate_class(&cls, &eval_args, stdout)?;
+                if let Value::Object(ref mut inst) = obj {
+                    inst.fields.insert("__enum".to_string(), Value::String(field.to_string()));
+                }
+                return Ok(Some(obj));
+            }
+        }
+        // 2. Constant property on class or ancestor
+        for anc in self.all_ancestors(class_name) {
+            if let Some(cls) = self.classes.get(&anc).cloned() {
+                if let Some(prop) = cls.properties.iter().find(|p| p.name == field && p.constant) {
+                    let val = if let Some(ch) = &prop.default {
+                        oop::eval_standalone_chunk(self, ch, "__prop_default", stdout)?
+                    } else {
+                        Value::empty()
+                    };
+                    return Ok(Some(val));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn add_event_listener(&mut self, handle_id: usize, args: &[Value]) -> Result<()> {
+        if args.len() < 2 {
+            return Err(MatroError::arity("addlistener", "2 (eventName, callback)", args.len()));
+        }
+        let ev = args[0].as_str()?.to_string();
+        let Value::Closure(cl) = &args[1] else {
+            return Err(MatroError::runtime(
+                "addlistener: callback must be a function handle",
+            ));
+        };
+        self.listeners
+            .entry((handle_id, ev))
+            .or_default()
+            .push(cl.clone());
+        Ok(())
+    }
+
+    fn notify_event(
+        &mut self,
+        handle: &HandleRef,
+        args: &[Value],
+        stdout: &mut String,
+    ) -> Result<()> {
+        if args.is_empty() {
+            return Err(MatroError::arity("notify", ">= 1 (eventName [, data])", 0));
+        }
+        let ev = args[0].as_str()?.to_string();
+        let data = if args.len() >= 2 {
+            args[1].clone()
+        } else {
+            let mut m = BTreeMap::new();
+            m.insert("EventName".to_string(), Value::String(ev.clone()));
+            m.insert("Source".to_string(), Value::Handle(handle.clone()));
+            Value::Struct(m)
+        };
+        let cbs = self
+            .listeners
+            .get(&(handle.id, ev))
+            .cloned()
+            .unwrap_or_default();
+        for cb in cbs {
+            let cb_args = if cb.params.len() >= 2 {
+                vec![Value::Handle(handle.clone()), data.clone()]
+            } else if cb.params.len() == 1 {
+                vec![Value::Handle(handle.clone())]
+            } else {
+                vec![]
+            };
+            self.call_closure(&cb, &cb_args, 0, stdout)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn isa_class(&self, val: &Value, expected: &str) -> bool {
+        let cname = match val {
             Value::Object(o) => Some(o.class_name.as_str()),
             Value::Handle(h) => Some(h.class_name.as_str()),
             _ => None,
         };
-        let mut guard = 0;
-        while let Some(name) = cur {
-            if name == expected {
+        if let Some(name) = cname {
+            if self.all_ancestors(name).iter().any(|n| n == expected) {
                 return true;
             }
-            guard += 1;
-            if guard > 32 {
-                break;
-            }
-            cur = self
-                .classes
-                .get(name)
-                .and_then(|c| c.superclass.as_deref());
         }
         match expected {
-            "numeric" | "double" => {
+            "numeric" => {
                 matches!(val, Value::Matrix(m) if !m.is_logical()) || matches!(val, Value::Sparse(_))
+            }
+            "float" => {
+                matches!(val, Value::Matrix(m) if m.dtype().is_float())
+                    || matches!(val, Value::Sparse(_))
+            }
+            "integer" => matches!(val, Value::Matrix(m) if m.dtype().is_integer()),
+            "double" => {
+                matches!(val, Value::Matrix(m) if m.dtype() == matro_types::NumericClass::Double)
+                    || matches!(val, Value::Sparse(_))
             }
             _ => val.type_name() == expected,
         }
     }
 
-    fn find_class_method(&self, class_name: &str, method_name: &str) -> Option<FunctionProto> {
-        let mut cur = Some(class_name);
-        let mut guard = 0;
-        while let Some(name) = cur {
-            if let Some(cls) = self.classes.get(name) {
+    pub(crate) fn find_class_method(&self, class_name: &str, method_name: &str) -> Option<FunctionProto> {
+        for anc in self.all_ancestors(class_name) {
+            if let Some(cls) = self.classes.get(&anc) {
                 if let Some(m) = cls.methods.iter().find(|m| m.name == method_name) {
                     return Some(m.clone());
                 }
-                cur = cls.superclass.as_deref();
-            } else {
-                break;
-            }
-            guard += 1;
-            if guard > 32 {
-                break;
             }
         }
         None
@@ -1828,18 +2200,9 @@ impl Vm {
 
     fn collect_class_hierarchy(&self, class_name: &str) -> Vec<ClassProto> {
         let mut chain = Vec::new();
-        let mut cur = Some(class_name.to_string());
-        let mut guard = 0;
-        while let Some(name) = cur {
-            if let Some(cls) = self.classes.get(&name) {
-                cur = cls.superclass.clone();
+        for anc in self.all_ancestors(class_name) {
+            if let Some(cls) = self.classes.get(&anc) {
                 chain.push(cls.clone());
-            } else {
-                break;
-            }
-            guard += 1;
-            if guard > 32 {
-                break;
             }
         }
         chain.reverse(); // base -> derived
@@ -1855,23 +2218,16 @@ impl Vm {
         let chain = self.collect_class_hierarchy(&cls.name);
         let mut fields = BTreeMap::new();
         for c in &chain {
-            for (prop_name, default_chunk) in &c.properties {
-                let val = if let Some(ch) = default_chunk {
-                    let mut tmp_val = None;
-                    let prev = self.globals.remove("__prop_default");
-                    self.run_frame(ch, None, stdout, &mut tmp_val)?;
-                    let v = self
-                        .globals
-                        .remove("__prop_default")
-                        .unwrap_or_else(Value::empty);
-                    if let Some(p) = prev {
-                        self.globals.insert("__prop_default".to_string(), p);
-                    }
-                    v
+            for prop in &c.properties {
+                if prop.dependent {
+                    continue;
+                }
+                let val = if let Some(ch) = &prop.default {
+                    oop::eval_standalone_chunk(self, ch, "__prop_default", stdout)?
                 } else {
                     Value::empty()
                 };
-                fields.insert(prop_name.clone(), val);
+                fields.insert(prop.name.clone(), val);
             }
         }
 
@@ -2296,6 +2652,96 @@ impl Vm {
                 let (t_mat, y_mat) = solvers::solve_ode15s(self, cl, &tspan, &y0, stdout)?;
                 return Ok(vec![Value::matrix(t_mat), Value::matrix(y_mat)]);
             }
+            "ode23" => {
+                if call_args.len() != 3 {
+                    return Err(MatroError::arity("ode23", "3 (f, tspan, y0)", call_args.len()));
+                }
+                let Value::Closure(cl) = &call_args[0] else {
+                    return Err(MatroError::runtime(
+                        "ode23: first argument must be a function handle @(t, y) ...",
+                    ));
+                };
+                let tspan = call_args[1].as_matrix()?.clone();
+                let y0 = call_args[2].as_matrix()?.clone();
+                let (t_mat, y_mat) = solvers_ext::solve_ode23(self, cl, &tspan, &y0, stdout)?;
+                return Ok(vec![Value::matrix(t_mat), Value::matrix(y_mat)]);
+            }
+            "ode113" => {
+                if call_args.len() != 3 {
+                    return Err(MatroError::arity("ode113", "3 (f, tspan, y0)", call_args.len()));
+                }
+                let Value::Closure(cl) = &call_args[0] else {
+                    return Err(MatroError::runtime(
+                        "ode113: first argument must be a function handle @(t, y) ...",
+                    ));
+                };
+                let tspan = call_args[1].as_matrix()?.clone();
+                let y0 = call_args[2].as_matrix()?.clone();
+                let (t_mat, y_mat) = solvers_ext::solve_ode113(self, cl, &tspan, &y0, stdout)?;
+                return Ok(vec![Value::matrix(t_mat), Value::matrix(y_mat)]);
+            }
+            "bvpinit" => {
+                if call_args.len() != 2 {
+                    return Err(MatroError::arity("bvpinit", "2 (x, yinit)", call_args.len()));
+                }
+                let x = call_args[0].to_dense_matrix()?;
+                let solinit = solvers_ext::eval_bvpinit(self, &x, &call_args[1], stdout)?;
+                return Ok(vec![solinit]);
+            }
+            "bvp4c" => {
+                if call_args.len() != 3 {
+                    return Err(MatroError::arity(
+                        "bvp4c",
+                        "3 (odefun, bcfun, solinit)",
+                        call_args.len(),
+                    ));
+                }
+                let Value::Closure(ode_cl) = &call_args[0] else {
+                    return Err(MatroError::runtime(
+                        "bvp4c: first argument must be an ODE function handle @(x, y) ...",
+                    ));
+                };
+                let Value::Closure(bc_cl) = &call_args[1] else {
+                    return Err(MatroError::runtime(
+                        "bvp4c: second argument must be a BC function handle @(ya, yb) ...",
+                    ));
+                };
+                let sol = solvers_ext::solve_bvp4c(self, ode_cl, bc_cl, &call_args[2], stdout)?;
+                return Ok(vec![sol]);
+            }
+            "deval" => {
+                if call_args.len() != 2 {
+                    return Err(MatroError::arity("deval", "2 (sol, xint)", call_args.len()));
+                }
+                let xint = call_args[1].to_dense_matrix()?;
+                let val = solvers_ext::eval_deval(&call_args[0], &xint)?;
+                return Ok(vec![val]);
+            }
+            "pdepe" => {
+                if call_args.len() != 6 {
+                    return Err(MatroError::arity(
+                        "pdepe",
+                        "6 (m, pdefun, icfun, bcfun, xmesh, tspan)",
+                        call_args.len(),
+                    ));
+                }
+                let m_sym = call_args[0].as_scalar()?;
+                let Value::Closure(pde_cl) = &call_args[1] else {
+                    return Err(MatroError::runtime("pdepe: pdefun must be a function handle"));
+                };
+                let Value::Closure(ic_cl) = &call_args[2] else {
+                    return Err(MatroError::runtime("pdepe: icfun must be a function handle"));
+                };
+                let Value::Closure(bc_cl) = &call_args[3] else {
+                    return Err(MatroError::runtime("pdepe: bcfun must be a function handle"));
+                };
+                let xmesh = call_args[4].to_dense_matrix()?;
+                let tspan = call_args[5].to_dense_matrix()?;
+                let sol = solvers_ext::solve_pdepe(
+                    self, m_sym, pde_cl, ic_cl, bc_cl, &xmesh, &tspan, stdout,
+                )?;
+                return Ok(vec![sol]);
+            }
             "fzero" => {
                 if call_args.len() != 2 {
                     return Err(MatroError::arity("fzero", "2 (f, x0)", call_args.len()));
@@ -2330,6 +2776,58 @@ impl Vm {
                 }
                 let expected = call_args[1].as_str()?;
                 return Ok(vec![Value::bool(self.isa_class(&call_args[0], expected))]);
+            }
+            "addlistener" => {
+                if call_args.len() < 3 {
+                    return Err(MatroError::arity(
+                        "addlistener",
+                        "3 (handleObj, eventName, callback)",
+                        call_args.len(),
+                    ));
+                }
+                let Value::Handle(ref h) = call_args[0] else {
+                    return Err(MatroError::runtime(
+                        "addlistener: first argument must be a handle object",
+                    ));
+                };
+                self.add_event_listener(h.id, &call_args[1..])?;
+                return Ok(vec![]);
+            }
+            "notify" => {
+                if call_args.len() < 2 {
+                    return Err(MatroError::arity(
+                        "notify",
+                        ">= 2 (handleObj, eventName [, data])",
+                        call_args.len(),
+                    ));
+                }
+                let Value::Handle(h) = call_args[0].clone() else {
+                    return Err(MatroError::runtime(
+                        "notify: first argument must be a handle object",
+                    ));
+                };
+                self.notify_event(&h, &call_args[1..], stdout)?;
+                return Ok(vec![]);
+            }
+            "builtin" => {
+                if call_args.is_empty() {
+                    return Err(MatroError::arity("builtin", ">= 1 (funcName, args...)", 0));
+                }
+                let fname = call_args[0].as_str()?;
+                if let Some(res) = call_intrinsic(
+                    fname,
+                    &call_args[1..],
+                    nargout,
+                    &mut IntrinsicContext {
+                        stdout,
+                        figure: &mut self.figure,
+                        rng: &mut self.rng,
+                        loader: &mut self.loader,
+                    },
+                ) {
+                    return res;
+                }
+                return Err(MatroError::undefined(fname));
             }
             "fminsearch" => {
                 if call_args.len() != 2 {
@@ -2655,6 +3153,17 @@ impl Vm {
             .get(cl.id)
             .cloned()
             .ok_or_else(|| MatroError::runtime("Invalid closure handle"))?;
+        if let Some(target_name) = proto.name.strip_prefix('@') {
+            if let Some(Value::Closure(inner)) = cl.captures.get(target_name) {
+                return self.call_closure(inner, args, nargout, stdout);
+            }
+            if let Some(eid) = cl.env_id {
+                if let Some(Value::Closure(inner)) = self.envs.get(eid).and_then(|e| e.get(target_name)).cloned() {
+                    return self.call_closure(&inner, args, nargout, stdout);
+                }
+            }
+            return self.invoke_named_callable(target_name, args, nargout, None, stdout);
+        }
         let env_id = cl.env_id.or_else(|| {
             if proto.has_nested {
                 let eid = self.envs.len();
@@ -2695,21 +3204,6 @@ impl Vm {
         mut frame: LocalFrame<'_>,
         stdout: &mut String,
     ) -> Result<Vec<Value>> {
-        let has_varargin = proto.varargin_slot.is_some();
-        let fixed_params = if has_varargin {
-            proto.params.len() - 1
-        } else {
-            proto.params.len()
-        };
-
-        if !has_varargin && args.len() > fixed_params {
-            return Err(MatroError::arity(
-                &proto.name,
-                format!("at most {}", proto.params.len()),
-                args.len(),
-            ));
-        }
-
         if let Some(s) = proto.nargin_slot {
             frame.set(s, Value::scalar(args.len() as f64));
         }
@@ -2717,17 +3211,36 @@ impl Vm {
             frame.set(s, Value::scalar(nargout as f64));
         }
 
-        for (&slot, v) in proto.param_slots.iter().take(fixed_params).zip(args.iter()) {
-            frame.set(slot, v.clone());
-        }
-        if let Some(vslot) = proto.varargin_slot {
-            let extra: Vec<Value> = args.iter().skip(fixed_params).cloned().collect();
-            let cell = if extra.is_empty() {
-                CellArray::empty()
+        if !proto.arg_specs.is_empty() {
+            oop::bind_arguments_block(self, proto, args, &mut frame, stdout)?;
+        } else {
+            let has_varargin = proto.varargin_slot.is_some();
+            let fixed_params = if has_varargin {
+                proto.params.len() - 1
             } else {
-                CellArray::from_rows(vec![extra])?
+                proto.params.len()
             };
-            frame.set(vslot, Value::Cell(cell));
+
+            if !has_varargin && args.len() > fixed_params {
+                return Err(MatroError::arity(
+                    &proto.name,
+                    format!("at most {}", proto.params.len()),
+                    args.len(),
+                ));
+            }
+
+            for (&slot, v) in proto.param_slots.iter().take(fixed_params).zip(args.iter()) {
+                frame.set(slot, v.clone());
+            }
+            if let Some(vslot) = proto.varargin_slot {
+                let extra: Vec<Value> = args.iter().skip(fixed_params).cloned().collect();
+                let cell = if extra.is_empty() {
+                    CellArray::empty()
+                } else {
+                    CellArray::from_rows(vec![extra])?
+                };
+                frame.set(vslot, Value::Cell(cell));
+            }
         }
         if let Some(voslot) = proto.varargout_slot {
             frame.set(voslot, Value::Cell(CellArray::empty()));
@@ -3136,16 +3649,6 @@ fn bin_logical(stack: &mut Vec<StackItem>, f: impl Fn(f64, f64) -> bool) -> Resu
         .to_dense_matrix()?
         .elementwise(&b.to_dense_matrix()?, |x, y| if f(x, y) { 1.0 } else { 0.0 })?
         .with_logical(true);
-    stack.push(StackItem::Val(Value::matrix(res)));
-    Ok(())
-}
-
-fn bin_elem_c(stack: &mut Vec<StackItem>, f: impl Fn(Complex, Complex) -> Complex) -> Result<()> {
-    let b = pop_val(stack)?;
-    let a = pop_val(stack)?;
-    let res = a
-        .to_dense_matrix()?
-        .elementwise_c(&b.to_dense_matrix()?, f)?;
     stack.push(StackItem::Val(Value::matrix(res)));
     Ok(())
 }

@@ -354,57 +354,57 @@ impl Matrix {
         let mut a = self.clone();
         let mut v = Matrix::eye(n, n);
 
-        for _ in 0..100 {
-            let mut max_off = 0.0;
-            let mut p = 0;
-            let mut q = 1;
-            for i in 0..n {
-                for j in (i + 1)..n {
-                    let val = a.get(i, j).abs();
-                    if val > max_off {
-                        max_off = val;
-                        p = i;
-                        q = j;
+        // Cyclic Jacobi sweeps: quadratically convergent, O(n^3) per sweep
+        for _sweep in 0..50 {
+            let mut max_off = 0.0f64;
+            for p in 0..n {
+                for q in (p + 1)..n {
+                    let apq = a.get(p, q);
+                    let abs_apq = apq.abs();
+                    if abs_apq > max_off {
+                        max_off = abs_apq;
+                    }
+                    if abs_apq <= 1e-15 {
+                        continue;
+                    }
+                    let app = a.get(p, p);
+                    let aqq = a.get(q, q);
+                    let tau = (aqq - app) / (2.0 * apq);
+                    let t = if tau >= 0.0 {
+                        1.0 / (tau + (1.0 + tau * tau).sqrt())
+                    } else {
+                        -1.0 / (-tau + (1.0 + tau * tau).sqrt())
+                    };
+                    let c = 1.0 / (1.0 + t * t).sqrt();
+                    let s = t * c;
+
+                    for i in 0..n {
+                        if i != p && i != q {
+                            let aip = a.get(i, p);
+                            let aiq = a.get(i, q);
+                            let np = c * aip - s * aiq;
+                            let nq = s * aip + c * aiq;
+                            a.set(i, p, np);
+                            a.set(p, i, np);
+                            a.set(i, q, nq);
+                            a.set(q, i, nq);
+                        }
+                    }
+                    a.set(p, p, c * c * app - 2.0 * s * c * apq + s * s * aqq);
+                    a.set(q, q, s * s * app + 2.0 * s * c * apq + c * c * aqq);
+                    a.set(p, q, 0.0);
+                    a.set(q, p, 0.0);
+
+                    for i in 0..n {
+                        let vip = v.get(i, p);
+                        let viq = v.get(i, q);
+                        v.set(i, p, c * vip - s * viq);
+                        v.set(i, q, s * vip + c * viq);
                     }
                 }
             }
             if max_off < 1e-14 {
                 break;
-            }
-            let app = a.get(p, p);
-            let aqq = a.get(q, q);
-            let apq = a.get(p, q);
-            let tau = (aqq - app) / (2.0 * apq);
-            let t = if tau >= 0.0 {
-                1.0 / (tau + (1.0 + tau * tau).sqrt())
-            } else {
-                -1.0 / (-tau + (1.0 + tau * tau).sqrt())
-            };
-            let c = 1.0 / (1.0 + t * t).sqrt();
-            let s = t * c;
-
-            for i in 0..n {
-                if i != p && i != q {
-                    let aip = a.get(i, p);
-                    let aiq = a.get(i, q);
-                    let np = c * aip - s * aiq;
-                    let nq = s * aip + c * aiq;
-                    a.set(i, p, np);
-                    a.set(p, i, np);
-                    a.set(i, q, nq);
-                    a.set(q, i, nq);
-                }
-            }
-            a.set(p, p, c * c * app - 2.0 * s * c * apq + s * s * aqq);
-            a.set(q, q, s * s * app + 2.0 * s * c * apq + c * c * aqq);
-            a.set(p, q, 0.0);
-            a.set(q, p, 0.0);
-
-            for i in 0..n {
-                let vip = v.get(i, p);
-                let viq = v.get(i, q);
-                v.set(i, p, c * vip - s * viq);
-                v.set(i, q, s * vip + c * viq);
             }
         }
 

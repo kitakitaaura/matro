@@ -57,9 +57,15 @@ pub enum StmtKind {
     },
     ClassDef {
         name: String,
-        superclass: Option<String>,
-        properties: Vec<(String, Option<Expr>)>,
+        superclasses: Vec<String>,
+        properties: Vec<PropDef>,
         methods: Vec<MethodDef>,
+        enumerations: Vec<(String, Vec<Expr>)>,
+        events: Vec<String>,
+    },
+    Arguments {
+        repeating: bool,
+        entries: Vec<ArgSpec>,
     },
     Global(Vec<String>),
     Persistent(Vec<String>),
@@ -69,11 +75,29 @@ pub enum StmtKind {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct PropDef {
+    pub name: String,
+    pub default: Option<Expr>,
+    pub dependent: bool,
+    pub constant: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArgSpec {
+    pub target: String,          // e.g. "x" or "opts"
+    pub field: Option<String>,   // e.g. Some("Color") for opts.Color
+    pub class_name: Option<String>,
+    pub validators: Vec<(String, Vec<Expr>)>, // e.g. ("mustBePositive", []) or ("mustBeMember", [allowed])
+    pub default: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct MethodDef {
     pub name: String,
     pub params: Vec<String>,
     pub returns: Vec<String>,
     pub body: Vec<Stmt>,
+    pub is_static: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
