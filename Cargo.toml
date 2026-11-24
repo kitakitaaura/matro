@@ -14,8 +14,13 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
-description = "A lightweight, modular, Wasm-ready MATLAB/Octave bytecode VM written in pure Rust."
+license = "MIT"
+repository = "https://github.com/kitakitaaura/matro"
+homepage = "https://kitakitaaura.github.io/matro/"
+readme = "README.md"
+keywords = ["matlab", "octave", "wasm", "bytecode-vm", "scientific-computing"]
+categories = ["science", "mathematics", "wasm", "compilers"]
+description = "A lightweight, modular, zero-dependency MATLAB/Octave bytecode VM written in pure Rust."
 
 [workspace.dependencies]
 matro_types = { path = "crates/matro_types" }
@@ -26,6 +31,15 @@ matro_intrinsics = { path = "crates/matro_intrinsics" }
 matro_vm = { path = "crates/matro_vm" }
 
 [profile.release]
-opt-level = "s"
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
 lto = true
+codegen-units = 1
+panic = "abort"
 strip = true

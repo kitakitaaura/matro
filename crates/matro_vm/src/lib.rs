@@ -19,18 +19,39 @@ pub struct EvalOutput {
     pub last_value: Option<Value>,
 }
 
-/// Internal stack slot (regular value, `:` index sentinel, or comma-separated list spread `c{:}`).
+/// Internal stack slot (regular value, fast unboxed scalar, `:` sentinel, or `c{:}` spread).
 #[derive(Debug, Clone)]
 enum StackItem {
     Val(Value),
+    Scalar(f64),
     Colon,
     Spread(Vec<Value>),
 }
 
 impl StackItem {
+    #[inline]
+    fn from_value_fast(v: &Value) -> Self {
+        if let Value::Matrix(m) = v {
+            if let Some(x) = m.is_real_non_logical_scalar() {
+                return Self::Scalar(x);
+            }
+        }
+        Self::Val(v.clone())
+    }
+
+    #[inline]
+    fn as_fast_scalar(&self) -> Option<f64> {
+        match self {
+            Self::Scalar(x) => Some(*x),
+            Self::Val(Value::Matrix(m)) => m.is_real_non_logical_scalar(),
+            _ => None,
+        }
+    }
+
     fn into_val(self) -> Result<Value> {
         match self {
             Self::Val(v) => Ok(v),
+            Self::Scalar(x) => Ok(Value::scalar(x)),
             Self::Colon => Err(MatroError::runtime("Unexpected ':' outside indexing")),
             Self::Spread(mut vs) => {
                 if vs.is_empty() {
@@ -142,6 +163,21 @@ impl<'a> LocalFrame<'a> {
     fn set(&mut self, slot: u16, val: Value) {
         if let Some(cell) = self.slots.get_mut(slot as usize) {
             *cell = Some(val);
+        }
+    }
+
+    /// Zero-allocation scalar update when the local slot uniquely owns a scalar `Arc<Matrix>`.
+    #[inline]
+    fn set_scalar(&mut self, slot: u16, x: f64) {
+        if let Some(cell) = self.slots.get_mut(slot as usize) {
+            if let Some(Value::Matrix(arc)) = cell {
+                if let Some(m) = std::sync::Arc::get_mut(arc) {
+                    if m.set_scalar_in_place(x) {
+                        return;
+                    }
+                }
+            }
+            *cell = Some(Value::scalar(x));
         }
     }
 
@@ -471,26 +507,33 @@ impl Vm {
     ) -> Result<bool> {
         match op {
             OpCode::LoadConst(idx) => {
-                stack.push(StackItem::Val(chunk.constants[idx as usize].clone()));
+                stack.push(StackItem::from_value_fast(&chunk.constants[idx as usize]));
             }
             OpCode::LoadLocal(slot) => {
                 let f = frame
                     .as_deref()
                     .ok_or_else(|| MatroError::runtime("LoadLocal outside function frame"))?;
                 if let Some(val) = f.get(slot) {
-                    stack.push(StackItem::Val(val.clone()));
+                    stack.push(StackItem::from_value_fast(val));
                 } else {
                     let name = f.names[slot as usize].as_str();
                     return Err(MatroError::undefined(name));
                 }
             }
             OpCode::StoreLocal(slot) => {
-                let val = pop_val(stack)?;
-                *last_value = Some(val.clone());
+                let item = stack
+                    .pop()
+                    .ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
                 let f = frame
                     .as_deref_mut()
                     .ok_or_else(|| MatroError::runtime("StoreLocal outside function frame"))?;
-                f.set(slot, val);
+                match item {
+                    StackItem::Scalar(x) => f.set_scalar(slot, x),
+                    other => {
+                        let val = other.into_val()?;
+                        f.set(slot, val);
+                    }
+                }
             }
             OpCode::InitGlobal(idx) => {
                 let name = chunk.names[idx as usize].clone();
@@ -720,16 +763,19 @@ impl Vm {
                 ))));
             }
             OpCode::Neg => {
-                let v = pop_val(stack)?;
-                let out = match v {
-                    Value::Sparse(s) => Value::sparse(s.scale(-1.0)),
-                    other => Value::matrix(other.as_matrix()?.map_c(|c| -c)),
-                };
-                stack.push(StackItem::Val(out));
+                if let Some(StackItem::Scalar(x)) = stack.last_mut() {
+                    *x = -*x;
+                } else {
+                    let v = pop_val(stack)?;
+                    let out = match v {
+                        Value::Sparse(s) => Value::sparse(s.scale(-1.0)),
+                        other => Value::matrix(other.as_matrix()?.map_c(|c| -c)),
+                    };
+                    stack.push(StackItem::Val(out));
+                }
             }
             OpCode::Pos => {
-                let v = pop_val(stack)?;
-                stack.push(StackItem::Val(v));
+                // unary `+` is a no-op on numeric scalars/matrices
             }
             OpCode::Not => {
                 let m = pop_val(stack)?
@@ -739,100 +785,149 @@ impl Vm {
                 stack.push(StackItem::Val(Value::matrix(m)));
             }
             OpCode::CTranspose => {
-                let v = pop_val(stack)?;
-                let out = match v {
-                    Value::Sparse(s) => Value::sparse(s.transpose()),
-                    other => Value::matrix(other.as_matrix()?.ctranspose()),
-                };
-                stack.push(StackItem::Val(out));
+                if matches!(stack.last(), Some(StackItem::Scalar(_))) {
+                    // real scalar conjugate transpose is itself
+                } else {
+                    let v = pop_val(stack)?;
+                    let out = match v {
+                        Value::Sparse(s) => Value::sparse(s.transpose()),
+                        other => Value::matrix(other.as_matrix()?.ctranspose()),
+                    };
+                    stack.push(StackItem::Val(out));
+                }
             }
             OpCode::Transpose => {
-                let v = pop_val(stack)?;
-                let out = match v {
-                    Value::Sparse(s) => Value::sparse(s.transpose()),
-                    other => Value::matrix(other.as_matrix()?.transpose()),
-                };
-                stack.push(StackItem::Val(out));
+                if matches!(stack.last(), Some(StackItem::Scalar(_))) {
+                    // real scalar transpose is itself
+                } else {
+                    let v = pop_val(stack)?;
+                    let out = match v {
+                        Value::Sparse(s) => Value::sparse(s.transpose()),
+                        other => Value::matrix(other.as_matrix()?.transpose()),
+                    };
+                    stack.push(StackItem::Val(out));
+                }
             }
             OpCode::Add => {
-                let b = pop_val(stack)?;
-                let a = pop_val(stack)?;
-                let out = match (&a, &b) {
-                    (Value::Sparse(sa), Value::Sparse(sb)) => Value::sparse(sa.add_scaled(sb, 1.0)?),
-                    _ => Value::matrix(
-                        a.to_dense_matrix()?
-                            .elementwise_c(&b.to_dense_matrix()?, |x, y| x + y)?,
-                    ),
-                };
-                stack.push(StackItem::Val(out));
+                let b_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
+                let a_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
+                if let (Some(x), Some(y)) = (a_item.as_fast_scalar(), b_item.as_fast_scalar()) {
+                    stack.push(StackItem::Scalar(x + y));
+                } else {
+                    let a = a_item.into_val()?;
+                    let b = b_item.into_val()?;
+                    let out = match (&a, &b) {
+                        (Value::Sparse(sa), Value::Sparse(sb)) => Value::sparse(sa.add_scaled(sb, 1.0)?),
+                        _ => Value::matrix(
+                            a.to_dense_matrix()?
+                                .elementwise_c(&b.to_dense_matrix()?, |x, y| x + y)?,
+                        ),
+                    };
+                    stack.push(StackItem::Val(out));
+                }
             }
             OpCode::Sub => {
-                let b = pop_val(stack)?;
-                let a = pop_val(stack)?;
-                let out = match (&a, &b) {
-                    (Value::Sparse(sa), Value::Sparse(sb)) => {
-                        Value::sparse(sa.add_scaled(sb, -1.0)?)
-                    }
-                    _ => Value::matrix(
-                        a.to_dense_matrix()?
-                            .elementwise_c(&b.to_dense_matrix()?, |x, y| x - y)?,
-                    ),
-                };
-                stack.push(StackItem::Val(out));
+                let b_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
+                let a_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
+                if let (Some(x), Some(y)) = (a_item.as_fast_scalar(), b_item.as_fast_scalar()) {
+                    stack.push(StackItem::Scalar(x - y));
+                } else {
+                    let a = a_item.into_val()?;
+                    let b = b_item.into_val()?;
+                    let out = match (&a, &b) {
+                        (Value::Sparse(sa), Value::Sparse(sb)) => {
+                            Value::sparse(sa.add_scaled(sb, -1.0)?)
+                        }
+                        _ => Value::matrix(
+                            a.to_dense_matrix()?
+                                .elementwise_c(&b.to_dense_matrix()?, |x, y| x - y)?,
+                        ),
+                    };
+                    stack.push(StackItem::Val(out));
+                }
             }
             OpCode::ElemMul => {
-                let b = pop_val(stack)?;
-                let a = pop_val(stack)?;
-                let out = match (&a, &b) {
-                    (Value::Sparse(sa), Value::Sparse(sb)) => Value::sparse(sa.elem_mul(sb)?),
-                    (Value::Sparse(sa), Value::Matrix(mb)) if mb.as_scalar().is_some() => {
-                        Value::sparse(sa.scale(mb.as_scalar().unwrap()))
-                    }
-                    (Value::Matrix(ma), Value::Sparse(sb)) if ma.as_scalar().is_some() => {
-                        Value::sparse(sb.scale(ma.as_scalar().unwrap()))
-                    }
-                    _ => Value::matrix(
-                        a.to_dense_matrix()?
-                            .elementwise_c(&b.to_dense_matrix()?, |x, y| x * y)?,
-                    ),
-                };
-                stack.push(StackItem::Val(out));
+                let b_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
+                let a_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
+                if let (Some(x), Some(y)) = (a_item.as_fast_scalar(), b_item.as_fast_scalar()) {
+                    stack.push(StackItem::Scalar(x * y));
+                } else {
+                    let a = a_item.into_val()?;
+                    let b = b_item.into_val()?;
+                    let out = match (&a, &b) {
+                        (Value::Sparse(sa), Value::Sparse(sb)) => Value::sparse(sa.elem_mul(sb)?),
+                        (Value::Sparse(sa), Value::Matrix(mb)) if mb.as_scalar().is_some() => {
+                            Value::sparse(sa.scale(mb.as_scalar().unwrap()))
+                        }
+                        (Value::Matrix(ma), Value::Sparse(sb)) if ma.as_scalar().is_some() => {
+                            Value::sparse(sb.scale(ma.as_scalar().unwrap()))
+                        }
+                        _ => Value::matrix(
+                            a.to_dense_matrix()?
+                                .elementwise_c(&b.to_dense_matrix()?, |x, y| x * y)?,
+                        ),
+                    };
+                    stack.push(StackItem::Val(out));
+                }
             }
-            OpCode::ElemDiv => bin_elem_c(stack, |a, b| a / b)?,
+            OpCode::ElemDiv => {
+                let b_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
+                let a_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
+                if let (Some(x), Some(y)) = (a_item.as_fast_scalar(), b_item.as_fast_scalar()) {
+                    stack.push(StackItem::Scalar(x / y));
+                } else {
+                    let a = a_item.into_val()?;
+                    let b = b_item.into_val()?;
+                    let res = a.to_dense_matrix()?.elementwise_c(&b.to_dense_matrix()?, |x, y| x / y)?;
+                    stack.push(StackItem::Val(Value::matrix(res)));
+                }
+            }
             OpCode::ElemPow => bin_elem_c(stack, Complex::powc)?,
             OpCode::Mul => {
-                let b = pop_val(stack)?;
-                let a = pop_val(stack)?;
-                let out = match (&a, &b) {
-                    (Value::Sparse(sa), Value::Sparse(sb)) => Value::sparse(sa.matmul_sparse(sb)?),
-                    (Value::Sparse(sa), Value::Matrix(mb)) => {
-                        if let Some(sc) = mb.as_scalar() {
-                            Value::sparse(sa.scale(sc))
-                        } else {
-                            Value::matrix(sa.matmul_dense(mb)?)
+                let b_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
+                let a_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
+                if let (Some(x), Some(y)) = (a_item.as_fast_scalar(), b_item.as_fast_scalar()) {
+                    stack.push(StackItem::Scalar(x * y));
+                } else {
+                    let a = a_item.into_val()?;
+                    let b = b_item.into_val()?;
+                    let out = match (&a, &b) {
+                        (Value::Sparse(sa), Value::Sparse(sb)) => Value::sparse(sa.matmul_sparse(sb)?),
+                        (Value::Sparse(sa), Value::Matrix(mb)) => {
+                            if let Some(sc) = mb.as_scalar() {
+                                Value::sparse(sa.scale(sc))
+                            } else {
+                                Value::matrix(sa.matmul_dense(mb)?)
+                            }
                         }
-                    }
-                    (Value::Matrix(ma), Value::Sparse(sb)) => {
-                        if let Some(sc) = ma.as_scalar() {
-                            Value::sparse(sb.scale(sc))
-                        } else {
-                            Value::matrix(ma.matmul(&sb.to_dense())?)
+                        (Value::Matrix(ma), Value::Sparse(sb)) => {
+                            if let Some(sc) = ma.as_scalar() {
+                                Value::sparse(sb.scale(sc))
+                            } else {
+                                Value::matrix(ma.matmul(&sb.to_dense())?)
+                            }
                         }
-                    }
-                    _ => Value::matrix(a.as_matrix()?.matmul(b.as_matrix()?)?),
-                };
-                stack.push(StackItem::Val(out));
+                        _ => Value::matrix(a.as_matrix()?.matmul(b.as_matrix()?)?),
+                    };
+                    stack.push(StackItem::Val(out));
+                }
             }
             OpCode::Div => {
-                let b = pop_val(stack)?;
-                let a = pop_val(stack)?;
-                let out = match (&a, &b) {
-                    (Value::Sparse(sa), Value::Matrix(mb)) if mb.as_scalar().is_some() => {
-                        Value::sparse(sa.scale(1.0 / mb.as_scalar().unwrap()))
-                    }
-                    _ => Value::matrix(a.to_dense_matrix()?.rdivide(&b.to_dense_matrix()?)?),
-                };
-                stack.push(StackItem::Val(out));
+                let b_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
+                let a_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
+                if let (Some(x), Some(y)) = (a_item.as_fast_scalar(), b_item.as_fast_scalar()) {
+                    stack.push(StackItem::Scalar(x / y));
+                } else {
+                    let a = a_item.into_val()?;
+                    let b = b_item.into_val()?;
+                    let out = match (&a, &b) {
+                        (Value::Sparse(sa), Value::Matrix(mb)) if mb.as_scalar().is_some() => {
+                            Value::sparse(sa.scale(1.0 / mb.as_scalar().unwrap()))
+                        }
+                        _ => Value::matrix(a.to_dense_matrix()?.rdivide(&b.to_dense_matrix()?)?),
+                    };
+                    stack.push(StackItem::Val(out));
+                }
             }
             OpCode::LeftDiv => {
                 let b = pop_val(stack)?;
@@ -889,13 +984,18 @@ impl Vm {
                 *ip = target as usize;
             }
             OpCode::JumpIfFalse(target) => {
-                let v = pop_val(stack)?;
-                if !v.is_truthy() {
+                let truthy = match stack.pop() {
+                    Some(StackItem::Scalar(x)) => x != 0.0 && !x.is_nan(),
+                    Some(other) => other.into_val()?.is_truthy(),
+                    None => return Err(MatroError::runtime("VM stack underflow")),
+                };
+                if !truthy {
                     *ip = target as usize;
                 }
             }
             OpCode::JumpIfFalsePeek(target) => {
                 let truthy = match stack.last() {
+                    Some(StackItem::Scalar(x)) => *x != 0.0 && !x.is_nan(),
                     Some(StackItem::Val(v)) => v.is_truthy(),
                     _ => return Err(MatroError::runtime("Stack underflow")),
                 };
@@ -905,6 +1005,7 @@ impl Vm {
             }
             OpCode::JumpIfTruePeek(target) => {
                 let truthy = match stack.last() {
+                    Some(StackItem::Scalar(x)) => *x != 0.0 && !x.is_nan(),
                     Some(StackItem::Val(v)) => v.is_truthy(),
                     _ => return Err(MatroError::runtime("Stack underflow")),
                 };
@@ -914,11 +1015,11 @@ impl Vm {
             }
             OpCode::SwitchMatch => {
                 let case_val = pop_val(stack)?;
-                let scrutinee = match stack.last() {
-                    Some(StackItem::Val(v)) => v,
+                let matched = match stack.last() {
+                    Some(StackItem::Val(v)) => switch_matches(v, &case_val),
+                    Some(StackItem::Scalar(x)) => switch_matches(&Value::scalar(*x), &case_val),
                     _ => return Err(MatroError::runtime("Stack underflow in switch")),
                 };
-                let matched = switch_matches(scrutinee, &case_val);
                 stack.push(StackItem::Val(Value::bool(matched)));
             }
             OpCode::TryEnter {
@@ -1072,7 +1173,7 @@ impl Vm {
                 let state = for_loops
                     .last_mut()
                     .ok_or_else(|| MatroError::runtime("ForNextLocal without active loop"))?;
-                let next_val = match state {
+                match state {
                     ForLoopState::Range {
                         start,
                         step,
@@ -1080,31 +1181,30 @@ impl Vm {
                         count,
                     } => {
                         if *idx < *count {
-                            let v = Value::scalar(*start + (*idx as f64) * (*step));
+                            let val = *start + (*idx as f64) * (*step);
                             *idx += 1;
-                            Some(v)
+                            let f = frame.as_deref_mut().ok_or_else(|| {
+                                MatroError::runtime("ForNextLocal outside function")
+                            })?;
+                            f.set_scalar(slot, val);
+                            *ip = loop_ip as usize;
                         } else {
-                            None
+                            for_loops.pop();
                         }
                     }
                     ForLoopState::Matrix { matrix, col_idx } => {
                         if *col_idx < matrix.cols() {
                             let col = extract_col(matrix, *col_idx);
                             *col_idx += 1;
-                            Some(Value::matrix(col))
+                            let f = frame.as_deref_mut().ok_or_else(|| {
+                                MatroError::runtime("ForNextLocal outside function")
+                            })?;
+                            f.set(slot, Value::matrix(col));
+                            *ip = loop_ip as usize;
                         } else {
-                            None
+                            for_loops.pop();
                         }
                     }
-                };
-                if let Some(v) = next_val {
-                    let f = frame
-                        .as_deref_mut()
-                        .ok_or_else(|| MatroError::runtime("ForNextLocal outside function"))?;
-                    f.set(slot, v);
-                    *ip = loop_ip as usize;
-                } else {
-                    for_loops.pop();
                 }
             }
             OpCode::ForPop => {
@@ -2247,6 +2347,42 @@ impl Vm {
                 }
                 return Ok(vec![Value::matrix(best_x)]);
             }
+            "fsolve" => {
+                if call_args.len() != 2 {
+                    return Err(MatroError::arity("fsolve", "2 (f, x0)", call_args.len()));
+                }
+                let Value::Closure(cl) = &call_args[0] else {
+                    return Err(MatroError::runtime(
+                        "fsolve: first argument must be a function handle",
+                    ));
+                };
+                let x0 = call_args[1].as_matrix()?.clone();
+                let (sol, _resnorm, residual) = solvers::solve_lm(self, cl, &x0, stdout)?;
+                if nargout >= 2 {
+                    return Ok(vec![Value::matrix(sol), Value::matrix(residual)]);
+                }
+                return Ok(vec![Value::matrix(sol)]);
+            }
+            "lsqnonlin" => {
+                if call_args.len() != 2 {
+                    return Err(MatroError::arity("lsqnonlin", "2 (f, x0)", call_args.len()));
+                }
+                let Value::Closure(cl) = &call_args[0] else {
+                    return Err(MatroError::runtime(
+                        "lsqnonlin: first argument must be a function handle",
+                    ));
+                };
+                let x0 = call_args[1].as_matrix()?.clone();
+                let (sol, resnorm, residual) = solvers::solve_lm(self, cl, &x0, stdout)?;
+                let mut out = vec![Value::matrix(sol)];
+                if nargout >= 2 {
+                    out.push(Value::scalar(resnorm));
+                }
+                if nargout >= 3 {
+                    out.push(Value::matrix(residual));
+                }
+                return Ok(out);
+            }
             "integral" => {
                 if call_args.len() != 3 {
                     return Err(MatroError::arity("integral", "3 (f, a, b)", call_args.len()));
@@ -2983,6 +3119,7 @@ fn flatten_call_args(raw_args: Vec<StackItem>) -> Result<Vec<Value>> {
     for item in raw_args {
         match item {
             StackItem::Val(v) => out.push(v),
+            StackItem::Scalar(x) => out.push(Value::scalar(x)),
             StackItem::Spread(vs) => out.extend(vs),
             StackItem::Colon => {
                 return Err(MatroError::runtime("Unexpected ':' outside indexing"));
@@ -3025,6 +3162,15 @@ fn extract_col(m: &Matrix, col: usize) -> Matrix {
 fn resolve_indices(item: &StackItem, max_len: usize) -> Result<Vec<usize>> {
     match item {
         StackItem::Colon => Ok((0..max_len).collect()),
+        StackItem::Scalar(x) => {
+            let idx = x.round() as isize;
+            if (x - idx as f64).abs() > 1e-12 || idx < 1 || (idx as usize) > max_len {
+                return Err(MatroError::index(format!(
+                    "Index {x} out of bounds for length {max_len} (1-based)"
+                )));
+            }
+            Ok(vec![(idx - 1) as usize])
+        }
         StackItem::Spread(vs) => {
             let first = vs.first().ok_or_else(|| {
                 MatroError::index("Empty comma-separated list cannot be used as index")
@@ -3323,6 +3469,13 @@ fn assign_matrix_index(m: &mut Matrix, args: &[StackItem], rhs: &Matrix) -> Resu
             let max_len = m.len();
             let idxs: Vec<usize> = match &args[0] {
                 StackItem::Colon => (0..max_len).collect(),
+                StackItem::Scalar(x) => {
+                    let i = x.round() as isize;
+                    if i < 1 {
+                        return Err(MatroError::index(format!("Index {x} must be >= 1")));
+                    }
+                    vec![(i - 1) as usize]
+                }
                 StackItem::Spread(_) => {
                     return Err(MatroError::index(
                         "Comma-separated list cannot be used as assignment index",
@@ -3376,6 +3529,14 @@ fn assign_matrix_index(m: &mut Matrix, args: &[StackItem], rhs: &Matrix) -> Resu
             let parse_dim = |item: &StackItem, cur: usize| -> Result<Vec<usize>> {
                 match item {
                     StackItem::Colon => Ok((0..cur).collect()),
+                    StackItem::Scalar(x) => {
+                        let i = x.round() as isize;
+                        if i < 1 {
+                            Err(MatroError::index(format!("Index {x} must be >= 1")))
+                        } else {
+                            Ok(vec![(i - 1) as usize])
+                        }
+                    }
                     StackItem::Spread(_) => Err(MatroError::index(
                         "Comma-separated list cannot be used as assignment index",
                     )),
@@ -3448,6 +3609,13 @@ fn assign_matrix_index(m: &mut Matrix, args: &[StackItem], rhs: &Matrix) -> Resu
                 let cur = m.dim_size(ax);
                 let idxs = match arg {
                     StackItem::Colon => (0..cur).collect(),
+                    StackItem::Scalar(x) => {
+                        let i = x.round() as isize;
+                        if i < 1 {
+                            return Err(MatroError::index(format!("Index {x} must be >= 1")));
+                        }
+                        vec![(i - 1) as usize]
+                    }
                     StackItem::Spread(_) => {
                         return Err(MatroError::index(
                             "Comma-separated list cannot be used as assignment index",

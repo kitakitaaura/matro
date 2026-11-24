@@ -406,6 +406,25 @@ impl Matrix {
     }
 
     #[inline]
+    pub fn is_real_non_logical_scalar(&self) -> Option<f64> {
+        if self.rows == 1 && self.cols == 1 && self.extra_dims.is_none() && self.im.is_none() && !self.logical {
+            Some(self.re[0])
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn set_scalar_in_place(&mut self, val: f64) -> bool {
+        if self.rows == 1 && self.cols == 1 && self.extra_dims.is_none() && self.im.is_none() && !self.logical {
+            self.re[0] = val;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[inline]
     pub fn rows(&self) -> usize {
         self.rows
     }

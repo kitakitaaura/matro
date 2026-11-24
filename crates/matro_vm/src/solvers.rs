@@ -826,3 +826,141 @@ pub fn solve_fminsearch(
     };
     Ok((mat, best_f))
 }
+
+/// Levenberg-Marquardt nonlinear least-squares / system solver (`lsqnonlin` & `fsolve`).
+/// Minimizes `0.5 * ||r(x)||_2^2` with finite-difference Jacobian and adaptive damping.
+pub fn solve_lm(
+    vm: &mut Vm,
+    cl: &ClosureHandle,
+    x0: &Matrix,
+    stdout: &mut String,
+) -> Result<(Matrix, f64, Matrix)> {
+    let n = x0.len();
+    if n == 0 {
+        return Err(MatroError::dimension("fsolve/lsqnonlin: x0 cannot be empty"));
+    }
+    let is_row = x0.rows() == 1;
+    let mut eval_r = |x: &[f64]| -> Result<Vec<f64>> {
+        let arg = if x.len() == 1 {
+            Value::scalar(x[0])
+        } else if is_row {
+            Value::matrix(Matrix::row_vec(x.to_vec()))
+        } else {
+            Value::matrix(Matrix::col_vec(x.to_vec()))
+        };
+        let rets = vm.call_closure(cl, &[arg], 1, stdout)?;
+        let m = rets
+            .into_iter()
+            .next()
+            .unwrap_or_else(Value::empty)
+            .as_matrix()?
+            .clone();
+        Ok(m.data().to_vec())
+    };
+
+    let mut x = x0.data().to_vec();
+    let mut r = eval_r(&x)?;
+    let m = r.len();
+    if m == 0 {
+        return Err(MatroError::dimension(
+            "fsolve/lsqnonlin: residual function returned empty vector",
+        ));
+    }
+    let mut cost: f64 = r.iter().map(|&v| v * v).sum();
+    let mut lambda = 1e-3f64;
+
+    for _ in 0..200 {
+        if cost < 1e-22 {
+            break;
+        }
+        // Finite-difference Jacobian J (m x n)
+        let mut jac = vec![0.0; m * n]; // col-major: col j at j*m..
+        let mut xp = x.clone();
+        for j in 0..n {
+            let eps = 1e-7 * x[j].abs().max(1.0);
+            xp[j] = x[j] + eps;
+            let rp = eval_r(&xp)?;
+            xp[j] = x[j];
+            if rp.len() != m {
+                return Err(MatroError::dimension(
+                    "fsolve/lsqnonlin: residual length changed across evaluations",
+                ));
+            }
+            for i in 0..m {
+                jac[j * m + i] = (rp[i] - r[i]) / eps;
+            }
+        }
+
+        // Normal equations: A = J' * J (n x n), g = -J' * r (n)
+        let mut jtj = Matrix::zeros(n, n);
+        let mut g = vec![0.0; n];
+        for c in 0..n {
+            let mut gc = 0.0;
+            for i in 0..m {
+                gc -= jac[c * m + i] * r[i];
+            }
+            g[c] = gc;
+            for row in c..n {
+                let mut s = 0.0;
+                for i in 0..m {
+                    s += jac[row * m + i] * jac[c * m + i];
+                }
+                jtj.set(row, c, s);
+                jtj.set(c, row, s);
+            }
+        }
+        let g_inf = g.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        if g_inf < 1e-11 {
+            break;
+        }
+
+        let mut accepted = false;
+        for _ in 0..12 {
+            let mut damped = jtj.clone();
+            for j in 0..n {
+                let d = damped.get(j, j);
+                damped.set(j, j, d + lambda * d.max(1.0));
+            }
+            let Some(lu) = LuFactor::factor(&damped) else {
+                lambda *= 10.0;
+                continue;
+            };
+            let dx = lu.solve(&g);
+            if dx.iter().any(|v| !v.is_finite()) {
+                lambda *= 10.0;
+                continue;
+            }
+            let x_new: Vec<f64> = (0..n).map(|i| x[i] + dx[i]).collect();
+            let r_new = eval_r(&x_new)?;
+            let cost_new: f64 = r_new.iter().map(|&v| v * v).sum();
+            if cost_new < cost {
+                let step_norm = dx.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+                x = x_new;
+                r = r_new;
+                cost = cost_new;
+                lambda = (lambda * 0.3).max(1e-12);
+                accepted = true;
+                if step_norm < 1e-11 * (1.0 + x.iter().map(|v| v.abs()).fold(0.0f64, f64::max)) {
+                    let x_mat = if is_row {
+                        Matrix::row_vec(x)
+                    } else {
+                        Matrix::col_vec(x)
+                    };
+                    return Ok((x_mat, cost, Matrix::col_vec(r)));
+                }
+                break;
+            }
+            lambda = (lambda * 5.0).min(1e12);
+        }
+        if !accepted {
+            break;
+        }
+    }
+
+    let x_mat = if is_row {
+        Matrix::row_vec(x)
+    } else {
+        Matrix::col_vec(x)
+    };
+    Ok((x_mat, cost, Matrix::col_vec(r)))
+}

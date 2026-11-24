@@ -910,8 +910,8 @@ fn render_panel_3d(svg: &mut String, panel: &PlotPanel, width: f64, height: f64)
 
     let pad_t = if panel.title.is_empty() { 18.0 } else { 34.0 };
     let cx = width * 0.5;
-    let cy = pad_t + (height - pad_t - 18.0) * 0.52;
-    let scale = (width.min(height - pad_t) * 0.34).max(30.0);
+    let cy = pad_t + (height - pad_t - 24.0) * 0.50;
+    let scale = (width.min(height - pad_t) * 0.28).max(26.0);
 
     // Project world (x, y, z) -> (screen_x, screen_y, cam_depth) where larger depth = closer
     let project = |x: f64, y: f64, z: f64| -> (f64, f64, f64) {
@@ -1055,31 +1055,35 @@ fn render_panel_3d(svg: &mut String, panel: &PlotPanel, width: f64, height: f64)
         ));
     }
 
-    // Axis endpoint ticks & labels
+    // Axis endpoint ticks & labels (clamped inside panel bounds so narrow subplots never clip)
     let xl = if panel.xlabel.is_empty() { "X" } else { &panel.xlabel };
     let yl = if panel.ylabel.is_empty() { "Y" } else { &panel.ylabel };
     let zl = if panel.zlabel.is_empty() { "Z" } else { &panel.zlabel };
     let (mx, my, _) = project(0.5 * (xmin + xmax), ymin, zmin);
     let (yx, yy, _) = project(xmax, 0.5 * (ymin + ymax), zmin);
     let (zx, zy, _) = project(xmin, ymin, 0.5 * (zmin + zmax));
+    let x_lbl_x = mx.clamp(56.0, (width - 56.0).max(56.0));
+    let x_lbl_y = (my + 15.0).min(height - 6.0);
+    let y_lbl_x = (yx + 6.0).min(width - 6.0);
+    let y_lbl_anchor = if y_lbl_x > width * 0.72 { "end" } else { "start" };
+    let z_lbl_x = (zx - 6.0).max(6.0);
+    let z_lbl_anchor = if z_lbl_x < width * 0.28 { "start" } else { "end" };
     svg.push_str(&format!(
-        "<text x=\"{mx:.1}\" y=\"{:.1}\" fill=\"#374151\" font-size=\"10.5\" text-anchor=\"middle\">{} [{}, {}]</text>",
-        my + 14.0,
+        "<text x=\"{x_lbl_x:.1}\" y=\"{x_lbl_y:.1}\" fill=\"#374151\" font-size=\"10\" text-anchor=\"middle\">{} [{}, {}]</text>",
         xml_escape(xl),
         fmt_tick(xmin),
         fmt_tick(xmax)
     ));
     svg.push_str(&format!(
-        "<text x=\"{:.1}\" y=\"{:.1}\" fill=\"#374151\" font-size=\"10.5\" text-anchor=\"start\">{} [{}, {}]</text>",
-        yx + 8.0,
-        yy + 10.0,
+        "<text x=\"{y_lbl_x:.1}\" y=\"{:.1}\" fill=\"#374151\" font-size=\"10\" text-anchor=\"{y_lbl_anchor}\">{} [{}, {}]</text>",
+        (yy + 11.0).min(height - 6.0),
         xml_escape(yl),
         fmt_tick(ymin),
         fmt_tick(ymax)
     ));
     svg.push_str(&format!(
-        "<text x=\"{:.1}\" y=\"{zy:.1}\" fill=\"#374151\" font-size=\"10.5\" text-anchor=\"end\">{} [{}, {}]</text>",
-        zx - 8.0,
+        "<text x=\"{z_lbl_x:.1}\" y=\"{:.1}\" fill=\"#374151\" font-size=\"10\" text-anchor=\"{z_lbl_anchor}\">{} [{}, {}]</text>",
+        zy.clamp(pad_t + 10.0, height - 10.0),
         xml_escape(zl),
         fmt_tick(zmin),
         fmt_tick(zmax)

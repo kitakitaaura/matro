@@ -16,12 +16,12 @@ jobs:
           targets: wasm32-unknown-unknown,wasm32-wasip1
       - name: Run Rust workspace tests
         run: cargo test --workspace
-      - name: Build browser Wasm (wasm32-unknown-unknown)
+      - name: Build browser Wasm (wasm32-unknown-unknown, wasm-release)
         run: |
-          cargo build -p matro_wasm --target wasm32-unknown-unknown --release
-          cp target/wasm32-unknown-unknown/release/matro_wasm.wasm packages/matro-wasm/
-      - name: Build portable WASI CLI (wasm32-wasip1)
-        run: cargo build -p matro_cli --target wasm32-wasip1 --release
+          cargo build -p matro_wasm --target wasm32-unknown-unknown --profile wasm-release
+          cp target/wasm32-unknown-unknown/wasm-release/matro_wasm.wasm packages/matro-wasm/
+      - name: Build portable WASI CLI (wasm32-wasip1, wasm-release)
+        run: cargo build -p matro_cli --target wasm32-wasip1 --profile wasm-release
       - name: Smoke test @matro/wasm in Node.js
         run: |
           node -e "

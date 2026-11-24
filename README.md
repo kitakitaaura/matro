@@ -1,6 +1,8 @@
 # Matro
 
-**Matro** is a modular, pure-Rust, **zero-external-dependency** MATLAB/Octave bytecode virtual machine targeting native CLI, WebAssembly in the browser (`wasm32-unknown-unknown`, **0 Wasm imports**), and portable WASI (`wasm32-wasip1`).
+**Matro** is a modular, pure-Rust, **zero-external-dependency** MATLAB/Octave bytecode virtual machine targeting native CLI, WebAssembly in the browser (`wasm32-unknown-unknown`, **0 Wasm imports**, `~302 KB` gzipped), and portable WASI (`wasm32-wasip1`).
+
+**[Try the Live Browser Playground →](https://kitakitaaura.github.io/matro/)**
 
 Inspired by the crate-layered architecture of [Ristretto](https://github.com/theseus-rs/ristretto), Matro cleanly separates lexing/parsing, bytecode compilation, virtual filesystem loading, numerical intrinsics, and execution across an 8-crate Cargo workspace.
 
@@ -38,12 +40,15 @@ MATLAB/Octave (.m)
   - Real & **complex** `lu`, `qr`, `chol`, `svd`, `eig`, `inv`, `pinv`, `det`, `rank`, `cond`, `null`, `orth`, `expm`, `A \ b`
   - Sparse CSC matrices (`sparse`, `speye`, `full`, `nnz`, `issparse`, `S \ b`, `pcg`)
   - Numerical solvers: `ode45` (Dormand-Prince RK4(5)), `ode15s` (adaptive L-stable TR-BDF2 stiff solver with cached LU), `fzero` (Brent), `integral` (adaptive Simpson), `fminsearch` (Nelder-Mead)
-- **Signal Processing, Regex & File I/O**
-  - `fft`/`ifft`, `fft2`/`ifft2`, `filter` (FIR/IIR), `conv`/`conv2`, `interp1`/`interp2`, `roots`/`poly`/`polyfit`/`polyval`
+- **Built-In Scientific Toolboxes (Pure Zero-Dep Rust)**
+  - **Statistics**: `std`, `var`, `median`, `prctile`, `quantile`, `cov`, `corrcoef`, `erf`, `erfc`, `normpdf`, `normcdf`, `norminv`, `ttest`, `kmeans` (k-means++), `pca`
+  - **Signal Processing**: `fft`/`ifft`, `fft2`/`ifft2`, `fftshift`/`ifftshift`, `hann`, `hamming`, `blackman`, `xcorr`, `findpeaks`, `butter` (digital Butterworth IIR), `filter`, `filtfilt` (zero-phase), `pwelch` (Welch PSD), `conv`/`conv2`, `interp1`/`interp2`
+  - **Optimization & Control**: `fsolve` & `lsqnonlin` (Levenberg-Marquardt), `linprog` (two-phase Simplex), `tf`, `step`, `bode`, `logspace`
+- **Strings, Regex & File I/O**
   - Pure-Rust `regexp`, `regexpi`, `regexprep`, `jsondecode`/`jsonencode`, set operations (`unique`, `ismember`, `setdiff`, `intersect`, `union`)
   - VFS-backed File I/O (`fopen`, `fclose`, `fprintf(fid, ...)`, `fgetl`, `fgets`, `fread`, `fwrite`, `feof`, `ftell`, `frewind`, `textscan`) + Level 5 `.mat` reader/writer with built-in RFC 1950/1951 zlib/DEFLATE `miCOMPRESSED` support
 - **Pure-Rust 2D & 3D SVG Plotting**
-  - `plot`, `semilogy`, `loglog`, `scatter`, `bar`, `stem`, `histogram`, `imagesc`, `contour`, `quiver`, `subplot`, `legend`, `xlim`/`ylim`, `hold`, `grid`
+  - `plot`, `semilogx`, `semilogy`, `loglog`, `scatter`, `bar`, `stem`, `histogram`, `imagesc`, `contour`, `quiver`, `subplot`, `legend`, `xlim`/`ylim`, `hold`, `grid`
   - 3D perspective SVG renderer with painter's algorithm: `surf`, `mesh`, `plot3`, `view(az, el)`, `zlabel`
 
 ## Quick Start
@@ -71,12 +76,19 @@ cargo build -p matro_cli --release
 
 ### Browser Playground
 ```bash
-# Rebuild the zero-import WebAssembly bundle
-cargo build -p matro_wasm --target wasm32-unknown-unknown --release
-cp target/wasm32-unknown-unknown/release/matro_wasm.wasm web/
+# Rebuild the size-optimized zero-import WebAssembly bundle
+cargo build -p matro_wasm --target wasm32-unknown-unknown --profile wasm-release
+cp target/wasm32-unknown-unknown/wasm-release/matro_wasm.wasm web/
 
 # Serve locally and open http://localhost:8080
 python3 -m http.server 8080 -d web
+```
+
+### Runnable Examples
+```bash
+./target/release/matro examples/signal_butter_bode.m --svg signal.svg
+./target/release/matro examples/stats_pca_kmeans.m
+./target/release/matro examples/control_step_bode.m --svg step.svg
 ```
 
 ### Embed with `@matro/wasm` (Browser & Node.js)
@@ -104,21 +116,21 @@ cargo build -p matro_cli --target wasm32-wasip1 --release
 wasmtime target/wasm32-wasip1/release/matro.wasm -e "disp(eig([0 -1; 1 0]))"
 ```
 
-## Benchmarks
+## Benchmarks & Footprint
 
 Measured with `./target/release/matro --bench` (Apple Silicon, `--release`, zero external dependencies):
 
 | Benchmark | Time |
 |---|---:|
-| Zero-alloc range loop (100,000 iters) | `20.79 ms` |
-| Blocked dense `matmul` (128×128) | `1.18 ms` |
-| Dense linear solve `A \ b` (80×80) | `0.45 ms` |
-| Radix-2 `fft` (4,096 pts) | `0.35 ms` |
-| Sparse Poisson `pcg` (400×400) | `0.76 ms` |
-| Stiff `ode15s` (Van der Pol $\mu=50$, $t \in [0,120]$) | `11.57 ms` |
+| Zero-alloc range loop (100,000 iters, unboxed scalar fast-path) | `10.78 ms` |
+| Blocked dense `matmul` (128×128) | `3.70 ms` |
+| Dense linear solve `A \ b` (80×80) | `1.15 ms` |
+| Radix-2 `fft` (4,096 pts) | `0.99 ms` |
+| Sparse Poisson `pcg` (400×400) | `1.06 ms` |
+| Stiff `ode15s` (Van der Pol $\mu=50$, $t \in [0,120]$) | `28.58 ms` |
 
-- `web/matro_wasm.wasm`: **~1.1 MB**, **0 Wasm imports**
-- `target/wasm32-wasip1/release/matro.wasm`: **~1.1 MB**
+- `web/matro_wasm.wasm` (`--profile wasm-release`): **~1.0 MB** raw (**`302 KB` gzipped**), **0 Wasm imports**
+- `target/wasm32-wasip1/wasm-release/matro.wasm`: **~963 KB**
 
 ## License
 

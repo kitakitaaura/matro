@@ -1,0 +1,41 @@
+name: Deploy Playground to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Build size-optimized matro_wasm.wasm
+        run: |
+          cargo build -p matro_wasm --target wasm32-unknown-unknown --profile wasm-release
+          cp target/wasm32-unknown-unknown/wasm-release/matro_wasm.wasm web/matro_wasm.wasm
+          ls -lh web/matro_wasm.wasm
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Upload web/ artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

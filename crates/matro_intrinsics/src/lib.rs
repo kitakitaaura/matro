@@ -6,7 +6,10 @@ use matro_types::{
 };
 
 mod extras;
+mod opt_ctrl;
 mod regex;
+mod signal;
+mod stats;
 pub mod tables;
 
 /// Mutable host context passed to intrinsic functions.
@@ -64,6 +67,7 @@ pub fn call_intrinsic(
         "randn" => fn_rand(args, ctx.rng, true),
         "rng" => fn_rng(args, ctx.rng),
         "linspace" => fn_linspace(args),
+        "logspace" => fn_logspace(args),
         "meshgrid" => fn_meshgrid(args),
         "diag" => fn_diag(args),
         "magic" => fn_magic(args),
@@ -169,12 +173,8 @@ pub fn call_intrinsic(
                 s / Complex::from_real(slice.len() as f64)
             }
         }),
-        "min" => fn_reduce(name, args, |slice| {
-            slice.iter().copied().fold(f64::INFINITY, f64::min)
-        }),
-        "max" => fn_reduce(name, args, |slice| {
-            slice.iter().copied().fold(f64::NEG_INFINITY, f64::max)
-        }),
+        "min" => fn_minmax("min", args, nargout, false),
+        "max" => fn_minmax("max", args, nargout, true),
 
         // Element-wise math
         "abs" => fn_unary_mat(name, args, |m| Ok(m.map_c_to_real(Complex::abs))),
@@ -208,6 +208,39 @@ pub fn call_intrinsic(
         // Output
         "disp" => fn_disp(args, ctx.stdout),
         "fprintf" | "printf" => fn_fprintf(args, ctx.stdout),
+
+        // Statistics toolbox
+        "std" => stats::fn_std_var("std", args, true),
+        "var" => stats::fn_std_var("var", args, false),
+        "median" => stats::fn_median(args),
+        "prctile" => stats::fn_quantile("prctile", args, true),
+        "quantile" => stats::fn_quantile("quantile", args, false),
+        "cov" => stats::fn_cov_or_corr("cov", args, false),
+        "corrcoef" => stats::fn_cov_or_corr("corrcoef", args, true),
+        "erf" => stats::fn_erf(args),
+        "erfc" => stats::fn_erfc(args),
+        "normpdf" => stats::fn_normpdf(args),
+        "normcdf" => stats::fn_normcdf(args),
+        "norminv" => stats::fn_norminv(args),
+        "ttest" => stats::fn_ttest(args, nargout),
+        "kmeans" => stats::fn_kmeans(args, nargout, ctx.rng),
+        "pca" => stats::fn_pca(args, nargout),
+
+        // Signal processing toolbox
+        "fftshift" => signal::fn_fftshift(args, false),
+        "ifftshift" => signal::fn_fftshift(args, true),
+        "hann" | "hamming" | "blackman" => signal::fn_window(name, args),
+        "xcorr" => signal::fn_xcorr(args, nargout),
+        "findpeaks" => signal::fn_findpeaks(args, nargout),
+        "butter" => signal::fn_butter(args),
+        "filtfilt" => signal::fn_filtfilt(args),
+        "pwelch" => signal::fn_pwelch(args, nargout),
+
+        // Optimization & Control toolbox
+        "linprog" => opt_ctrl::fn_linprog(args, nargout),
+        "tf" => opt_ctrl::fn_tf(args),
+        "step" => opt_ctrl::fn_step(args, nargout, ctx.figure),
+        "bode" => opt_ctrl::fn_bode(args, nargout, ctx.figure),
 
         // VFS & module path helpers
         "addpath" => fn_addpath(args, ctx.loader),
@@ -245,6 +278,7 @@ pub fn call_intrinsic(
 
         // Plotting
         "plot" => fn_plot(PlotKind::Line, args, ctx.figure, false, false),
+        "semilogx" => fn_plot(PlotKind::Line, args, ctx.figure, true, false),
         "semilogy" => fn_plot(PlotKind::Line, args, ctx.figure, false, true),
         "loglog" => fn_plot(PlotKind::Line, args, ctx.figure, true, true),
         "scatter" => fn_plot(PlotKind::Scatter, args, ctx.figure, false, false),
@@ -831,6 +865,30 @@ fn fn_linspace(args: &[Value]) -> Result<Vec<Value>> {
     ok1(Value::matrix(Matrix::row_vec(data)))
 }
 
+fn fn_logspace(args: &[Value]) -> Result<Vec<Value>> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(MatroError::arity("logspace", "2 or 3", args.len()));
+    }
+    let a = args[0].as_scalar()?;
+    let b = args[1].as_scalar()?;
+    let n = if args.len() == 3 {
+        as_usize(&args[2], "logspace")?
+    } else {
+        50
+    };
+    if n == 0 {
+        return ok1(Value::empty());
+    }
+    if n == 1 {
+        return ok1(Value::scalar(10f64.powf(b)));
+    }
+    let step = (b - a) / ((n - 1) as f64);
+    let data: Vec<f64> = (0..n)
+        .map(|i| 10f64.powf(if i + 1 == n { b } else { a + (i as f64) * step }))
+        .collect();
+    ok1(Value::matrix(Matrix::row_vec(data)))
+}
+
 fn fn_diag(args: &[Value]) -> Result<Vec<Value>> {
     if args.len() != 1 {
         return Err(MatroError::arity("diag", "1", args.len()));
@@ -1330,36 +1388,82 @@ fn fn_norm(args: &[Value]) -> Result<Vec<Value>> {
     ok1(Value::scalar(s.sqrt()))
 }
 
-fn fn_reduce(name: &str, args: &[Value], op: impl Fn(&[f64]) -> f64) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 2 {
-        return Err(MatroError::arity(name, "1 or 2", args.len()));
+fn fn_minmax(name: &str, args: &[Value], nargout: usize, is_max: bool) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity(name, "1 to 3", args.len()));
     }
     let m = args[0].as_matrix()?;
+    // Element-wise min(A, B) / max(A, B) when 2nd arg is non-empty and args.len() == 2
+    if args.len() == 2 && !args[1].as_matrix()?.is_empty() {
+        let b = args[1].as_matrix()?;
+        let out = m.elementwise(b, |x, y| if is_max { x.max(y) } else { x.min(y) })?;
+        return ok1(Value::matrix(out));
+    }
     if m.is_empty() {
-        return ok1(Value::scalar(0.0));
+        return if nargout >= 2 {
+            Ok(vec![Value::empty(), Value::empty()])
+        } else {
+            ok1(Value::empty())
+        };
     }
+    let best_in_slice = |xs: &[f64]| -> (f64, f64) {
+        let mut best_v = xs[0];
+        let mut best_i = 0usize;
+        for (i, &v) in xs.iter().enumerate().skip(1) {
+            if (is_max && v > best_v) || (!is_max && v < best_v) {
+                best_v = v;
+                best_i = i;
+            }
+        }
+        (best_v, (best_i + 1) as f64)
+    };
     if args.len() == 1 && (m.rows() == 1 || m.cols() == 1) {
-        return ok1(Value::scalar(op(m.data())));
+        let (v, idx) = best_in_slice(m.data());
+        return if nargout >= 2 {
+            Ok(vec![Value::scalar(v), Value::scalar(idx)])
+        } else {
+            ok1(Value::scalar(v))
+        };
     }
-    let dim = if args.len() == 2 {
-        as_usize(&args[1], name)?
+    let dim = if args.len() == 3 {
+        as_usize(&args[2], name)?
     } else {
         1
     };
     if dim == 1 {
-        let mut out = Vec::with_capacity(m.cols());
+        let mut vals = Vec::with_capacity(m.cols());
+        let mut idxs = Vec::with_capacity(m.cols());
         for c in 0..m.cols() {
             let col: Vec<f64> = (0..m.rows()).map(|r| m.get(r, c)).collect();
-            out.push(op(&col));
+            let (v, idx) = best_in_slice(&col);
+            vals.push(v);
+            idxs.push(idx);
         }
-        ok1(Value::matrix(Matrix::row_vec(out)))
+        if nargout >= 2 {
+            Ok(vec![
+                Value::matrix(Matrix::row_vec(vals)),
+                Value::matrix(Matrix::row_vec(idxs)),
+            ])
+        } else {
+            ok1(Value::matrix(Matrix::row_vec(vals)))
+        }
     } else if dim == 2 {
-        let mut out = Vec::with_capacity(m.rows());
+        let mut vals = Vec::with_capacity(m.rows());
+        let mut idxs = Vec::with_capacity(m.rows());
         for r in 0..m.rows() {
             let row: Vec<f64> = (0..m.cols()).map(|c| m.get(r, c)).collect();
-            out.push(op(&row));
+            let (v, idx) = best_in_slice(&row);
+            vals.push(v);
+            idxs.push(idx);
         }
-        ok1(Value::matrix(Matrix::col_vec(out)))
+        if nargout >= 2 {
+            Ok(vec![
+                Value::matrix(Matrix::col_vec(vals)),
+                Value::matrix(Matrix::col_vec(idxs)),
+            ])
+        } else {
+            ok1(Value::matrix(Matrix::col_vec(vals)))
+        }
     } else {
         Err(MatroError::runtime(format!("{name}: unsupported dimension {dim}")))
     }

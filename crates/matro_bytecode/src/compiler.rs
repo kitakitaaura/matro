@@ -296,6 +296,13 @@ impl Compiler {
         let line = stmt.span.line as u32;
         match &stmt.kind {
             StmtKind::Expr(expr) => {
+                if matches!(
+                    &expr.kind,
+                    ExprKind::CallOrIndex { callee, .. } if matches!(callee.as_str(), "bode" | "step")
+                ) {
+                    self.compile_expr(expr, 0, None)?;
+                    return Ok(());
+                }
                 self.compile_expr(expr, 1, None)?;
                 if stmt.suppressed {
                     if let Some(slot) = self.lookup_local("ans") {

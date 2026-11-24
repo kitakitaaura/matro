@@ -236,6 +236,7 @@
       <option value="opt_contour">Example: fminsearch, Contours &amp; Handles</option>
       <option value="stiff_dsp">Example: Stiff ODE15s, Filter, Regexp &amp; File I/O</option>
       <option value="surf_tables">Example: 3D Surf, Tables, Map &amp; Nested Closures</option>
+      <option value="toolboxes">Example: Toolboxes (Butterworth, PCA, fsolve, Bode)</option>
       <option value="linalg">Example: Linear Algebra (LU / QR / SVD / Eig)</option>
       <option value="fft">Example: Complex &amp; FFT</option>
       <option value="vfs">Example: Multi-file VFS, Masks &amp; Solvers</option>
@@ -513,6 +514,51 @@ t = linspace(0, 6*pi, 140);
 plot3(cos(t), sin(t), t / (6*pi), 'r');
 title('3D Helix (plot3)');
 xlabel('x'); ylabel('y'); zlabel('t');
+`
+      },
+      toolboxes: {
+        files: {},
+        code: `% Statistics, Signal Processing, Optimization & Control Toolboxes
+% 1. Zero-phase 4th-order Butterworth IIR filter + Welch PSD
+fs = 200;
+t = (0:399) / fs;
+pure = sin(2*pi*5*t);
+noisy = pure + 0.75 * sin(2*pi*65*t);
+[b, a] = butter(4, 20 / (fs / 2));
+clean = filtfilt(b, a, noisy);
+fprintf('Butterworth filtfilt RMS err: %.4f\\n', norm(clean(40:360) - pure(40:360)) / norm(pure(40:360)));
+
+% 2. Statistics: PCA + k-means + Student t-test
+rng(7);
+X = [randn(12, 2)*0.4; 5 + randn(12, 2)*0.4];
+[idx, C] = kmeans(X, 2);
+[~, ~, latent] = pca(X);
+[h, p] = ttest(X(1:12, 1), 0);
+fprintf('PCA PC1=%.1f%% | ttest p=%.3f (h=%d)\\n', 100*latent(1)/sum(latent), p, h);
+
+% 3. Optimization: fsolve & linprog
+[sol, ~] = fsolve(@(v) [v(1)^2 + v(2)^2 - 5; v(1) - v(2) - 1], [1.5; 0.5]);
+[xlp, flp] = linprog([-3; -5], [1 0; 0 2; 3 2], [4; 12; 18], [], [], [0; 0]);
+fprintf('fsolve=(%.3f, %.3f) | linprog=[%.1f, %.1f] fval=%.1f\\n', sol(1), sol(2), xlp(1), xlp(2), flp);
+
+% 4. Control Systems: 2nd-order transfer function step + Butterworth plot
+subplot(2, 1, 1);
+plot(t(1:150), noisy(1:150), 'r--');
+hold('on');
+plot(t(1:150), clean(1:150), 'b');
+legend('noisy (5+65 Hz)', 'filtfilt Butterworth');
+title('Zero-Phase Butterworth Filter');
+ylabel('Amp');
+grid('on');
+
+subplot(2, 1, 2);
+sys = tf(4, [1, 0.8, 4]);
+[ys, ts] = step(sys, linspace(0, 15, 220));
+plot(ts, ys, 'b');
+title('Step Response: G(s) = 4 / (s^2 + 0.8s + 4)');
+xlabel('Time (s)');
+ylabel('y(t)');
+grid('on');
 `
       },
       linalg: {
