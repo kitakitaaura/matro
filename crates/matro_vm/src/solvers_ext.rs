@@ -813,3 +813,175 @@ pub fn solve_pdepe(
         Ok(Value::matrix(sol))
     }
 }
+
+/// Brent's golden-section + parabolic 1D bounded minimizer: `[x, fval] = fminbnd(fun, x1, x2)`.
+pub fn solve_fminbnd(
+    vm: &mut Vm,
+    cl: &ClosureHandle,
+    x1: f64,
+    x2: f64,
+    stdout: &mut String,
+) -> Result<(f64, f64)> {
+    let mut a = x1.min(x2);
+    let mut b = x1.max(x2);
+    let golden = 0.3819660112501051f64; // (3 - sqrt(5))/2
+    let tol = 1e-8;
+    let mut eval_f = |x: f64| -> Result<f64> {
+        let r = vm.call_closure(cl, &[Value::scalar(x)], 1, stdout)?;
+        r.into_iter()
+            .next()
+            .unwrap_or_else(Value::empty)
+            .as_scalar()
+    };
+
+    let mut x = a + golden * (b - a);
+    let mut w = x;
+    let mut v = x;
+    let mut fx = eval_f(x)?;
+    let mut fw = fx;
+    let mut fv = fx;
+    let mut d = 0.0f64;
+    let mut e = 0.0f64;
+
+    for _ in 0..200 {
+        let xm = 0.5 * (a + b);
+        let tol1 = tol * x.abs() + 1e-11;
+        let tol2 = 2.0 * tol1;
+        if (x - xm).abs() <= tol2 - 0.5 * (b - a) {
+            break;
+        }
+        let mut use_golden = true;
+        if e.abs() > tol1 {
+            let r = (x - w) * (fx - fv);
+            let mut q = (x - v) * (fx - fw);
+            let mut p = (x - v) * q - (x - w) * r;
+            q = 2.0 * (q - r);
+            if q > 0.0 {
+                p = -p;
+            }
+            q = q.abs();
+            let etemp = e;
+            e = d;
+            if p.abs() < (0.5 * q * etemp).abs() && p > q * (a - x) && p < q * (b - x) {
+                d = p / q;
+                let u = x + d;
+                if (u - a) < tol2 || (b - u) < tol2 {
+                    d = if xm >= x { tol1 } else { -tol1 };
+                }
+                use_golden = false;
+            }
+        }
+        if use_golden {
+            e = if x >= xm { a - x } else { b - x };
+            d = golden * e;
+        }
+        let u = if d.abs() >= tol1 {
+            x + d
+        } else if d > 0.0 {
+            x + tol1
+        } else {
+            x - tol1
+        };
+        let fu = eval_f(u)?;
+        if fu <= fx {
+            if u >= x {
+                a = x;
+            } else {
+                b = x;
+            }
+            v = w;
+            fv = fw;
+            w = x;
+            fw = fx;
+            x = u;
+            fx = fu;
+        } else {
+            if u < x {
+                a = u;
+            } else {
+                b = u;
+            }
+            if fu <= fw || w == x {
+                v = w;
+                fv = fw;
+                w = u;
+                fw = fu;
+            } else if fu <= fv || v == x || v == w {
+                v = u;
+                fv = fu;
+            }
+        }
+    }
+    Ok((x, fx))
+}
+
+/// 2D Gauss-Legendre composite quadrature: `q = integral2(fun, xmin, xmax, ymin, ymax)`
+/// where `ymin` and `ymax` may be scalars or function handles `@(x)`.
+pub fn solve_integral2(
+    vm: &mut Vm,
+    fun_cl: &ClosureHandle,
+    xmin: f64,
+    xmax: f64,
+    ymin_v: &Value,
+    ymax_v: &Value,
+    stdout: &mut String,
+) -> Result<f64> {
+    // 5-point Gauss-Legendre nodes & weights on [-1, 1]
+    const NODES: [f64; 5] = [
+        -0.9061798459386640,
+        -0.5384693101056831,
+        0.0,
+        0.5384693101056831,
+        0.9061798459386640,
+    ];
+    const WEIGHTS: [f64; 5] = [
+        0.2369268850561891,
+        0.4786286704993665,
+        0.5688888888888889,
+        0.4786286704993665,
+        0.2369268850561891,
+    ];
+
+    let eval_bound = |vm: &mut Vm, b: &Value, x: f64, stdout: &mut String| -> Result<f64> {
+        match b {
+            Value::Closure(cl) => {
+                let r = vm.call_closure(cl, &[Value::scalar(x)], 1, stdout)?;
+                r.into_iter().next().unwrap_or_else(Value::empty).as_scalar()
+            }
+            other => other.as_scalar(),
+        }
+    };
+
+    let nx_panels = 8usize;
+    let ny_panels = 8usize;
+    let hx = (xmax - xmin) / (nx_panels as f64);
+    let mut total = 0.0;
+
+    for ix in 0..nx_panels {
+        let xa = xmin + (ix as f64) * hx;
+        let xb = xa + hx;
+        let xm = 0.5 * (xa + xb);
+        let xh = 0.5 * (xb - xa);
+        for (&nx, &wx) in NODES.iter().zip(WEIGHTS.iter()) {
+            let x = xm + xh * nx;
+            let ya_all = eval_bound(vm, ymin_v, x, stdout)?;
+            let yb_all = eval_bound(vm, ymax_v, x, stdout)?;
+            let hy = (yb_all - ya_all) / (ny_panels as f64);
+            let mut inner = 0.0;
+            for iy in 0..ny_panels {
+                let ya = ya_all + (iy as f64) * hy;
+                let yb = ya + hy;
+                let ym = 0.5 * (ya + yb);
+                let yh = 0.5 * (yb - ya);
+                for (&ny, &wy) in NODES.iter().zip(WEIGHTS.iter()) {
+                    let y = ym + yh * ny;
+                    let r = vm.call_closure(fun_cl, &[Value::scalar(x), Value::scalar(y)], 1, stdout)?;
+                    let val = r.into_iter().next().unwrap_or_else(Value::empty).as_scalar()?;
+                    inner += wy * yh * val;
+                }
+            }
+            total += wx * xh * inner;
+        }
+    }
+    Ok(total)
+}

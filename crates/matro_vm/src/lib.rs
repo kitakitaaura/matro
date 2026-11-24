@@ -11,6 +11,7 @@ use matro_types::{
 
 mod fileio;
 mod oop;
+mod opt_solvers;
 mod solvers;
 mod solvers_ext;
 
@@ -243,6 +244,7 @@ pub struct Vm {
     classes: HashMap<String, ClassProto>,
     handles: Vec<ObjectInstance>,
     listeners: HashMap<(usize, String), Vec<ClosureHandle>>,
+    imports: Vec<String>,
     closures: Vec<FunctionProto>,
     envs: Vec<BTreeMap<String, Value>>,
     figure: PlotFigure,
@@ -271,6 +273,7 @@ impl Vm {
             classes: HashMap::new(),
             handles: Vec::new(),
             listeners: HashMap::new(),
+            imports: Vec::new(),
             closures: Vec::new(),
             envs: Vec::new(),
             figure: PlotFigure::default(),
@@ -347,6 +350,7 @@ impl Vm {
         self.classes.clear();
         self.handles.clear();
         self.listeners.clear();
+        self.imports.clear();
         self.closures.clear();
         self.envs.clear();
         self.figure.clear();
@@ -663,6 +667,13 @@ impl Vm {
                     } else {
                         return Err(MatroError::undefined(name));
                     }
+                } else if self.loader.has_package(&name) {
+                    let mut f = BTreeMap::new();
+                    f.insert("__path".to_string(), Value::String(name));
+                    stack.push(StackItem::Val(Value::Object(ObjectInstance {
+                        class_name: "__pkg_ref".to_string(),
+                        fields: f,
+                    })));
                 } else {
                     return Err(MatroError::undefined(name));
                 }
@@ -1201,6 +1212,39 @@ impl Vm {
                             "No static method '{method_name}' on class '{cname}'"
                         )));
                     }
+                    if o.class_name == "__pkg_ref" {
+                        let pkg_path = o
+                            .fields
+                            .get("__path")
+                            .and_then(|v| v.as_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let call_args = flatten_call_args(raw_args)?;
+                        let results = self.call_package_member(
+                            &pkg_path,
+                            &method_name,
+                            &call_args,
+                            nargout as usize,
+                            stdout,
+                        )?;
+                        push_call_results(stack, results, nargout as usize);
+                        return Ok(true);
+                    }
+                    if method_name == "predict"
+                        && matches!(
+                            o.class_name.as_str(),
+                            "LinearModel"
+                                | "ClassificationKNN"
+                                | "ClassificationSVM"
+                                | "ClassificationNaiveBayes"
+                        )
+                    {
+                        let mut call_args = vec![receiver];
+                        call_args.extend(flatten_call_args(raw_args)?);
+                        let results = matro_intrinsics::stats_ml::fn_predict(&call_args)?;
+                        push_call_results(stack, results, nargout as usize);
+                        return Ok(true);
+                    }
                 }
                 if let Value::Handle(ref h) = receiver {
                     if h.class_name == "inputParser" {
@@ -1318,6 +1362,10 @@ impl Vm {
                     }
                     let key = MapData::key_of(&raw_args[0].clone().into_val()?)?;
                     map.entries.insert(key, rhs);
+                } else if let Some(updated) =
+                    self.try_subsasgn(&val, "()", &raw_args, rhs.clone(), stdout)?
+                {
+                    val = updated;
                 } else {
                     assign_matrix_index(val.as_matrix_mut()?, &raw_args, &rhs.to_dense_matrix()?)?;
                 }
@@ -1327,21 +1375,28 @@ impl Vm {
             OpCode::StoreIndexLocal { slot, argc } => {
                 let rhs = pop_val(stack)?;
                 let raw_args = pop_items(stack, argc as usize)?;
-                let f = frame
+                let mut val = frame
                     .as_deref_mut()
-                    .ok_or_else(|| MatroError::runtime("StoreIndexLocal outside function"))?;
-                let mut val = f.take(slot).unwrap_or_else(Value::empty);
+                    .ok_or_else(|| MatroError::runtime("StoreIndexLocal outside function"))?
+                    .take(slot)
+                    .unwrap_or_else(Value::empty);
                 if let Value::Map(ref mut map) = val {
                     if raw_args.len() != 1 {
                         return Err(MatroError::index("containers.Map indexing expects 1 key"));
                     }
                     let key = MapData::key_of(&raw_args[0].clone().into_val()?)?;
                     map.entries.insert(key, rhs);
+                } else if let Some(updated) =
+                    self.try_subsasgn(&val, "()", &raw_args, rhs.clone(), stdout)?
+                {
+                    val = updated;
                 } else {
                     assign_matrix_index(val.as_matrix_mut()?, &raw_args, &rhs.to_dense_matrix()?)?;
                 }
                 *last_value = Some(val.clone());
-                f.set(slot, val);
+                if let Some(f) = frame.as_deref_mut() {
+                    f.set(slot, val);
+                }
             }
             OpCode::CellIndex { argc, nargout } => {
                 let raw_args = pop_items(stack, argc as usize)?;
@@ -1424,6 +1479,15 @@ impl Vm {
                             .unwrap_or("")
                             .to_string();
                         self.resolve_class_ref_field(&cname, &field, stdout)?
+                    }
+                    Value::Object(ref inst) if inst.class_name == "__pkg_ref" => {
+                        let pkg_path = inst
+                            .fields
+                            .get("__path")
+                            .and_then(|v| v.as_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        self.resolve_pkg_field(&pkg_path, &field, stdout)?
                     }
                     Value::Object(inst) => {
                         let getter = format!("get.{field}");
@@ -2267,13 +2331,159 @@ impl Vm {
         Ok(obj)
     }
 
-    fn try_autoload_symbol(&mut self, name: &str, stdout: &mut String) -> Result<bool> {
-        let Some(mod_chunk) = self.loader.load_module(name)? else {
-            return Ok(false);
+    #[inline(never)]
+    fn try_subsasgn(
+        &mut self,
+        val: &Value,
+        kind: &str,
+        raw_args: &[StackItem],
+        rhs: Value,
+        stdout: &mut String,
+    ) -> Result<Option<Value>> {
+        let cname = match val {
+            Value::Object(o) => Some(o.class_name.clone()),
+            Value::Handle(h) => Some(h.class_name.clone()),
+            _ => None,
+        };
+        let Some(cls) = cname else {
+            return Ok(None);
+        };
+        let Some(proto) = self.find_class_method(&cls, "subsasgn") else {
+            return Ok(None);
+        };
+        let subs = flatten_call_args(raw_args.to_vec())?;
+        let mut s_map = BTreeMap::new();
+        s_map.insert("type".to_string(), Value::String(kind.to_string()));
+        let cell = if subs.is_empty() {
+            CellArray::empty()
+        } else {
+            CellArray::from_rows(vec![subs])?
+        };
+        s_map.insert("subs".to_string(), Value::Cell(cell));
+        let is_handle = matches!(val, Value::Handle(_));
+        let rets = self.call_user_func(
+            &proto,
+            &[val.clone(), Value::Struct(s_map), rhs],
+            if is_handle { 0 } else { 1 },
+            None,
+            stdout,
+        )?;
+        if is_handle {
+            Ok(Some(val.clone()))
+        } else {
+            Ok(Some(rets.into_iter().next().unwrap_or_else(|| val.clone())))
+        }
+    }
+
+    #[inline(never)]
+    fn resolve_pkg_field(
+        &mut self,
+        pkg_path: &str,
+        field: &str,
+        stdout: &mut String,
+    ) -> Result<Option<Value>> {
+        let sub_pkg = format!("{pkg_path}.{field}");
+        if self.loader.has_package(&sub_pkg) {
+            let mut f = BTreeMap::new();
+            f.insert("__path".to_string(), Value::String(sub_pkg));
+            return Ok(Some(Value::Object(ObjectInstance {
+                class_name: "__pkg_ref".to_string(),
+                fields: f,
+            })));
+        }
+        if let Some(mpath) = self.loader.resolve_package_member(pkg_path, field) {
+            let Some(chunk) = self.loader.load_module(&mpath)? else {
+                return Ok(None);
+            };
+            let mut ignored = None;
+            self.run_frame(&chunk, None, stdout, &mut ignored)?;
+            if let Some(cls) = self.classes.get(field).cloned() {
+                if self.class_has_static_or_enum_or_const(field) {
+                    let mut f = BTreeMap::new();
+                    f.insert("__name".to_string(), Value::String(field.to_string()));
+                    return Ok(Some(Value::Object(ObjectInstance {
+                        class_name: "__class_ref".to_string(),
+                        fields: f,
+                    })));
+                }
+                return Ok(Some(self.instantiate_class(&cls, &[], stdout)?));
+            }
+            if let Some(func) = self.functions.get(field).cloned() {
+                let rets = self.call_user_func(&func, &[], 1, None, stdout)?;
+                return Ok(Some(rets.into_iter().next().unwrap_or_else(Value::empty)));
+            }
+        }
+        Ok(None)
+    }
+
+    #[inline(never)]
+    fn call_package_member(
+        &mut self,
+        pkg_path: &str,
+        member: &str,
+        args: &[Value],
+        nargout: usize,
+        stdout: &mut String,
+    ) -> Result<Vec<Value>> {
+        let Some(mpath) = self.loader.resolve_package_member(pkg_path, member) else {
+            return Err(MatroError::runtime(format!(
+                "Unable to resolve package member '{pkg_path}.{member}'"
+            )));
+        };
+        let Some(chunk) = self.loader.load_module(&mpath)? else {
+            return Err(MatroError::runtime(format!(
+                "Unable to load package member '{pkg_path}.{member}'"
+            )));
         };
         let mut ignored = None;
-        self.run_frame(&mod_chunk, None, stdout, &mut ignored)?;
-        Ok(self.functions.contains_key(name) || self.classes.contains_key(name))
+        self.run_frame(&chunk, None, stdout, &mut ignored)?;
+        if let Some(func) = self.functions.get(member).cloned() {
+            return self.call_user_func(&func, args, nargout, None, stdout);
+        }
+        if let Some(cls) = self.classes.get(member).cloned() {
+            return Ok(vec![self.instantiate_class(&cls, args, stdout)?]);
+        }
+        Err(MatroError::runtime(format!(
+            "Package file '{mpath}' did not define function or class '{member}'"
+        )))
+    }
+
+    fn try_autoload_symbol(&mut self, name: &str, stdout: &mut String) -> Result<bool> {
+        if let Some(mod_chunk) = self.loader.load_module(name)? {
+            let mut ignored = None;
+            self.run_frame(&mod_chunk, None, stdout, &mut ignored)?;
+            if self.functions.contains_key(name) || self.classes.contains_key(name) {
+                return Ok(true);
+            }
+        }
+        // Check MATLAB `import pkg.*` and `import pkg.member` statements
+        let imports = self.imports.clone();
+        for imp in imports {
+            if let Some(pkg) = imp.strip_suffix(".*") {
+                if let Some(mpath) = self.loader.resolve_package_member(pkg, name) {
+                    if let Some(mod_chunk) = self.loader.load_module(&mpath)? {
+                        let mut ignored = None;
+                        self.run_frame(&mod_chunk, None, stdout, &mut ignored)?;
+                        if self.functions.contains_key(name) || self.classes.contains_key(name) {
+                            return Ok(true);
+                        }
+                    }
+                }
+            } else if let Some((pkg, member)) = imp.rsplit_once('.') {
+                if member == name {
+                    if let Some(mpath) = self.loader.resolve_package_member(pkg, name) {
+                        if let Some(mod_chunk) = self.loader.load_module(&mpath)? {
+                            let mut ignored = None;
+                            self.run_frame(&mod_chunk, None, stdout, &mut ignored)?;
+                            if self.functions.contains_key(name) || self.classes.contains_key(name) {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn do_tic(&mut self) {
@@ -2845,6 +3055,29 @@ impl Vm {
                 }
                 return Ok(vec![Value::matrix(best_x)]);
             }
+            "fminunc" => {
+                if call_args.len() != 2 {
+                    return Err(MatroError::arity("fminunc", "2 (fun, x0)", call_args.len()));
+                }
+                let Value::Closure(cl) = &call_args[0] else {
+                    return Err(MatroError::runtime(
+                        "fminunc: first argument must be a function handle",
+                    ));
+                };
+                let x0 = call_args[1].to_dense_matrix()?;
+                let (best_x, fval) = opt_solvers::solve_fminunc(self, cl, &x0, stdout)?;
+                if nargout >= 2 {
+                    return Ok(vec![Value::matrix(best_x), Value::scalar(fval)]);
+                }
+                return Ok(vec![Value::matrix(best_x)]);
+            }
+            "fmincon" => {
+                let (best_x, fval) = opt_solvers::solve_fmincon(self, call_args, stdout)?;
+                if nargout >= 2 {
+                    return Ok(vec![Value::matrix(best_x), Value::scalar(fval)]);
+                }
+                return Ok(vec![Value::matrix(best_x)]);
+            }
             "fsolve" => {
                 if call_args.len() != 2 {
                     return Err(MatroError::arity("fsolve", "2 (f, x0)", call_args.len()));
@@ -2894,6 +3127,58 @@ impl Vm {
                 let b = call_args[2].as_scalar()?;
                 let q = solvers::solve_integral(self, cl, a, b, stdout)?;
                 return Ok(vec![Value::scalar(q)]);
+            }
+            "integral2" => {
+                if call_args.len() != 5 {
+                    return Err(MatroError::arity(
+                        "integral2",
+                        "5 (fun, xmin, xmax, ymin, ymax)",
+                        call_args.len(),
+                    ));
+                }
+                let Value::Closure(cl) = &call_args[0] else {
+                    return Err(MatroError::runtime(
+                        "integral2: first argument must be a function handle @(x, y) ...",
+                    ));
+                };
+                let xmin = call_args[1].as_scalar()?;
+                let xmax = call_args[2].as_scalar()?;
+                let q = solvers_ext::solve_integral2(
+                    self,
+                    cl,
+                    xmin,
+                    xmax,
+                    &call_args[3],
+                    &call_args[4],
+                    stdout,
+                )?;
+                return Ok(vec![Value::scalar(q)]);
+            }
+            "fminbnd" => {
+                if call_args.len() != 3 {
+                    return Err(MatroError::arity("fminbnd", "3 (fun, x1, x2)", call_args.len()));
+                }
+                let Value::Closure(cl) = &call_args[0] else {
+                    return Err(MatroError::runtime(
+                        "fminbnd: first argument must be a function handle",
+                    ));
+                };
+                let x1 = call_args[1].as_scalar()?;
+                let x2 = call_args[2].as_scalar()?;
+                let (x, fval) = solvers_ext::solve_fminbnd(self, cl, x1, x2, stdout)?;
+                if nargout >= 2 {
+                    return Ok(vec![Value::scalar(x), Value::scalar(fval)]);
+                }
+                return Ok(vec![Value::scalar(x)]);
+            }
+            "import" => {
+                for a in call_args {
+                    let pat = a.as_str()?.trim().to_string();
+                    if !pat.is_empty() && !self.imports.contains(&pat) {
+                        self.imports.push(pat);
+                    }
+                }
+                return Ok(vec![]);
             }
             "run" => {
                 if call_args.len() != 1 {

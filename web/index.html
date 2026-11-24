@@ -238,6 +238,7 @@
       <option value="surf_tables">Example: 3D Surf, Tables, Map &amp; Nested Closures</option>
       <option value="toolboxes">Example: Toolboxes (Butterworth, PCA, fsolve, Bode)</option>
       <option value="core_full">Example: Spline/PCHIP, BVP4C, OOP Overloads &amp; Handle Graphics</option>
+      <option value="toolboxes_full">Example: LQR Control, fmincon, fitlm/SVM &amp; Chebyshev Filter</option>
       <option value="linalg">Example: Linear Algebra (LU / QR / SVD / Eig)</option>
       <option value="fft">Example: Complex &amp; FFT</option>
       <option value="vfs">Example: Multi-file VFS, Masks &amp; Solvers</option>
@@ -669,6 +670,54 @@ plot(xf, evalCurve(xf, Scale=1), 'k--');
 legend('bvp4c', 'exact sin(x)');
 title('bvp4c Lobatto IIIA Collocation Solution');
 fprintf('bvp4c max error vs sin(x): %.2e\\n', max(abs(yf(1, :) - sin(xf))));
+`
+      },
+      toolboxes_full: {
+        files: {},
+        code: `% All 5 Built-In Toolboxes: Control (LQR/ss/lsim), Optimization (fmincon/quadprog),
+% Statistics & ML (fitlm/fitcsvm/anova1), Signal (cheby1/freqz), Image (Otsu/Sobel)
+
+% 1. LQR Optimal Control on an unstable double integrator: x'' = u
+A = [0, 1; 0, 0]; B = [0; 1]; C = [1, 0]; D = 0;
+[K, S, P] = lqr(A, B, diag([10, 1]), 1);
+sys_cl = ss(A - B*K, B, C, D);
+t = linspace(0, 6, 120);
+[y_lqr, ~] = lsim(sys_cl, zeros(size(t)), t, [1; 0]);
+fprintf('LQR gain K = [%.3f, %.3f] | closed-loop poles = %.2f +/- %.2fi\\n', ...
+    K(1), K(2), real(P(1)), abs(imag(P(1))));
+
+% 2. Nonlinear constrained optimization (fmincon): min (x-2)^2+(y-2)^2 s.t. x^2+y^2 <= 1
+function [c, ceq] = disk(v)
+    c = v(1)^2 + v(2)^2 - 1;
+    ceq = [];
+end
+[xc, fc] = fmincon(@(v) (v(1)-2)^2 + (v(2)-2)^2, [0.4; 0.4], [], [], [], [], [], [], @disk);
+fprintf('fmincon on unit disk: x = (%.4f, %.4f), fval = %.4f\\n', xc(1), xc(2), fc);
+
+% 3. Regression (fitlm) & Binary Linear SVM (fitcsvm)
+x_reg = (1:8)';
+y_reg = 2.0 + 1.5 * x_reg + [0.1; -0.1; 0.05; -0.05; 0.1; -0.1; 0.05; -0.05];
+mdl = fitlm(x_reg, y_reg);
+svm = fitcsvm([-2,-2; -1,-2; -2,-1; 2,2; 1,2; 2,1], [0;0;0; 1;1;1]);
+fprintf('fitlm R^2 = %.5f | SVM predict([1.5, 1.5]) = %d\\n', ...
+    mdl.Rsquared.Ordinary, svm.predict([1.5, 1.5]));
+
+% 4. Chebyshev Type I IIR Filter frequency response
+[b, a] = cheby1(4, 1.0, 0.35);
+[H, w] = freqz(b, a, 128);
+
+% Plot LQR stabilization + Chebyshev IIR response
+subplot(2, 1, 1);
+plot(t, y_lqr, LineWidth=2.2, Color='#0072bd');
+title('LQR Closed-Loop Stabilization (Double Integrator)');
+xlabel('Time (s)');
+ylabel('Position x(t)');
+
+subplot(2, 1, 2);
+plot(w / pi, 20 * log10(max(abs(H), 1e-6)), LineWidth=2.0, Color='#d95319');
+title('4th-Order Chebyshev Type I Lowpass Filter (freqz)');
+xlabel('Normalized Frequency (x pi rad/sample)');
+ylabel('Magnitude (dB)');
 `
       },
       vfs: {

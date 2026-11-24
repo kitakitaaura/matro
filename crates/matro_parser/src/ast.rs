@@ -111,6 +111,12 @@ pub enum AssignTarget {
         indices: Vec<IndexArg>,
         fields: Vec<String>,
     },
+    /// Indexing into a struct/object field, e.g. `obj.Data(idx) = val`.
+    FieldIndex {
+        name: String,
+        fields: Vec<String>,
+        indices: Vec<IndexArg>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

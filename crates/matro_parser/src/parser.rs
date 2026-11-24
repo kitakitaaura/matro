@@ -794,6 +794,8 @@ impl Parser {
                             TokenKind::Ident(s) => word.push_str(&s),
                             TokenKind::Number(n) => word.push_str(&format!("{n}")),
                             TokenKind::Dot => word.push('.'),
+                            TokenKind::DotStar => word.push_str(".*"),
+                            TokenKind::Star => word.push('*'),
                             TokenKind::Slash => word.push('/'),
                             TokenKind::Minus => word.push('-'),
                             TokenKind::Plus => word.push('+'),
@@ -866,6 +868,36 @@ impl Parser {
                                 return Err(MatroError::syntax(
                                     span,
                                     "Invalid struct field assignment target",
+                                ));
+                            }
+                        }
+                    }
+                }
+                ExprKind::MethodCall {
+                    object,
+                    method,
+                    args,
+                } => {
+                    let mut fields = vec![method];
+                    let mut cur = *object;
+                    loop {
+                        match cur.kind {
+                            ExprKind::Ident(n) => {
+                                fields.reverse();
+                                break AssignTarget::FieldIndex {
+                                    name: n,
+                                    fields,
+                                    indices: args,
+                                };
+                            }
+                            ExprKind::FieldAccess { object: o, field: f } => {
+                                fields.push(f);
+                                cur = *o;
+                            }
+                            _ => {
+                                return Err(MatroError::syntax(
+                                    span,
+                                    "Invalid field-index assignment target",
                                 ));
                             }
                         }

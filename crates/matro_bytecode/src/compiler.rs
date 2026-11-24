@@ -133,8 +133,12 @@ impl Compiler {
                         | AssignTarget::Index { name: n, .. }
                         | AssignTarget::CellIndex { name: n, .. }
                         | AssignTarget::Field { name: n, .. }
-                        | AssignTarget::IndexedField { name: n, .. } => n,
+                        | AssignTarget::IndexedField { name: n, .. }
+                        | AssignTarget::FieldIndex { name: n, .. } => n,
                     };
+                    if matches!(target, AssignTarget::FieldIndex { .. }) {
+                        self.alloc_local("__matro_fi_tmp");
+                    }
                     if !self.globals_declared.contains(n)
                         && !self.persistents_declared.contains(n)
                         && !self.outer_locals.contains(n)
@@ -370,6 +374,11 @@ impl Compiler {
                             callee.as_str(),
                             "bode"
                                 | "step"
+                                | "impulse"
+                                | "nyquist"
+                                | "pzmap"
+                                | "freqz"
+                                | "spectrogram"
                                 | "plot"
                                 | "semilogx"
                                 | "semilogy"
@@ -586,6 +595,77 @@ impl Compiler {
                             },
                             line,
                         );
+                        if !stmt.suppressed {
+                            self.chunk.emit(OpCode::LoadVar(name_idx), line);
+                            self.chunk.emit(OpCode::PrintVar(name_idx), line);
+                        }
+                    }
+                }
+                AssignTarget::FieldIndex {
+                    name,
+                    fields,
+                    indices,
+                } => {
+                    // Desugar `obj.a.b(idx) = val` -> tmp = obj.a.b; tmp(idx) = val; obj.a.b = tmp
+                    let total_dims = indices.len() as u8;
+                    let path_idx = self.chunk.add_field_path(fields.clone());
+                    if let Some(slot) = self.lookup_local(name) {
+                        self.chunk.emit(OpCode::LoadLocal(slot), line);
+                    } else {
+                        let name_idx = self.chunk.add_name(name);
+                        self.chunk.emit(OpCode::LoadVar(name_idx), line);
+                    }
+                    for f in fields {
+                        let f_idx = self.chunk.add_name(f);
+                        self.chunk.emit(OpCode::GetField(f_idx), line);
+                    }
+                    if let Some(tmp_slot) = self.lookup_local("__matro_fi_tmp") {
+                        self.chunk.emit(OpCode::StoreLocal(tmp_slot), line);
+                        for (dim, arg) in indices.iter().enumerate() {
+                            self.compile_index_arg(
+                                arg,
+                                Some((EndTarget::Local(tmp_slot), dim as u8, total_dims)),
+                            )?;
+                        }
+                        self.compile_expr(value, 1, None)?;
+                        self.chunk.emit(
+                            OpCode::StoreIndexLocal {
+                                slot: tmp_slot,
+                                argc: total_dims,
+                            },
+                            line,
+                        );
+                        self.chunk.emit(OpCode::LoadLocal(tmp_slot), line);
+                    } else {
+                        let tmp_idx = self.chunk.add_name("__matro_fi_tmp");
+                        self.chunk.emit(OpCode::StoreVar(tmp_idx), line);
+                        for (dim, arg) in indices.iter().enumerate() {
+                            self.compile_index_arg(
+                                arg,
+                                Some((EndTarget::Global(tmp_idx), dim as u8, total_dims)),
+                            )?;
+                        }
+                        self.compile_expr(value, 1, None)?;
+                        self.chunk.emit(
+                            OpCode::StoreIndex {
+                                name_idx: tmp_idx,
+                                argc: total_dims,
+                            },
+                            line,
+                        );
+                        self.chunk.emit(OpCode::LoadVar(tmp_idx), line);
+                    }
+                    if let Some(slot) = self.lookup_local(name) {
+                        self.chunk
+                            .emit(OpCode::StoreFieldLocal { slot, path_idx }, line);
+                        if !stmt.suppressed {
+                            self.chunk.emit(OpCode::LoadLocal(slot), line);
+                            self.chunk.emit(OpCode::PrintLocal(slot), line);
+                        }
+                    } else {
+                        let name_idx = self.chunk.add_name(name);
+                        self.chunk
+                            .emit(OpCode::StoreField { name_idx, path_idx }, line);
                         if !stmt.suppressed {
                             self.chunk.emit(OpCode::LoadVar(name_idx), line);
                             self.chunk.emit(OpCode::PrintVar(name_idx), line);

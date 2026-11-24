@@ -93,7 +93,7 @@ impl Complex {
     }
 
     pub fn powc(self, exp: Self) -> Self {
-        if exp.im == 0.0 && self.im == 0.0 && self.re >= 0.0 {
+        if exp.im == 0.0 && self.im == 0.0 && (self.re >= 0.0 || exp.re.fract() == 0.0) {
             return Self::new(self.re.powf(exp.re), 0.0);
         }
         if self.is_zero() {

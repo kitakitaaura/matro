@@ -6,15 +6,20 @@ use matro_types::{
     SparseMatrix, Value,
 };
 
+mod control_ext;
 mod extras;
 pub mod fs_media;
+mod image_proc;
 pub mod interp;
 pub mod modern_types;
 mod opt_ctrl;
+mod opt_ext;
 mod regex;
 mod signal;
+mod signal_ext;
 mod sparse_eig;
 mod stats;
+pub mod stats_ml;
 pub mod tables;
 
 /// Mutable host context passed to intrinsic functions.
@@ -274,8 +279,32 @@ pub fn call_intrinsic(
         "normcdf" => stats::fn_normcdf(args),
         "norminv" => stats::fn_norminv(args),
         "ttest" => stats::fn_ttest(args, nargout),
+        "ttest2" => stats_ml::fn_ttest2(args, nargout),
         "kmeans" => stats::fn_kmeans(args, nargout, ctx.rng),
         "pca" => stats::fn_pca(args, nargout),
+        "gamma" => stats_ml::fn_gamma_fn(args, false),
+        "gammaln" => stats_ml::fn_gamma_fn(args, true),
+        "gammainc" => stats_ml::fn_gammainc(args),
+        "betainc" => stats_ml::fn_betainc(args),
+        "tpdf" | "tcdf" | "tinv" => stats_ml::fn_t_dist(name, args),
+        "chi2pdf" | "chi2cdf" | "chi2inv" => stats_ml::fn_chi2_dist(name, args),
+        "fpdf" | "fcdf" => stats_ml::fn_f_dist(name, args),
+        "exppdf" | "expcdf" | "expinv" => stats_ml::fn_exp_dist(name, args),
+        "binopdf" | "binocdf" => stats_ml::fn_bino_dist(name, args),
+        "poisspdf" | "poisscdf" => stats_ml::fn_poiss_dist(name, args),
+        "zscore" => stats_ml::fn_zscore(args, nargout),
+        "skewness" | "kurtosis" | "iqr" | "mad" => stats_ml::fn_moment_stat(name, args),
+        "fitlm" => stats_ml::fn_fitlm(args),
+        "regress" => stats_ml::fn_regress(args, nargout),
+        "anova1" => stats_ml::fn_anova1(args, nargout),
+        "fitcknn" => stats_ml::fn_fitcknn(args),
+        "fitcsvm" => stats_ml::fn_fitcsvm(args),
+        "fitcnb" => stats_ml::fn_fitcnb(args),
+        "predict" => stats_ml::fn_predict(args),
+        "pdist" => stats_ml::fn_pdist(args),
+        "squareform" => stats_ml::fn_squareform(args),
+        "linkage" => stats_ml::fn_linkage(args),
+        "cluster" => stats_ml::fn_cluster(args),
 
         // Signal processing toolbox
         "fftshift" => signal::fn_fftshift(args, false),
@@ -284,14 +313,52 @@ pub fn call_intrinsic(
         "xcorr" => signal::fn_xcorr(args, nargout),
         "findpeaks" => signal::fn_findpeaks(args, nargout),
         "butter" => signal::fn_butter(args),
+        "cheby1" => signal_ext::fn_cheby1(args),
+        "cheby2" => signal_ext::fn_cheby2(args),
+        "fir1" => signal_ext::fn_fir1(args),
+        "freqz" => signal_ext::fn_freqz(args, nargout, ctx.figure),
+        "grpdelay" => signal_ext::fn_grpdelay(args, nargout),
         "filtfilt" => signal::fn_filtfilt(args),
         "pwelch" => signal::fn_pwelch(args, nargout),
+        "spectrogram" | "stft" => signal_ext::fn_spectrogram(args, nargout, ctx.figure),
+        "hilbert" => signal_ext::fn_hilbert(args),
+        "envelope" => signal_ext::fn_envelope(args, nargout),
+        "medfilt1" => signal_ext::fn_medfilt1(args),
+        "sgolayfilt" => signal_ext::fn_sgolayfilt(args),
+        "detrend" => signal_ext::fn_detrend(args),
+        "downsample" => signal_ext::fn_downsample(args),
+        "upsample" => signal_ext::fn_upsample(args),
+        "resample" => signal_ext::fn_resample(args),
+        "bartlett" | "kaiser" | "flattopwin" => signal_ext::fn_extra_window(name, args),
 
         // Optimization & Control toolbox
         "linprog" => opt_ctrl::fn_linprog(args, nargout),
+        "quadprog" => opt_ext::fn_quadprog(args, nargout),
+        "lsqlin" => opt_ext::fn_lsqlin(args, nargout),
         "tf" => opt_ctrl::fn_tf(args),
-        "step" => opt_ctrl::fn_step(args, nargout, ctx.figure),
-        "bode" => opt_ctrl::fn_bode(args, nargout, ctx.figure),
+        "ss" => control_ext::fn_ss(args),
+        "tf2ss" => control_ext::fn_tf2ss(args),
+        "ss2tf" => control_ext::fn_ss2tf(args),
+        "series" => control_ext::fn_series(args),
+        "parallel" => control_ext::fn_parallel(args),
+        "feedback" => control_ext::fn_feedback(args),
+        "step" => control_ext::fn_step_unified(args, nargout, ctx.figure),
+        "impulse" => control_ext::fn_impulse(args, nargout, ctx.figure),
+        "lsim" => control_ext::fn_lsim(args, nargout, ctx.figure),
+        "bode" => control_ext::fn_bode_unified(args, nargout, ctx.figure),
+        "nyquist" => control_ext::fn_nyquist(args, nargout, ctx.figure),
+        "pzmap" => control_ext::fn_pzmap(args, ctx.figure),
+        "pole" => control_ext::fn_pole(args),
+        "zero" => control_ext::fn_zero(args),
+        "dcgain" => control_ext::fn_dcgain(args),
+        "margin" => control_ext::fn_margin(args, nargout),
+        "ctrb" => control_ext::fn_ctrb(args),
+        "obsv" => control_ext::fn_obsv(args),
+        "place" | "acker" => control_ext::fn_place(args),
+        "lyap" => control_ext::fn_lyap(args),
+        "care" => control_ext::fn_care(args),
+        "lqr" => control_ext::fn_lqr(args, nargout),
+        "lqe" => control_ext::fn_lqe(args, nargout),
 
         // VFS & module path helpers
         "addpath" => fn_addpath(args, ctx.loader),
@@ -308,6 +375,15 @@ pub fn call_intrinsic(
         "sortrows" => tables::fn_sortrows(args, nargout),
         "readtable" => tables::fn_readtable(args, ctx.loader),
         "writetable" => tables::fn_writetable(args, ctx.loader),
+        "head" => tables::fn_head_tail(args, false),
+        "tail" => tables::fn_head_tail(args, true),
+        "array2table" => tables::fn_array2table(args),
+        "table2array" => tables::fn_table2array(args),
+        "renamevars" => tables::fn_renamevars(args),
+        "removevars" => tables::fn_removevars(args),
+        "innerjoin" => tables::fn_table_join(args, tables::JoinKind::Inner),
+        "outerjoin" => tables::fn_table_join(args, tables::JoinKind::Outer),
+        "groupsummary" => tables::fn_groupsummary(args),
         "dictionary" => tables::fn_dictionary(args),
         "isKey" => tables::fn_is_key(args),
         "keys" => tables::fn_keys(args),
@@ -348,7 +424,13 @@ pub fn call_intrinsic(
         }),
         "strlength" => modern_types::fn_strlength(args),
         "split" => modern_types::fn_split(args),
-        "join" => modern_types::fn_join(args),
+        "join" => {
+            if matches!(args.first(), Some(Value::Table(_))) {
+                tables::fn_table_join(args, tables::JoinKind::Left)
+            } else {
+                modern_types::fn_join(args)
+            }
+        }
         "startsWith" => modern_types::fn_starts_ends_with("startsWith", args, false),
         "endsWith" => modern_types::fn_starts_ends_with("endsWith", args, true),
         "erase" => modern_types::fn_erase(args),
@@ -422,6 +504,19 @@ pub fn call_intrinsic(
         "imwrite" => fs_media::fn_imwrite(args, ctx.loader),
         "audioread" => fs_media::fn_audioread(args, nargout, ctx.loader),
         "audiowrite" => fs_media::fn_audiowrite(args, ctx.loader),
+
+        // Image Processing Toolbox basics
+        "rgb2gray" => image_proc::fn_rgb2gray(args),
+        "im2double" => image_proc::fn_im2double(args),
+        "im2uint8" => image_proc::fn_im2uint8(args),
+        "imresize" => image_proc::fn_imresize(args),
+        "imfilter" => image_proc::fn_imfilter(args),
+        "imgaussfilt" => image_proc::fn_imgaussfilt(args),
+        "edge" => image_proc::fn_edge(args),
+        "graythresh" => image_proc::fn_graythresh(args),
+        "imbinarize" => image_proc::fn_imbinarize(args),
+        "imhist" => image_proc::fn_imhist(args, nargout),
+        "imadjust" => image_proc::fn_imadjust(args),
 
         _ => return None,
     };
@@ -579,6 +674,28 @@ fn fn_complex(args: &[Value]) -> Result<Vec<Value>> {
 }
 
 fn fn_fill(name: &str, args: &[Value], make: fn(usize, usize) -> Matrix) -> Result<Vec<Value>> {
+    if args.len() == 1 {
+        if let Ok(m) = args[0].to_dense_matrix() {
+            if m.len() >= 2 {
+                let dims: Vec<usize> = m
+                    .data()
+                    .iter()
+                    .map(|&x| x.max(0.0).round() as usize)
+                    .collect();
+                if dims.len() == 2 {
+                    return ok1(Value::matrix(make(dims[0], dims[1])));
+                }
+                if name != "eye" {
+                    let mat = if name == "ones" {
+                        Matrix::ones_nd(dims)
+                    } else {
+                        Matrix::zeros_nd(dims)
+                    };
+                    return ok1(Value::matrix(mat));
+                }
+            }
+        }
+    }
     if args.len() > 2 && name != "eye" {
         let dims: Vec<usize> = args
             .iter()
@@ -608,8 +725,13 @@ fn fn_rand(args: &[Value], rng: &mut Rng, normal: bool) -> Result<Vec<Value>> {
     let dims: Vec<usize> = match args.len() {
         0 => vec![1, 1],
         1 => {
-            let n = as_usize(&args[0], name)?;
-            vec![n, n]
+            let m = args[0].to_dense_matrix()?;
+            if m.len() >= 2 {
+                m.data().iter().map(|&x| x.max(0.0).round() as usize).collect()
+            } else {
+                let n = as_usize(&args[0], name)?;
+                vec![n, n]
+            }
         }
         _ => args
             .iter()

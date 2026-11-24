@@ -278,6 +278,59 @@ impl ModuleLoader {
         self.cache.clear();
     }
 
+    /// Convert a dotted package name `"a.b"` to `"+a/+b"`.
+    pub fn package_dir(dotted: &str) -> String {
+        dotted
+            .split('.')
+            .filter(|s| !s.is_empty())
+            .map(|seg| format!("+{seg}"))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// Check whether a MATLAB `+package` directory exists on disk/VFS or along `search_paths`.
+    pub fn has_package(&self, dotted: &str) -> bool {
+        let pdir = Self::package_dir(dotted);
+        if pdir.is_empty() {
+            return false;
+        }
+        if self.vfs.is_dir(&pdir) {
+            return true;
+        }
+        for dir in &self.search_paths {
+            if dir.is_empty() {
+                continue;
+            }
+            let joined = format!("{dir}/{pdir}");
+            if self.vfs.is_dir(&joined) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Resolve a member `.m` file inside a dotted `+package` namespace (e.g. `pkg.sub`, `foo` -> `+pkg/+sub/foo.m`).
+    pub fn resolve_package_member(&self, dotted_pkg: &str, member: &str) -> Option<String> {
+        let pdir = Self::package_dir(dotted_pkg);
+        if pdir.is_empty() {
+            return None;
+        }
+        let rel = format!("{pdir}/{member}.m");
+        if self.vfs.exists(&rel) {
+            return Some(rel);
+        }
+        for dir in &self.search_paths {
+            if dir.is_empty() {
+                continue;
+            }
+            let joined = format!("{dir}/{rel}");
+            if self.vfs.exists(&joined) {
+                return Some(joined);
+            }
+        }
+        None
+    }
+
     /// Resolve a bare module or script path across `search_paths`.
     pub fn resolve_path(&self, name_or_path: &str) -> Option<String> {
         let candidates = if name_or_path.contains('.') {
