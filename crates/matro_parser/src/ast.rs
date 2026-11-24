@@ -1,0 +1,192 @@
+use matro_types::Span;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Program {
+    pub statements: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stmt {
+    pub kind: StmtKind,
+    pub span: Span,
+    /// True if terminated by `;` (suppresses automatic output in MATLAB/Octave).
+    pub suppressed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StmtKind {
+    Expr(Expr),
+    Assign {
+        target: AssignTarget,
+        value: Expr,
+    },
+    MultiAssign {
+        targets: Vec<String>,
+        value: Expr,
+    },
+    If {
+        cond: Expr,
+        then_body: Vec<Stmt>,
+        elseifs: Vec<(Expr, Vec<Stmt>)>,
+        else_body: Option<Vec<Stmt>>,
+    },
+    Switch {
+        expr: Expr,
+        cases: Vec<(Expr, Vec<Stmt>)>,
+        otherwise: Option<Vec<Stmt>>,
+    },
+    TryCatch {
+        try_body: Vec<Stmt>,
+        catch_var: Option<String>,
+        catch_body: Vec<Stmt>,
+    },
+    While {
+        cond: Expr,
+        body: Vec<Stmt>,
+    },
+    For {
+        var: String,
+        iter: Expr,
+        body: Vec<Stmt>,
+    },
+    Function {
+        name: String,
+        params: Vec<String>,
+        returns: Vec<String>,
+        body: Vec<Stmt>,
+    },
+    ClassDef {
+        name: String,
+        superclass: Option<String>,
+        properties: Vec<(String, Option<Expr>)>,
+        methods: Vec<MethodDef>,
+    },
+    Global(Vec<String>),
+    Persistent(Vec<String>),
+    Break,
+    Continue,
+    Return,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MethodDef {
+    pub name: String,
+    pub params: Vec<String>,
+    pub returns: Vec<String>,
+    pub body: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AssignTarget {
+    Var(String),
+    Index { name: String, indices: Vec<IndexArg> },
+    CellIndex { name: String, indices: Vec<IndexArg> },
+    Field { name: String, fields: Vec<String> },
+    IndexedField {
+        name: String,
+        indices: Vec<IndexArg>,
+        fields: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Expr {
+    pub kind: ExprKind,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExprKind {
+    Number(f64),
+    Bool(bool),
+    ImagNumber(f64),
+    String(String),
+    Ident(String),
+    EndKeyword,
+    Matrix(Vec<Vec<Expr>>),
+    Cell(Vec<Vec<Expr>>),
+    AnonFunc {
+        params: Vec<String>,
+        body: Box<Expr>,
+    },
+    Unary {
+        op: UnaryOp,
+        expr: Box<Expr>,
+    },
+    Binary {
+        op: BinaryOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Range {
+        start: Box<Expr>,
+        step: Option<Box<Expr>>,
+        stop: Box<Expr>,
+    },
+    /// Hermitian / conjugate transpose (`'`).
+    CTranspose(Box<Expr>),
+    /// Non-conjugate transpose (`.'`).
+    Transpose(Box<Expr>),
+    /// In MATLAB, `f(a, b)` is syntactically ambiguous between a function call and matrix indexing.
+    CallOrIndex {
+        callee: String,
+        args: Vec<IndexArg>,
+    },
+    /// General postfix call/index on an arbitrary expression (e.g., `s.fn(x)` or `c{1}(2)`).
+    DynamicCall {
+        target: Box<Expr>,
+        args: Vec<IndexArg>,
+    },
+    /// Cell content indexing `c{1, 2}`.
+    CellIndex {
+        target: Box<Expr>,
+        indices: Vec<IndexArg>,
+    },
+    /// Struct field or object property access `s.field`.
+    FieldAccess {
+        object: Box<Expr>,
+        field: String,
+    },
+    /// Dot-method or field-closure call `obj.method(args...)`.
+    MethodCall {
+        object: Box<Expr>,
+        method: String,
+        args: Vec<IndexArg>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexArg {
+    Expr(Expr),
+    Colon,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Neg,
+    Pos,
+    Not,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    ElemMul,
+    Div,
+    ElemDiv,
+    LeftDiv,
+    Pow,
+    ElemPow,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+    ShortAnd,
+    ShortOr,
+}

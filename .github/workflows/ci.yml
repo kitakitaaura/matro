@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown,wasm32-wasip1
+      - name: Run Rust workspace tests
+        run: cargo test --workspace
+      - name: Build browser Wasm (wasm32-unknown-unknown)
+        run: |
+          cargo build -p matro_wasm --target wasm32-unknown-unknown --release
+          cp target/wasm32-unknown-unknown/release/matro_wasm.wasm packages/matro-wasm/
+      - name: Build portable WASI CLI (wasm32-wasip1)
+        run: cargo build -p matro_cli --target wasm32-wasip1 --release
+      - name: Smoke test @matro/wasm in Node.js
+        run: |
+          node -e "
+            import('./packages/matro-wasm/index.mjs').then(async ({ loadMatro }) => {
+              const m = await loadMatro();
+              const r = m.eval('A = [3 1; 1 2]; x = A \\\\ [9; 8]; fprintf(\"%.0f,%.0f\", x(1), x(2));');
+              if (!r.ok || r.output !== '2,3') { console.error(r); process.exit(1); }
+              console.log('Node @matro/wasm smoke test passed:', r.output);
+            });
+          "

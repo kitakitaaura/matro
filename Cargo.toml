@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/matro_types",
+    "crates/matro_parser",
+    "crates/matro_bytecode",
+    "crates/matro_loader",
+    "crates/matro_intrinsics",
+    "crates/matro_vm",
+    "crates/matro_cli",
+    "crates/matro_wasm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A lightweight, modular, Wasm-ready MATLAB/Octave bytecode VM written in pure Rust."
+
+[workspace.dependencies]
+matro_types = { path = "crates/matro_types" }
+matro_parser = { path = "crates/matro_parser" }
+matro_bytecode = { path = "crates/matro_bytecode" }
+matro_loader = { path = "crates/matro_loader" }
+matro_intrinsics = { path = "crates/matro_intrinsics" }
+matro_vm = { path = "crates/matro_vm" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

@@ -1,0 +1,11 @@
+[package]
+name = "matro_vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+matro_types = { workspace = true }
+matro_bytecode = { workspace = true }
+matro_loader = { workspace = true }
+matro_intrinsics = { workspace = true }
