@@ -845,6 +845,7 @@ pub fn fn_importdata(args: &[Value], loader: &ModuleLoader) -> Result<Vec<Value>
                 rows: nrows,
                 cols: 1,
                 data: header_lines,
+                extra_dims: Vec::new(),
             }),
         );
         ok1(Value::Struct(s))

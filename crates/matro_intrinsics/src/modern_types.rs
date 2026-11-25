@@ -402,11 +402,7 @@ pub fn fn_timetable(args: &[Value]) -> Result<Vec<Value>> {
             let epochs = o.fields["EpochSec"].as_matrix()?.data();
             let labels: Vec<Value> = epochs.iter().map(|&e| Value::String(format_epoch(e))).collect();
             let n = labels.len();
-            Value::Cell(CellArray {
-                rows: n,
-                cols: if n == 0 { 0 } else { 1 },
-                data: labels,
-            })
+            Value::Cell(CellArray::from_vec(n, if n == 0 { 0 } else { 1 }, labels))
         }
         Value::Object(o) if o.class_name == "duration" => o.fields["Seconds"].clone(),
         other => other.clone(),

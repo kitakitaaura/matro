@@ -11,12 +11,13 @@ export interface WorkspaceVar {
 }
 
 export interface PlotSeriesJson {
-  kind: "line" | "scatter" | "bar" | "stem";
+  kind: "line" | "scatter" | "bar" | "stem" | "errorbar" | "fill";
   color: string;
   dashed: boolean;
   label: string | null;
   x: (number | null)[];
   y: (number | null)[];
+  err?: (number | null)[];
 }
 
 export interface PlotPanelJson {
@@ -25,6 +26,8 @@ export interface PlotPanelJson {
   ylabel: string;
   grid: boolean;
   has_heatmap: boolean;
+  colormap?: string;
+  show_colorbar?: boolean;
   series: PlotSeriesJson[];
 }
 

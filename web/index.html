@@ -128,12 +128,23 @@
 
     #plot-box {
       border-bottom: 1px solid #e5e7eb;
-      padding: 10px 12px;
+      padding: 8px 12px 10px;
       background: #ffffff;
       display: none;
     }
     #plot-box.has-plot { display: block; }
-    #plot-box svg { display: block; max-height: 440px; }
+    #plot-box svg { display: block; width: 100%; height: auto; max-height: 440px; }
+    .plot-bar {
+      display: flex;
+      justify-content: flex-end;
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+    .plot-bar button {
+      font-size: 11.5px;
+      padding: 2px 8px;
+      color: #57606a;
+    }
 
     #console {
       flex: 1;
@@ -284,8 +295,13 @@
     <button id="btn-run" class="run" title="Ctrl/Cmd + Enter">Run</button>
     <button id="btn-reset">Reset</button>
     <button id="btn-open" title="Open or mount .m, .csv, .mat, .png, .bmp, .wav files">Open…</button>
+    <button id="btn-share" title="Copy shareable link to current script">Share</button>
     <select id="preset" aria-label="Examples">
       <option value="trig">Example: Damped Sine Plot</option>
+      <option value="helmholtz">Example: Complex Sparse 2D Helmholtz Waveguide</option>
+      <option value="krylov_ic">Example: Sparse ichol + PCG Preconditioning &amp; spy</option>
+      <option value="viz_suite">Example: Scientific Plots (errorbar, fill, hist, colorbar)</option>
+      <option value="kalman_parfor">Example: 2D Radar Kalman Filter &amp; parfor</option>
       <option value="ode">Example: ODE45 Oscillator + Subplots</option>
       <option value="heatmap">Example: 2D Heatmap (imagesc)</option>
       <option value="sparse_oop">Example: Sparse PDE, .mat &amp; classdef</option>
@@ -317,7 +333,13 @@
       </nav>
 
       <div id="tab-output" class="panel active">
-        <div id="plot-box"></div>
+        <div id="plot-box">
+          <div class="plot-bar">
+            <button id="btn-dl-svg" type="button" title="Download figure as SVG">SVG</button>
+            <button id="btn-dl-png" type="button" title="Download figure as 2x PNG">PNG</button>
+          </div>
+          <div id="plot-svg-host"></div>
+        </div>
         <pre id="console"></pre>
         <form id="repl-form" class="repl">
           <span>&gt;&gt;</span>
@@ -372,6 +394,166 @@ ylabel('Amplitude');
 grid('on');
 
 fprintf('Peak amplitude: %.4f\\n', max(abs(y1)));
+`
+      },
+      helmholtz: {
+        files: {},
+        code: `% 2D Complex Sparse Helmholtz Waveguide: (-Laplacian - k^2 + i*gamma) u = f
+nx = 24; ny = 24;
+N = nx * ny;
+h = 1 / (nx + 1);
+L = gallery('poisson', nx) / (h^2);
+
+% Complex wavenumber with absorbing damping near boundaries
+k = 14.0;
+[X, Y] = meshgrid(linspace(0, 1, nx), linspace(0, 1, ny));
+damp = 25 * ((X < 0.15) | (X > 0.85) | (Y < 0.15) | (Y > 0.85));
+A = L - (k^2) * speye(N) + 1i * spdiags(damp(:), 0, N, N);
+
+% Point source near (0.35, 0.5)
+src = zeros(ny, nx);
+src(round(0.5 * ny), round(0.35 * nx)) = 1 / (h^2);
+
+% Exact direct complex Gilbert-Peierls sparse LU solve
+u = A \\ src(:);
+U = reshape(u, ny, nx);
+
+imagesc([0, 1], [0, 1], abs(U));
+colormap('turbo');
+colorbar;
+title('2D Complex Helmholtz Wavefield |u(x,y)|');
+xlabel('x (m)');
+ylabel('y (m)');
+
+fprintf('Complex sparse %dx%d (nnz=%d, isreal=%d)\\n', N, N, nnz(A), isreal(A));
+fprintf('Direct sparse LU residual: %.2e\\n', norm(A * u - src(:)) / norm(src(:)));
+`
+      },
+      krylov_ic: {
+        files: {},
+        code: `% Sparse Incomplete Cholesky ichol(A) Preconditioned Conjugate Gradient
+n = 16;
+A = gallery('poisson', n);
+b = ones(n^2, 1);
+
+% Unpreconditioned vs IC(0)-preconditioned PCG
+[x0, flag0, rel0, it0, rv0] = pcg(A, b, 1e-10, 200);
+L = ichol(A);
+[x1, flag1, rel1, it1, rv1] = pcg(A, b, 1e-10, 200, L, L');
+
+subplot(1, 2, 1);
+spy(A);
+title('2D Poisson Sparsity Pattern');
+
+subplot(1, 2, 2);
+semilogy(0:(length(rv0)-1), rv0 / norm(b), 'r--');
+hold('on');
+semilogy(0:(length(rv1)-1), rv1 / norm(b), 'b');
+legend('Unpreconditioned', 'ichol(A) PCG');
+title('PCG Convergence');
+xlabel('Iteration');
+ylabel('Relative Residual');
+grid('on');
+
+fprintf('Unpreconditioned PCG: %d iters (relres=%.2e)\\n', it0, rel0);
+fprintf('ichol(A) PCG:         %d iters (relres=%.2e)\\n', it1, rel1);
+fprintf('Solution diff norm:   %.2e\\n', norm(x1 - x0));
+`
+      },
+      viz_suite: {
+        files: {},
+        code: `% Scientific Visualization Suite: errorbar, fill, hist, imagesc + colorbar
+rng(42, 'twister');
+x = linspace(0, 2*pi, 24);
+y = sin(x) .* exp(-0.12 * x);
+err = 0.08 + 0.06 * abs(cos(x));
+
+subplot(2, 2, 1);
+fill([x, fliplr(x)], [y + err, fliplr(y - err)], 'b');
+hold('on');
+plot(x, y, 'k');
+title('Confidence Band (fill)');
+xlabel('x'); ylabel('y'); grid('on');
+
+subplot(2, 2, 2);
+errorbar(x(1:2:end), y(1:2:end), err(1:2:end), 'r');
+title('Measurements (errorbar)');
+xlabel('x'); ylabel('y'); grid('on');
+
+subplot(2, 2, 3);
+samples = randn(1, 500) * 1.2 + 3.0;
+hist(samples, 16);
+title('Sample Distribution (hist)');
+xlabel('Value'); ylabel('Count');
+
+subplot(2, 2, 4);
+[Xg, Yg] = meshgrid(linspace(-2, 2, 30), linspace(-2, 2, 30));
+Z = exp(-(Xg.^2 + Yg.^2)) .* cos(3 * Xg);
+imagesc([-2, 2], [-2, 2], Z);
+colormap('viridis');
+colorbar;
+title('2D Field (imagesc + colorbar)');
+
+fprintf('Generated 4-panel scientific figure cleanly.\\n');
+`
+      },
+      kalman_parfor: {
+        files: {},
+        code: `% 1D Constant-Velocity Kalman Filter + parfor Monte Carlo RMSE + MException
+rng(7, 'twister');
+dt = 0.1; N = 60;
+F = [1, dt; 0, 1];
+H = [1, 0];
+Q = 0.02 * [dt^3/3, dt^2/2; dt^2/2, dt];
+R = 0.35;
+
+% Single trajectory with uncertainty band
+t = (0:N-1) * dt;
+x_true = zeros(2, N);
+z_meas = zeros(1, N);
+x_est  = zeros(2, N);
+p_std  = zeros(1, N);
+x_cur = [0; 1.5];
+xh = [0; 1.0]; P = eye(2);
+
+for k = 1:N
+    if k > 1
+        x_cur = F * x_cur + [0; 0.08 * sin(0.6 * t(k))];
+    end
+    x_true(:, k) = x_cur;
+    z_meas(k) = H * x_cur + sqrt(R) * randn();
+    % Predict
+    xh = F * xh;
+    P = F * P * F' + Q;
+    % Update
+    S = H * P * H' + R;
+    K = P * H' / S;
+    xh = xh + K * (z_meas(k) - H * xh);
+    P = (eye(2) - K * H) * P;
+    x_est(:, k) = xh;
+    p_std(k) = sqrt(P(1, 1));
+end
+
+% parfor Monte Carlo validation
+trials = 12;
+rmses = zeros(1, trials);
+parfor (tr = 1:trials, 4)
+    noise = sqrt(R) * randn(1, N);
+    rmses(tr) = sqrt(mean((x_est(1, :) - x_true(1, :) + 0.05 * noise).^2));
+end
+
+fill([t, fliplr(t)], [x_est(1, :) + 2*p_std, fliplr(x_est(1, :) - 2*p_std)], 'b');
+hold('on');
+plot(t, x_true(1, :), 'k');
+plot(t, x_est(1, :), 'b');
+scatter(t(1:2:end), z_meas(1:2:end), 'r');
+legend('2-sigma band', 'True', 'Kalman', 'Meas');
+title('Kalman Filter Tracking with 2-Sigma Uncertainty');
+xlabel('Time (s)'); ylabel('Position (m)'); grid('on');
+
+fprintf('Raw meas RMSE: %.3f m -> Kalman RMSE: %.3f m\\n', ...
+    sqrt(mean((z_meas - x_true(1, :)).^2)), sqrt(mean((x_est(1, :) - x_true(1, :)).^2)));
+fprintf('parfor (%d trials) mean RMSE: %.3f m\\n', trials, mean(rmses));
 `
       },
       ode: {
@@ -832,9 +1014,16 @@ end
     const filePicker = document.getElementById("file-picker");
     const filesDropHint = document.getElementById("files-drop-hint");
     const dropOverlay = document.getElementById("drop-overlay");
+    const plotSvgHost = document.getElementById("plot-svg-host");
+    const btnDlSvg = document.getElementById("btn-dl-svg");
+    const btnDlPng = document.getElementById("btn-dl-png");
+    const btnShare = document.getElementById("btn-share");
 
     let worker = null;
     let running = false;
+    let runTimer = null;
+    let runStartedAt = 0;
+    let lastSvg = "";
     // path -> { kind: "text", data: string } | { kind: "bytes", data: Uint8Array }
     let mountedFiles = {};
     let activeFilePath = "";
@@ -865,7 +1054,18 @@ end
     function setRunning(flag) {
       running = flag;
       btnRun.textContent = flag ? "Stop" : "Run";
-      if (flag) statusEl.textContent = "Running…";
+      if (runTimer) {
+        clearInterval(runTimer);
+        runTimer = null;
+      }
+      if (flag) {
+        runStartedAt = performance.now();
+        statusEl.textContent = "Running…";
+        runTimer = setInterval(() => {
+          const secs = (performance.now() - runStartedAt) / 1000;
+          if (secs >= 0.2) statusEl.textContent = `Running… ${secs.toFixed(1)}s`;
+        }, 100);
+      }
     }
 
     function applyState({ vars = [], files = [], svg = "" }) {
@@ -914,11 +1114,12 @@ end
         }
       }
 
+      lastSvg = svg || "";
       if (svg) {
-        plotBox.innerHTML = svg;
+        plotSvgHost.innerHTML = svg;
         plotBox.classList.add("has-plot");
       } else {
-        plotBox.innerHTML = "";
+        plotSvgHost.innerHTML = "";
         plotBox.classList.remove("has-plot");
       }
     }
@@ -1173,8 +1374,84 @@ end
       });
     });
 
-    editor.value = PRESETS.trig.code;
-    spawnWorker(() => loadPreset(presetSel.value));
+    btnDlSvg.addEventListener("click", () => {
+      if (!lastSvg) return;
+      const blob = new Blob([lastSvg], { type: "image/svg+xml;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "matro_plot.svg";
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+
+    btnDlPng.addEventListener("click", () => {
+      if (!lastSvg) return;
+      const svgEl = plotSvgHost.querySelector("svg");
+      const w = Number(svgEl?.getAttribute("width")) || 680;
+      const h = Number(svgEl?.getAttribute("height")) || 340;
+      const scale = 2;
+      const blob = new Blob([lastSvg], { type: "image/svg+xml;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = w * scale;
+        canvas.height = h * scale;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        URL.revokeObjectURL(url);
+        const a = document.createElement("a");
+        a.href = canvas.toDataURL("image/png");
+        a.download = "matro_plot.png";
+        a.click();
+      };
+      img.src = url;
+    });
+
+    function encodeShareCode(text) {
+      const bytes = new TextEncoder().encode(text);
+      let bin = "";
+      for (const b of bytes) bin += String.fromCharCode(b);
+      return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    }
+
+    function decodeShareCode(hash) {
+      const m = /^#code=([A-Za-z0-9\-_]+)$/.exec(hash || "");
+      if (!m) return null;
+      try {
+        const b64 = m[1].replace(/-/g, "+").replace(/_/g, "/");
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return new TextDecoder().decode(bytes);
+      } catch {
+        return null;
+      }
+    }
+
+    btnShare.addEventListener("click", async () => {
+      const encoded = encodeShareCode(editor.value);
+      const shareUrl = `${location.origin}${location.pathname}#code=${encoded}`;
+      history.replaceState(null, "", `#code=${encoded}`);
+      try {
+        await navigator.clipboard.writeText(shareUrl);
+        statusEl.textContent = "Share link copied!";
+      } catch {
+        statusEl.textContent = "URL updated in address bar";
+      }
+    });
+
+    const sharedCode = decodeShareCode(location.hash);
+    if (sharedCode !== null) {
+      editor.value = sharedCode;
+      spawnWorker(() => runEditor());
+    } else {
+      editor.value = PRESETS.trig.code;
+      spawnWorker(() => loadPreset(presetSel.value));
+    }
   </script>
 </body>
 </html>

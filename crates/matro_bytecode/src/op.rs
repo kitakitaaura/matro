@@ -97,6 +97,8 @@ pub enum OpCode {
     StoreIndexedField { name_idx: u32, argc: u8, path_idx: u32 },
     StoreIndexedFieldLocal { slot: u16, argc: u8, path_idx: u32 },
 
+    StoreChain { name_idx: u32, spec_idx: u16 },
+    StoreChainLocal { slot: u16, spec_idx: u16 },
     DefineFunc(u32),
     DefineNestedFunc { func_idx: u32, slot: u16 },
     DefineClass(u32),
@@ -161,6 +163,13 @@ pub struct ClassProto {
     pub source_file: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChainStep {
+    Field(u32),
+    Paren(u8),
+    Brace(u8),
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Chunk {
     pub code: Vec<OpCode>,
@@ -171,6 +180,7 @@ pub struct Chunk {
     pub functions: Vec<FunctionProto>,
     pub classes: Vec<ClassProto>,
     pub field_paths: Vec<Vec<String>>,
+    pub chain_specs: Vec<Vec<ChainStep>>,
 }
 
 impl Chunk {
@@ -215,6 +225,11 @@ impl Chunk {
     pub fn add_field_path(&mut self, path: Vec<String>) -> u32 {
         self.field_paths.push(path);
         (self.field_paths.len() - 1) as u32
+    }
+
+    pub fn add_chain_spec(&mut self, spec: Vec<ChainStep>) -> u16 {
+        self.chain_specs.push(spec);
+        (self.chain_specs.len() - 1) as u16
     }
 
     /// Recursively stamp `source_file` on all functions, nested functions, closures, and class methods in this chunk.

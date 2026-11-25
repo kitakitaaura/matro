@@ -3,9 +3,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::{MatroError, Matrix, Result};
+use crate::{Complex, MatroError, Matrix, Result};
 
-/// Compressed Sparse Column (CSC) matrix of real `f64` values (matching MATLAB's sparse storage).
+/// Compressed Sparse Column (CSC) matrix of real or complex `f64` values (matching MATLAB's sparse storage).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SparseMatrix {
     rows: usize,
@@ -14,8 +14,10 @@ pub struct SparseMatrix {
     col_ptr: Vec<usize>,
     /// Row index for each non-zero entry (sorted ascending within each column).
     row_idx: Vec<usize>,
-    /// Non-zero numeric values.
+    /// Real part of non-zero numeric values.
     values: Vec<f64>,
+    /// Optional imaginary part of non-zero values (same length as `values` when `Some`).
+    imag: Option<Vec<f64>>,
 }
 
 impl SparseMatrix {
@@ -26,6 +28,7 @@ impl SparseMatrix {
             col_ptr: vec![0; cols + 1],
             row_idx: Vec::new(),
             values: Vec::new(),
+            imag: None,
         }
     }
 
@@ -39,7 +42,84 @@ impl SparseMatrix {
             col_ptr,
             row_idx,
             values,
+            imag: None,
         }
+    }
+
+    #[inline]
+    pub fn is_complex(&self) -> bool {
+        self.imag.is_some()
+    }
+
+    #[inline]
+    fn val_c(&self, idx: usize) -> Complex {
+        Complex::new(
+            self.values[idx],
+            self.imag.as_ref().map_or(0.0, |im| im[idx]),
+        )
+    }
+
+    /// Construct from 0-based `(row, col, Complex)` triplets, summing duplicate coordinates.
+    pub fn from_complex_triplets(
+        rows: usize,
+        cols: usize,
+        triplets: &[(usize, usize, Complex)],
+    ) -> Result<Self> {
+        let mut entries: Vec<(usize, usize, Complex)> = Vec::with_capacity(triplets.len());
+        for &(r, c, v) in triplets {
+            if r >= rows || c >= cols {
+                return Err(MatroError::index(format!(
+                    "Sparse triplet ({}, {}) out of bounds for {rows}x{cols}",
+                    r + 1,
+                    c + 1
+                )));
+            }
+            if v.re != 0.0 || v.im != 0.0 {
+                entries.push((c, r, v));
+            }
+        }
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        let mut col_ptr = vec![0usize; cols + 1];
+        let mut row_idx = Vec::with_capacity(entries.len());
+        let mut values = Vec::with_capacity(entries.len());
+        let mut im_vals = Vec::with_capacity(entries.len());
+        let mut has_imag = false;
+
+        let mut cur_col = 0usize;
+        let mut idx = 0usize;
+        while idx < entries.len() {
+            let (c, r, mut sum) = entries[idx];
+            idx += 1;
+            while idx < entries.len() && entries[idx].0 == c && entries[idx].1 == r {
+                sum = sum + entries[idx].2;
+                idx += 1;
+            }
+            if sum.re != 0.0 || sum.im != 0.0 {
+                while cur_col < c {
+                    cur_col += 1;
+                    col_ptr[cur_col] = row_idx.len();
+                }
+                row_idx.push(r);
+                values.push(sum.re);
+                im_vals.push(sum.im);
+                if sum.im != 0.0 {
+                    has_imag = true;
+                }
+            }
+        }
+        while cur_col < cols {
+            cur_col += 1;
+            col_ptr[cur_col] = row_idx.len();
+        }
+        Ok(Self {
+            rows,
+            cols,
+            col_ptr,
+            row_idx,
+            values,
+            imag: if has_imag { Some(im_vals) } else { None },
+        })
     }
 
     /// Construct from 0-based `(row, col, val)` triplets, summing duplicate coordinates (MATLAB convention).
@@ -91,6 +171,7 @@ impl SparseMatrix {
             col_ptr,
             row_idx,
             values,
+            imag: None,
         })
     }
 
@@ -98,13 +179,21 @@ impl SparseMatrix {
         let mut col_ptr = Vec::with_capacity(m.cols() + 1);
         let mut row_idx = Vec::new();
         let mut values = Vec::new();
+        let mut im_vals = if m.is_complex() { Some(Vec::new()) } else { None };
+        let mut has_imag = false;
         col_ptr.push(0);
         for c in 0..m.cols() {
             for r in 0..m.rows() {
-                let v = m.get(r, c);
-                if v != 0.0 {
+                let v = m.get_c(r, c);
+                if v.re != 0.0 || v.im != 0.0 {
                     row_idx.push(r);
-                    values.push(v);
+                    values.push(v.re);
+                    if let Some(im) = im_vals.as_mut() {
+                        im.push(v.im);
+                        if v.im != 0.0 {
+                            has_imag = true;
+                        }
+                    }
                 }
             }
             col_ptr.push(row_idx.len());
@@ -115,10 +204,20 @@ impl SparseMatrix {
             col_ptr,
             row_idx,
             values,
+            imag: if has_imag { im_vals } else { None },
         }
     }
 
     pub fn to_dense(&self) -> Matrix {
+        if self.is_complex() {
+            let mut out = Matrix::complex_zeros(self.rows, self.cols);
+            for c in 0..self.cols {
+                for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
+                    out.set_c(self.row_idx[idx], c, self.val_c(idx));
+                }
+            }
+            return out.normalize();
+        }
         let mut out = Matrix::zeros(self.rows, self.cols);
         for c in 0..self.cols {
             for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
@@ -154,9 +253,59 @@ impl SparseMatrix {
         out
     }
 
+    /// Return all stored non-zero entries as 0-based `(row, col, Complex)` triplets in column-major order.
+    pub fn triplets_c(&self) -> Vec<(usize, usize, Complex)> {
+        let mut out = Vec::with_capacity(self.values.len());
+        for c in 0..self.cols {
+            for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
+                out.push((self.row_idx[idx], c, self.val_c(idx)));
+            }
+        }
+        out
+    }
+
     /// Column vector of all non-zero values in column-major order.
     pub fn nonzeros(&self) -> Vec<f64> {
         self.values.clone()
+    }
+
+    /// Column vector of all complex non-zero values in column-major order.
+    pub fn nonzeros_c(&self) -> Vec<Complex> {
+        (0..self.values.len()).map(|i| self.val_c(i)).collect()
+    }
+
+    pub fn real_part(&self) -> Self {
+        let trips: Vec<(usize, usize, f64)> = self
+            .triplets_c()
+            .into_iter()
+            .filter(|&(_, _, v)| v.re != 0.0)
+            .map(|(r, c, v)| (r, c, v.re))
+            .collect();
+        Self::from_triplets(self.rows, self.cols, &trips).unwrap()
+    }
+
+    pub fn imag_part(&self) -> Self {
+        if self.imag.is_none() {
+            return Self::zeros(self.rows, self.cols);
+        }
+        let trips: Vec<(usize, usize, f64)> = self
+            .triplets_c()
+            .into_iter()
+            .filter(|&(_, _, v)| v.im != 0.0)
+            .map(|(r, c, v)| (r, c, v.im))
+            .collect();
+        Self::from_triplets(self.rows, self.cols, &trips).unwrap()
+    }
+
+    pub fn conj(&self) -> Self {
+        Self {
+            rows: self.rows,
+            cols: self.cols,
+            col_ptr: self.col_ptr.clone(),
+            row_idx: self.row_idx.clone(),
+            values: self.values.clone(),
+            imag: self.imag.as_ref().map(|im| im.iter().map(|&v| -v).collect()),
+        }
     }
 
     /// Return sparse matrix with same sparsity pattern and all non-zeros replaced by `1.0`.
@@ -167,6 +316,7 @@ impl SparseMatrix {
             col_ptr: self.col_ptr.clone(),
             row_idx: self.row_idx.clone(),
             values: vec![1.0; self.values.len()],
+            imag: None,
         }
     }
 
@@ -179,8 +329,22 @@ impl SparseMatrix {
         }
     }
 
+    pub fn get_c(&self, r: usize, c: usize) -> Complex {
+        let start = self.col_ptr[c];
+        let end = self.col_ptr[c + 1];
+        match self.row_idx[start..end].binary_search(&r) {
+            Ok(offset) => self.val_c(start + offset),
+            Err(_) => Complex::ZERO,
+        }
+    }
+
     /// Set entry `(r, c)` in-place (auto-growing dimensions if needed, removing explicit zeros).
     pub fn set(&mut self, r: usize, c: usize, val: f64) {
+        self.set_c(r, c, Complex::from_real(val));
+    }
+
+    /// Set complex entry `(r, c)` in-place.
+    pub fn set_c(&mut self, r: usize, c: usize, val: Complex) {
         if r >= self.rows {
             self.rows = r + 1;
         }
@@ -189,26 +353,39 @@ impl SparseMatrix {
             self.col_ptr.resize(c + 2, last);
             self.cols = c + 1;
         }
+        if val.im != 0.0 && self.imag.is_none() {
+            self.imag = Some(vec![0.0; self.values.len()]);
+        }
         let start = self.col_ptr[c];
         let end = self.col_ptr[c + 1];
+        let is_zero = val.re == 0.0 && val.im == 0.0;
         match self.row_idx[start..end].binary_search(&r) {
             Ok(offset) => {
                 let pos = start + offset;
-                if val == 0.0 {
+                if is_zero {
                     self.row_idx.remove(pos);
                     self.values.remove(pos);
+                    if let Some(im) = self.imag.as_mut() {
+                        im.remove(pos);
+                    }
                     for p in &mut self.col_ptr[(c + 1)..] {
                         *p -= 1;
                     }
                 } else {
-                    self.values[pos] = val;
+                    self.values[pos] = val.re;
+                    if let Some(im) = self.imag.as_mut() {
+                        im[pos] = val.im;
+                    }
                 }
             }
             Err(offset) => {
-                if val != 0.0 {
+                if !is_zero {
                     let pos = start + offset;
                     self.row_idx.insert(pos, r);
-                    self.values.insert(pos, val);
+                    self.values.insert(pos, val.re);
+                    if let Some(im) = self.imag.as_mut() {
+                        im.insert(pos, val.im);
+                    }
                     for p in &mut self.col_ptr[(c + 1)..] {
                         *p += 1;
                     }
@@ -247,15 +424,17 @@ impl SparseMatrix {
         let mut col_ptr = Vec::with_capacity(cols.len() + 1);
         let mut row_idx = Vec::new();
         let mut values = Vec::new();
+        let mut im_vals = if self.is_complex() { Some(Vec::new()) } else { None };
+        let mut has_imag = false;
         col_ptr.push(0);
 
-        let mut col_entries: Vec<(usize, f64)> = Vec::new();
+        let mut col_entries: Vec<(usize, Complex)> = Vec::new();
         for &orig_c in cols {
             col_entries.clear();
             if orig_c < self.cols {
                 for idx in self.col_ptr[orig_c]..self.col_ptr[orig_c + 1] {
                     let orig_r = self.row_idx[idx];
-                    let v = self.values[idx];
+                    let v = self.val_c(idx);
                     if has_dup_rows {
                         for &out_r in &row_multi[orig_r] {
                             col_entries.push((out_r, v));
@@ -270,7 +449,13 @@ impl SparseMatrix {
                 col_entries.sort_unstable_by_key(|&(r, _)| r);
                 for &(r, v) in &col_entries {
                     row_idx.push(r);
-                    values.push(v);
+                    values.push(v.re);
+                    if let Some(im) = im_vals.as_mut() {
+                        im.push(v.im);
+                        if v.im != 0.0 {
+                            has_imag = true;
+                        }
+                    }
                 }
             }
             col_ptr.push(row_idx.len());
@@ -282,11 +467,41 @@ impl SparseMatrix {
             col_ptr,
             row_idx,
             values,
+            imag: if has_imag { im_vals } else { None },
         }
     }
 
     /// `O(nnz)` column or row sum (`dim == 1` -> `1 x cols`, `dim == 2` -> `rows x 1`).
     pub fn sum_dim(&self, dim: usize) -> Matrix {
+        if self.is_complex() {
+            if dim == 1 {
+                let mut re = vec![0.0; self.cols];
+                let mut im = vec![0.0; self.cols];
+                for c in 0..self.cols {
+                    let mut acc = Complex::ZERO;
+                    for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
+                        acc = acc + self.val_c(idx);
+                    }
+                    re[c] = acc.re;
+                    im[c] = acc.im;
+                }
+                return Matrix::from_complex_col_major(1, self.cols, re, im)
+                    .unwrap()
+                    .normalize();
+            } else {
+                let mut re = vec![0.0; self.rows];
+                let mut im = vec![0.0; self.rows];
+                for idx in 0..self.values.len() {
+                    let r = self.row_idx[idx];
+                    let v = self.val_c(idx);
+                    re[r] += v.re;
+                    im[r] += v.im;
+                }
+                return Matrix::from_complex_col_major(self.rows, 1, re, im)
+                    .unwrap()
+                    .normalize();
+            }
+        }
         if dim == 1 {
             let mut out = vec![0.0; self.cols];
             for (c, slot) in out.iter_mut().enumerate() {
@@ -310,21 +525,30 @@ impl SparseMatrix {
     pub fn kron(&self, other: &Self) -> Self {
         let out_rows = self.rows * other.rows;
         let out_cols = self.cols * other.cols;
+        let complex = self.is_complex() || other.is_complex();
         let mut col_ptr = Vec::with_capacity(out_cols + 1);
         let mut row_idx = Vec::with_capacity(self.nnz().saturating_mul(other.nnz()));
         let mut values = Vec::with_capacity(self.nnz().saturating_mul(other.nnz()));
+        let mut im_vals = if complex { Some(Vec::with_capacity(self.nnz().saturating_mul(other.nnz()))) } else { None };
+        let mut has_imag = false;
         col_ptr.push(0);
         for ca in 0..self.cols {
             for cb in 0..other.cols {
                 for ia in self.col_ptr[ca]..self.col_ptr[ca + 1] {
                     let ra = self.row_idx[ia];
-                    let va = self.values[ia];
+                    let va = self.val_c(ia);
                     let r_off = ra * other.rows;
                     for ib in other.col_ptr[cb]..other.col_ptr[cb + 1] {
-                        let v = va * other.values[ib];
-                        if v != 0.0 {
+                        let v = va * other.val_c(ib);
+                        if v.re != 0.0 || v.im != 0.0 {
                             row_idx.push(r_off + other.row_idx[ib]);
-                            values.push(v);
+                            values.push(v.re);
+                            if let Some(im) = im_vals.as_mut() {
+                                im.push(v.im);
+                                if v.im != 0.0 {
+                                    has_imag = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -337,23 +561,59 @@ impl SparseMatrix {
             col_ptr,
             row_idx,
             values,
+            imag: if has_imag { im_vals } else { None },
         }
     }
 
     pub fn scale(&self, alpha: f64) -> Self {
-        if alpha == 0.0 {
+        self.scale_c(Complex::from_real(alpha))
+    }
+
+    pub fn scale_c(&self, alpha: Complex) -> Self {
+        if alpha.re == 0.0 && alpha.im == 0.0 {
             return Self::zeros(self.rows, self.cols);
+        }
+        if !self.is_complex() && alpha.im == 0.0 {
+            return Self {
+                rows: self.rows,
+                cols: self.cols,
+                col_ptr: self.col_ptr.clone(),
+                row_idx: self.row_idx.clone(),
+                values: self.values.iter().map(|&v| v * alpha.re).collect(),
+                imag: None,
+            };
+        }
+        let mut values = Vec::with_capacity(self.values.len());
+        let mut im_vals = Vec::with_capacity(self.values.len());
+        let mut has_imag = false;
+        for idx in 0..self.values.len() {
+            let v = self.val_c(idx) * alpha;
+            values.push(v.re);
+            im_vals.push(v.im);
+            if v.im != 0.0 {
+                has_imag = true;
+            }
         }
         Self {
             rows: self.rows,
             cols: self.cols,
             col_ptr: self.col_ptr.clone(),
             row_idx: self.row_idx.clone(),
-            values: self.values.iter().map(|&v| v * alpha).collect(),
+            values,
+            imag: if has_imag { Some(im_vals) } else { None },
         }
     }
 
     pub fn transpose(&self) -> Self {
+        if self.is_complex() {
+            let mut triplets = Vec::with_capacity(self.nnz());
+            for c in 0..self.cols {
+                for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
+                    triplets.push((c, self.row_idx[idx], self.val_c(idx)));
+                }
+            }
+            return Self::from_complex_triplets(self.cols, self.rows, &triplets).unwrap();
+        }
         let mut triplets = Vec::with_capacity(self.nnz());
         for c in 0..self.cols {
             for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
@@ -363,30 +623,86 @@ impl SparseMatrix {
         Self::from_triplets(self.cols, self.rows, &triplets).unwrap()
     }
 
-    /// Sparse addition / subtraction `alpha * self + beta * other`.
+    pub fn ctranspose(&self) -> Self {
+        if !self.is_complex() {
+            return self.transpose();
+        }
+        let mut triplets = Vec::with_capacity(self.nnz());
+        for c in 0..self.cols {
+            for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
+                triplets.push((c, self.row_idx[idx], self.val_c(idx).conj()));
+            }
+        }
+        Self::from_complex_triplets(self.cols, self.rows, &triplets).unwrap()
+    }
+
+    /// Sparse addition / subtraction `self + beta * other`.
     pub fn add_scaled(&self, other: &Self, beta: f64) -> Result<Self> {
+        self.add_scaled_c(other, Complex::from_real(beta))
+    }
+
+    /// Complex sparse addition / subtraction `self + beta * other`.
+    pub fn add_scaled_c(&self, other: &Self, beta: Complex) -> Result<Self> {
         if self.rows != other.rows || self.cols != other.cols {
             return Err(MatroError::dimension(format!(
                 "Sparse dimension mismatch: {}x{} vs {}x{}",
                 self.rows, self.cols, other.rows, other.cols
             )));
         }
+        if !self.is_complex() && !other.is_complex() && beta.im == 0.0 {
+            let mut col_ptr = Vec::with_capacity(self.cols + 1);
+            let mut row_idx = Vec::new();
+            let mut values = Vec::new();
+            col_ptr.push(0);
+            for c in 0..self.cols {
+                let mut acc = BTreeMap::new();
+                for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
+                    *acc.entry(self.row_idx[idx]).or_insert(0.0) += self.values[idx];
+                }
+                for idx in other.col_ptr[c]..other.col_ptr[c + 1] {
+                    *acc.entry(other.row_idx[idx]).or_insert(0.0) += beta.re * other.values[idx];
+                }
+                for (r, v) in acc {
+                    if v.abs() > 0.0 {
+                        row_idx.push(r);
+                        values.push(v);
+                    }
+                }
+                col_ptr.push(row_idx.len());
+            }
+            return Ok(Self {
+                rows: self.rows,
+                cols: self.cols,
+                col_ptr,
+                row_idx,
+                values,
+                imag: None,
+            });
+        }
         let mut col_ptr = Vec::with_capacity(self.cols + 1);
         let mut row_idx = Vec::new();
         let mut values = Vec::new();
+        let mut im_vals = Vec::new();
+        let mut has_imag = false;
         col_ptr.push(0);
         for c in 0..self.cols {
-            let mut acc = BTreeMap::new();
+            let mut acc: BTreeMap<usize, Complex> = BTreeMap::new();
             for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
-                *acc.entry(self.row_idx[idx]).or_insert(0.0) += self.values[idx];
+                let e = acc.entry(self.row_idx[idx]).or_insert(Complex::ZERO);
+                *e = *e + self.val_c(idx);
             }
             for idx in other.col_ptr[c]..other.col_ptr[c + 1] {
-                *acc.entry(other.row_idx[idx]).or_insert(0.0) += beta * other.values[idx];
+                let e = acc.entry(other.row_idx[idx]).or_insert(Complex::ZERO);
+                *e = *e + beta * other.val_c(idx);
             }
             for (r, v) in acc {
-                if v.abs() > 0.0 {
+                if v.re != 0.0 || v.im != 0.0 {
                     row_idx.push(r);
-                    values.push(v);
+                    values.push(v.re);
+                    im_vals.push(v.im);
+                    if v.im != 0.0 {
+                        has_imag = true;
+                    }
                 }
             }
             col_ptr.push(row_idx.len());
@@ -397,6 +713,7 @@ impl SparseMatrix {
             col_ptr,
             row_idx,
             values,
+            imag: if has_imag { Some(im_vals) } else { None },
         })
     }
 
@@ -407,6 +724,19 @@ impl SparseMatrix {
                 "Sparse dimension mismatch: {}x{} vs {}x{}",
                 self.rows, self.cols, other.rows, other.cols
             )));
+        }
+        if self.is_complex() || other.is_complex() {
+            let mut triplets = Vec::new();
+            for c in 0..self.cols {
+                for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
+                    let r = self.row_idx[idx];
+                    let ov = other.get_c(r, c);
+                    if ov.re != 0.0 || ov.im != 0.0 {
+                        triplets.push((r, c, self.val_c(idx) * ov));
+                    }
+                }
+            }
+            return Self::from_complex_triplets(self.rows, self.cols, &triplets);
         }
         let mut triplets = Vec::new();
         for c in 0..self.cols {
@@ -421,7 +751,7 @@ impl SparseMatrix {
         Self::from_triplets(self.rows, self.cols, &triplets)
     }
 
-    /// Sparse matrix * dense vector (`y = A * x`).
+    /// Sparse matrix * dense real vector (`y = A * x`).
     pub fn matvec(&self, x: &[f64]) -> Result<Vec<f64>> {
         if self.cols != x.len() {
             return Err(MatroError::dimension(format!(
@@ -442,7 +772,29 @@ impl SparseMatrix {
         Ok(y)
     }
 
-    /// Sparse matrix * dense matrix (`C = A * B`), real or complex RHS.
+    /// Sparse matrix * dense complex vector (`y = A * x`).
+    pub fn matvec_c(&self, x: &[Complex]) -> Result<Vec<Complex>> {
+        if self.cols != x.len() {
+            return Err(MatroError::dimension(format!(
+                "SpMV dimension mismatch: {}x{} * {}",
+                self.rows,
+                self.cols,
+                x.len()
+            )));
+        }
+        let mut y = vec![Complex::ZERO; self.rows];
+        for (c, &xc) in x.iter().enumerate() {
+            if xc.re != 0.0 || xc.im != 0.0 {
+                for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
+                    let r = self.row_idx[idx];
+                    y[r] = y[r] + self.val_c(idx) * xc;
+                }
+            }
+        }
+        Ok(y)
+    }
+
+    /// Sparse matrix * dense matrix (`C = A * B`), real or complex `self` and/or `rhs`.
     pub fn matmul_dense(&self, rhs: &Matrix) -> Result<Matrix> {
         if let Some(s) = rhs.as_complex_scalar() {
             let mut out = self.to_dense();
@@ -458,15 +810,13 @@ impl SparseMatrix {
                 rhs.cols()
             )));
         }
-        if rhs.is_complex() {
+        if self.is_complex() || rhs.is_complex() {
             let mut out = Matrix::complex_zeros(self.rows, rhs.cols());
             for j in 0..rhs.cols() {
-                let col_re: Vec<f64> = (0..rhs.rows()).map(|r| rhs.get_c(r, j).re).collect();
-                let col_im: Vec<f64> = (0..rhs.rows()).map(|r| rhs.get_c(r, j).im).collect();
-                let res_re = self.matvec(&col_re)?;
-                let res_im = self.matvec(&col_im)?;
-                for i in 0..self.rows {
-                    out.set_c(i, j, crate::Complex::new(res_re[i], res_im[i]));
+                let col: Vec<Complex> = (0..rhs.rows()).map(|r| rhs.get_c(r, j)).collect();
+                let res = self.matvec_c(&col)?;
+                for (i, &v) in res.iter().enumerate() {
+                    out.set_c(i, j, v);
                 }
             }
             return Ok(out.normalize());
@@ -489,6 +839,7 @@ impl SparseMatrix {
         }
         let rows = mats[0].rows;
         let mut total_cols = 0usize;
+        let complex = mats.iter().any(|m| m.is_complex());
         for m in mats {
             if m.rows != rows {
                 return Err(MatroError::dimension(format!(
@@ -501,12 +852,17 @@ impl SparseMatrix {
         let mut col_ptr = Vec::with_capacity(total_cols + 1);
         let mut row_idx = Vec::new();
         let mut values = Vec::new();
+        let mut im_vals = if complex { Some(Vec::new()) } else { None };
         col_ptr.push(0);
         for m in mats {
             for c in 0..m.cols {
                 for idx in m.col_ptr[c]..m.col_ptr[c + 1] {
                     row_idx.push(m.row_idx[idx]);
-                    values.push(m.values[idx]);
+                    let v = m.val_c(idx);
+                    values.push(v.re);
+                    if let Some(im) = im_vals.as_mut() {
+                        im.push(v.im);
+                    }
                 }
                 col_ptr.push(row_idx.len());
             }
@@ -517,6 +873,7 @@ impl SparseMatrix {
             col_ptr,
             row_idx,
             values,
+            imag: im_vals,
         })
     }
 
@@ -527,6 +884,7 @@ impl SparseMatrix {
         }
         let cols = mats[0].cols;
         let mut total_rows = 0usize;
+        let complex = mats.iter().any(|m| m.is_complex());
         for m in mats {
             if m.cols != cols {
                 return Err(MatroError::dimension(format!(
@@ -539,13 +897,18 @@ impl SparseMatrix {
         let mut col_ptr = Vec::with_capacity(cols + 1);
         let mut row_idx = Vec::new();
         let mut values = Vec::new();
+        let mut im_vals = if complex { Some(Vec::new()) } else { None };
         col_ptr.push(0);
         for c in 0..cols {
             let mut row_offset = 0usize;
             for m in mats {
                 for idx in m.col_ptr[c]..m.col_ptr[c + 1] {
                     row_idx.push(row_offset + m.row_idx[idx]);
-                    values.push(m.values[idx]);
+                    let v = m.val_c(idx);
+                    values.push(v.re);
+                    if let Some(im) = im_vals.as_mut() {
+                        im.push(v.im);
+                    }
                 }
                 row_offset += m.rows;
             }
@@ -557,16 +920,55 @@ impl SparseMatrix {
             col_ptr,
             row_idx,
             values,
+            imag: im_vals,
         })
     }
 
-    /// Sparse-sparse matrix multiplication (`C = A * B`).
+    /// Sparse-sparse matrix multiplication (`C = A * B`), real or complex.
     pub fn matmul_sparse(&self, other: &Self) -> Result<Self> {
         if self.cols != other.rows {
             return Err(MatroError::dimension(format!(
                 "Inner dimensions must agree: {}x{} * {}x{}",
                 self.rows, self.cols, other.rows, other.cols
             )));
+        }
+        if self.is_complex() || other.is_complex() {
+            let mut col_ptr = Vec::with_capacity(other.cols + 1);
+            let mut row_idx = Vec::new();
+            let mut values = Vec::new();
+            let mut im_vals = Vec::new();
+            let mut has_imag = false;
+            col_ptr.push(0);
+            for j in 0..other.cols {
+                let mut acc: BTreeMap<usize, Complex> = BTreeMap::new();
+                for b_idx in other.col_ptr[j]..other.col_ptr[j + 1] {
+                    let k = other.row_idx[b_idx];
+                    let b_kj = other.val_c(b_idx);
+                    for a_idx in self.col_ptr[k]..self.col_ptr[k + 1] {
+                        let e = acc.entry(self.row_idx[a_idx]).or_insert(Complex::ZERO);
+                        *e = *e + self.val_c(a_idx) * b_kj;
+                    }
+                }
+                for (r, v) in acc {
+                    if v.re != 0.0 || v.im != 0.0 {
+                        row_idx.push(r);
+                        values.push(v.re);
+                        im_vals.push(v.im);
+                        if v.im != 0.0 {
+                            has_imag = true;
+                        }
+                    }
+                }
+                col_ptr.push(row_idx.len());
+            }
+            return Ok(Self {
+                rows: self.rows,
+                cols: other.cols,
+                col_ptr,
+                row_idx,
+                values,
+                imag: if has_imag { Some(im_vals) } else { None },
+            });
         }
         let mut col_ptr = Vec::with_capacity(other.cols + 1);
         let mut row_idx = Vec::new();
@@ -595,6 +997,7 @@ impl SparseMatrix {
             col_ptr,
             row_idx,
             values,
+            imag: None,
         })
     }
 
@@ -793,6 +1196,7 @@ impl SparseMatrix {
             col_ptr,
             row_idx,
             values,
+            imag: None,
         })
     }
 
@@ -1049,6 +1453,7 @@ impl SparseMatrix {
                 col_ptr: l_col_ptr,
                 row_idx: l_row_idx,
                 values: l_values,
+                imag: None,
             },
             Self {
                 rows: n,
@@ -1056,9 +1461,245 @@ impl SparseMatrix {
                 col_ptr: u_col_ptr,
                 row_idx: u_row_idx,
                 values: u_values,
+                imag: None,
             },
             perm,
         ))
+    }
+
+    /// $O(\text{nnz})$ complex sparse forward substitution for lower-triangular CSC matrices.
+    pub fn solve_lower_triangular_c(&self, b: &[Complex]) -> Option<Vec<Complex>> {
+        let n = self.rows;
+        if self.cols != n || b.len() != n {
+            return None;
+        }
+        let mut x = b.to_vec();
+        for c in 0..n {
+            let start = self.col_ptr[c];
+            let end = self.col_ptr[c + 1];
+            let mut diag = Complex::ZERO;
+            let mut diag_pos = None;
+            for idx in start..end {
+                if self.row_idx[idx] == c {
+                    diag = self.val_c(idx);
+                    diag_pos = Some(idx);
+                    break;
+                }
+            }
+            let dabs = diag.abs();
+            if dabs < 1e-30 || !dabs.is_finite() {
+                return None;
+            }
+            let xc = x[c] / diag;
+            x[c] = xc;
+            if xc.re != 0.0 || xc.im != 0.0 {
+                let first_sub = diag_pos.map_or(start, |p| p + 1);
+                for idx in first_sub..end {
+                    let r = self.row_idx[idx];
+                    if r > c {
+                        x[r] = x[r] - self.val_c(idx) * xc;
+                    }
+                }
+            }
+        }
+        Some(x)
+    }
+
+    /// $O(\text{nnz})$ complex sparse back substitution for upper-triangular CSC matrices.
+    pub fn solve_upper_triangular_c(&self, b: &[Complex]) -> Option<Vec<Complex>> {
+        let n = self.rows;
+        if self.cols != n || b.len() != n {
+            return None;
+        }
+        let mut x = b.to_vec();
+        for c in (0..n).rev() {
+            let start = self.col_ptr[c];
+            let end = self.col_ptr[c + 1];
+            let mut diag = Complex::ZERO;
+            for idx in (start..end).rev() {
+                if self.row_idx[idx] == c {
+                    diag = self.val_c(idx);
+                    break;
+                }
+            }
+            let dabs = diag.abs();
+            if dabs < 1e-30 || !dabs.is_finite() {
+                return None;
+            }
+            let xc = x[c] / diag;
+            x[c] = xc;
+            if xc.re != 0.0 || xc.im != 0.0 {
+                for idx in start..end {
+                    let r = self.row_idx[idx];
+                    if r < c {
+                        x[r] = x[r] - self.val_c(idx) * xc;
+                    }
+                }
+            }
+        }
+        Some(x)
+    }
+
+    /// Complex Gilbert-Peierls sparse left-looking LU factorization with partial pivoting:
+    /// returns `(L, U, perm)` such that `A[perm[i], :] == (L * U)[i, :]`.
+    pub fn lu_sparse_complex(&self) -> Result<(Self, Self, Vec<usize>)> {
+        if !self.is_complex() {
+            return self.lu_sparse();
+        }
+        if self.rows != self.cols {
+            return Err(MatroError::dimension("Sparse LU requires a square matrix"));
+        }
+        let n = self.rows;
+        if n == 0 {
+            return Ok((Self::zeros(0, 0), Self::zeros(0, 0), Vec::new()));
+        }
+        let mut l_cols: Vec<Vec<(usize, Complex)>> = vec![Vec::new(); n];
+        let mut u_cols: Vec<Vec<(usize, Complex)>> = vec![Vec::new(); n];
+        let mut pinv = vec![usize::MAX; n];
+        let mut perm = vec![0usize; n];
+
+        let mut x = vec![Complex::ZERO; n];
+        let mut mark = vec![0usize; n];
+        let mut dfs_stack: Vec<(usize, usize)> = Vec::new();
+        let mut topo: Vec<usize> = Vec::new();
+        let mut unpivoted: Vec<usize> = Vec::new();
+        let mut unpiv_mark = vec![0usize; n];
+        let mut cur_mark = 0usize;
+
+        for j in 0..n {
+            cur_mark += 1;
+            topo.clear();
+            unpivoted.clear();
+
+            for idx in self.col_ptr[j]..self.col_ptr[j + 1] {
+                let r = self.row_idx[idx];
+                x[r] = x[r] + self.val_c(idx);
+                let step = pinv[r];
+                if step == usize::MAX {
+                    if unpiv_mark[r] != cur_mark {
+                        unpiv_mark[r] = cur_mark;
+                        unpivoted.push(r);
+                    }
+                } else if mark[step] != cur_mark {
+                    mark[step] = cur_mark;
+                    dfs_stack.push((step, 0));
+                    while let Some((col_k, pos)) = dfs_stack.last_mut() {
+                        let k = *col_k;
+                        if *pos < l_cols[k].len() {
+                            let next_r = l_cols[k][*pos].0;
+                            *pos += 1;
+                            let next_step = pinv[next_r];
+                            if next_step == usize::MAX {
+                                if unpiv_mark[next_r] != cur_mark {
+                                    unpiv_mark[next_r] = cur_mark;
+                                    unpivoted.push(next_r);
+                                }
+                            } else if mark[next_step] != cur_mark {
+                                mark[next_step] = cur_mark;
+                                dfs_stack.push((next_step, 0));
+                            }
+                        } else {
+                            topo.push(k);
+                            dfs_stack.pop();
+                        }
+                    }
+                }
+            }
+
+            for &k in topo.iter().rev() {
+                let piv_r = perm[k];
+                let uk = x[piv_r];
+                x[piv_r] = Complex::ZERO;
+                if uk.re != 0.0 || uk.im != 0.0 {
+                    u_cols[j].push((k, uk));
+                    for &(r, lrk) in &l_cols[k] {
+                        x[r] = x[r] - lrk * uk;
+                        if pinv[r] == usize::MAX && unpiv_mark[r] != cur_mark {
+                            unpiv_mark[r] = cur_mark;
+                            unpivoted.push(r);
+                        }
+                    }
+                }
+            }
+
+            let mut best_row = usize::MAX;
+            let mut best_abs = 0.0;
+            for &r in &unpivoted {
+                let a = x[r].abs();
+                if a > best_abs {
+                    best_abs = a;
+                    best_row = r;
+                }
+            }
+            if best_row == usize::MAX || !best_abs.is_finite() || best_abs == 0.0 {
+                for &r in &unpivoted {
+                    x[r] = Complex::ZERO;
+                }
+                return Err(MatroError::runtime(format!(
+                    "Sparse LU: matrix is singular at column {}",
+                    j + 1
+                )));
+            }
+
+            let piv_val = x[best_row];
+            x[best_row] = Complex::ZERO;
+            pinv[best_row] = j;
+            perm[j] = best_row;
+            u_cols[j].push((j, piv_val));
+            u_cols[j].sort_unstable_by_key(|&(r, _)| r);
+
+            for &r in &unpivoted {
+                if r == best_row {
+                    continue;
+                }
+                let v = x[r];
+                x[r] = Complex::ZERO;
+                if v.re != 0.0 || v.im != 0.0 {
+                    l_cols[j].push((r, v / piv_val));
+                }
+            }
+        }
+
+        let mut l_trips = Vec::new();
+        for (j, col) in l_cols.into_iter().enumerate() {
+            l_trips.push((j, j, Complex::ONE));
+            for (r, v) in col {
+                l_trips.push((pinv[r], j, v));
+            }
+        }
+        let mut u_trips = Vec::new();
+        for (j, col) in u_cols.into_iter().enumerate() {
+            for (r, v) in col {
+                u_trips.push((r, j, v));
+            }
+        }
+        Ok((
+            Self::from_complex_triplets(n, n, &l_trips)?,
+            Self::from_complex_triplets(n, n, &u_trips)?,
+            perm,
+        ))
+    }
+
+    /// Solve complex `A * X = B` given a precomputed sparse LU factorization `(L, U, perm)`.
+    pub fn solve_with_lu_c(l: &Self, u: &Self, perm: &[usize], rhs: &Matrix) -> Result<Matrix> {
+        let n = perm.len();
+        let mut out = Matrix::complex_zeros(n, rhs.cols());
+        for j in 0..rhs.cols() {
+            let mut pb = vec![Complex::ZERO; n];
+            for i in 0..n {
+                pb[i] = rhs.get_c(perm[i], j);
+            }
+            let y = l
+                .solve_lower_triangular_c(&pb)
+                .ok_or_else(|| MatroError::runtime("Complex sparse LU forward solve failed"))?;
+            let x = u
+                .solve_upper_triangular_c(&y)
+                .ok_or_else(|| MatroError::runtime("Complex sparse LU back solve failed"))?;
+            for (i, &v) in x.iter().enumerate() {
+                out.set_c(i, j, v);
+            }
+        }
+        Ok(out.normalize())
     }
 
     /// Solve `A * X = B` given a precomputed sparse LU factorization `(L, U, perm)`.
@@ -1374,6 +2015,69 @@ impl SparseMatrix {
                 rhs.cols()
             )));
         }
+        if self.is_complex() {
+            if self.rows != self.cols {
+                if self.rows.saturating_mul(self.cols) <= 250_000 {
+                    return self.to_dense().solve(rhs);
+                }
+                if self.rows > self.cols {
+                    let ah = self.ctranspose();
+                    let aha = ah.matmul_sparse(self)?;
+                    let ahb = ah.matmul_dense(rhs)?;
+                    return aha.solve_dense(&ahb);
+                }
+                return Err(MatroError::dimension(format!(
+                    "Underdetermined large complex sparse solve ({}x{}) exceeds dense fallback limit",
+                    self.rows, self.cols
+                )));
+            }
+            let n = self.rows;
+            if n == 0 {
+                return Ok(Matrix::zeros(0, rhs.cols()));
+            }
+            if n <= 16 {
+                return self.to_dense().solve(rhs);
+            }
+            let (kl, ku) = self.bandwidth();
+            if ku == 0 {
+                let mut out = Matrix::complex_zeros(n, rhs.cols());
+                let mut ok = true;
+                for j in 0..rhs.cols() {
+                    let b: Vec<Complex> = (0..n).map(|r| rhs.get_c(r, j)).collect();
+                    if let Some(x) = self.solve_lower_triangular_c(&b) {
+                        for (i, &v) in x.iter().enumerate() {
+                            out.set_c(i, j, v);
+                        }
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    return Ok(out.normalize());
+                }
+            }
+            if kl == 0 {
+                let mut out = Matrix::complex_zeros(n, rhs.cols());
+                let mut ok = true;
+                for j in 0..rhs.cols() {
+                    let b: Vec<Complex> = (0..n).map(|r| rhs.get_c(r, j)).collect();
+                    if let Some(x) = self.solve_upper_triangular_c(&b) {
+                        for (i, &v) in x.iter().enumerate() {
+                            out.set_c(i, j, v);
+                        }
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    return Ok(out.normalize());
+                }
+            }
+            let (l, u, perm) = self.lu_sparse_complex()?;
+            return Self::solve_with_lu_c(&l, &u, &perm, rhs);
+        }
         if rhs.is_complex() {
             let re_mat = Matrix::from_col_major(rhs.rows(), rhs.cols(), rhs.data().to_vec())?;
             let im_data = rhs
@@ -1542,13 +2246,25 @@ impl fmt::Display for SparseMatrix {
                     write!(f, "  ... ({} more non-zeros)", self.nnz() - limit)?;
                     return Ok(());
                 }
-                write!(
-                    f,
-                    "  ({}, {})    {:.4}",
-                    self.row_idx[idx] + 1,
-                    c + 1,
-                    self.values[idx]
-                )?;
+                let v = self.val_c(idx);
+                if self.is_complex() {
+                    write!(
+                        f,
+                        "  ({}, {})    {:.4} {:+.4}i",
+                        self.row_idx[idx] + 1,
+                        c + 1,
+                        v.re,
+                        v.im
+                    )?;
+                } else {
+                    write!(
+                        f,
+                        "  ({}, {})    {:.4}",
+                        self.row_idx[idx] + 1,
+                        c + 1,
+                        v.re
+                    )?;
+                }
                 shown += 1;
             }
         }

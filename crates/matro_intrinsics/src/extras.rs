@@ -28,6 +28,7 @@ pub fn fn_ndims(args: &[Value]) -> Result<Vec<Value>> {
     }
     let d = match &args[0] {
         Value::Matrix(m) => m.ndims(),
+        Value::Cell(c) => c.ndims(),
         _ => 2,
     };
     ok1(Value::scalar(d as f64))
@@ -828,6 +829,7 @@ pub fn fn_repmat(args: &[Value]) -> Result<Vec<Value>> {
             rows: out_r,
             cols: out_c,
             data,
+            extra_dims: Vec::new(),
         }));
     }
     if let Value::String(s) = &args[0] {
@@ -1057,7 +1059,7 @@ pub fn fn_strfind(args: &[Value]) -> Result<Vec<Value>> {
         for s in items {
             data.push(Value::matrix(Matrix::row_vec(overlapping_char_find(&s, &pat))));
         }
-        return ok1(Value::Cell(CellArray { rows: r, cols: c, data }));
+        return ok1(Value::Cell(CellArray { rows: r, cols: c, data, extra_dims: Vec::new() }));
     }
     Err(MatroError::runtime("strfind: expected char vector, string, or cellstr"))
 }
@@ -1078,7 +1080,7 @@ pub fn fn_strrep(args: &[Value]) -> Result<Vec<Value>> {
             .into_iter()
             .map(|s| Value::String(s.replace(&old, &new)))
             .collect();
-        let cell = CellArray { rows: r, cols: c, data };
+        let cell = CellArray { rows: r, cols: c, data, extra_dims: Vec::new() };
         if matches!(&args[0], Value::Object(o) if o.class_name == "string") {
             let mut fields = BTreeMap::new();
             fields.insert("Data".to_string(), Value::Cell(cell));

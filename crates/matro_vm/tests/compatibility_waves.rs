@@ -789,3 +789,125 @@ fn wave8_parfor_mexception_functions_and_sparse_solvers() {
     )
     .unwrap();
 }
+
+#[test]
+fn wave9_complex_sparse_chained_lvalues_nd_cells_and_benchmarks() {
+    let mut vm = Vm::new();
+    vm.eval(
+        r#"
+        % 9A. Complex Sparse Matrices & Native Complex Gilbert-Peierls Sparse LU
+        S = sparse([1, 2, 3, 1], [1, 2, 3, 3], [2+1i, 3-2i, 4+3i, 1i], 3, 3);
+        assert(issparse(S) && ~isreal(S) && nnz(S) == 4);
+        assert(issparse(real(S)) && isreal(real(S)));
+        assert(issparse(imag(S)) && isreal(imag(S)));
+        assert(norm(full(conj(S)) - conj(full(S))) < 1e-12);
+        assert(norm(full(S') - full(S)') < 1e-12);
+        assert(norm(full(S.') - full(S).') < 1e-12);
+
+        % Complex scalar scaling stays sparse!
+        Si = 1i * S;
+        assert(issparse(Si) && norm(full(Si) - 1i * full(S)) < 1e-12);
+        Sd = S / (1 + 1i);
+        assert(issparse(Sd) && norm(full(Sd) - full(S) / (1 + 1i)) < 1e-12);
+
+        % Complex sparse element assignment & spfun & nonzeros
+        S(2, 1) = -0.5 + 0.25i;
+        assert(abs(full(S(2, 1)) - (-0.5 + 0.25i)) < 1e-12);
+        nz = nonzeros(S);
+        assert(length(nz) == 5 && ~isreal(nz));
+        Sa = spfun(@abs, S);
+        assert(issparse(Sa) && isreal(Sa) && abs(full(Sa(1, 1)) - sqrt(5)) < 1e-12);
+
+        % 2D Complex Helmholtz PDE (12x12 = 144x144 complex sparse direct solve + lu)
+        nx = 12; N = nx * nx;
+        L = gallery('poisson', nx);
+        A_hz = L - 0.8 * speye(N) + 0.35i * speye(N);
+        assert(issparse(A_hz) && ~isreal(A_hz));
+        [Lc, Uc, Pc] = lu(A_hz);
+        assert(issparse(Lc) && issparse(Uc) && issparse(Pc));
+        assert(norm(full(Pc * A_hz - Lc * Uc), 'fro') < 1e-10);
+        f_hz = zeros(N, 1); f_hz(round(N/2)) = 1 + 0.5i;
+        u_hz = A_hz \ f_hz;
+        assert(~isreal(u_hz));
+        assert(norm(A_hz * u_hz - f_hz) / norm(f_hz) < 1e-11);
+
+        % 9B. Arbitrary-Depth Chained L-Value Assignments
+        s(2).arr{1}(3, 2) = 99;
+        assert(s(2).arr{1}(3, 2) == 99);
+        s(2).arr{1}(1, :) = [7, 8];
+        assert(isequal(s(2).arr{1}(1, :), [7, 8]));
+
+        c = cell(1, 2);
+        c{1} = zeros(2, 3);
+        c{1}(2, 3) = 42;
+        assert(c{1}(2, 3) == 42);
+        c{2}.x = 7;
+        c{2}.y(1, 2) = 8;
+        assert(c{2}.x == 7 && c{2}.y(1, 2) == 8);
+
+        nested = cell(1, 1);
+        nested{1}{2} = 123;
+        assert(nested{1}{2} == 123);
+
+        % Also verify inside function (local variable StoreChainLocal)
+        function out = test_chain_local()
+            st(2).items{1}(2, 2) = 55;
+            out = st(2).items{1}(2, 2);
+        end
+        assert(test_chain_local() == 55);
+
+        % 9C. 3D+ N-D Cell Arrays
+        C3 = cell(2, 3, 4);
+        assert(isequal(size(C3), [2, 3, 4]) && ndims(C3) == 3 && numel(C3) == 24);
+        C3{2, 3, 4} = 'corner';
+        C3{1, 2, 3} = [10, 20];
+        assert(strcmp(C3{2, 3, 4}, 'corner'));
+        assert(isequal(C3{1, 2, 3}, [10, 20]));
+        Sub3 = C3(:, 2:3, 3:4);
+        assert(isequal(size(Sub3), [2, 2, 2]));
+        assert(isequal(Sub3{1, 1, 1}, [10, 20]) && strcmp(Sub3{2, 2, 2}, 'corner'));
+        C3v = cell([2, 2, 3]);
+        assert(isequal(size(C3v), [2, 2, 3]));
+        G3 = cell(1, 1);
+        G3{2, 2, 2} = 77;
+        assert(isequal(size(G3), [2, 2, 2]) && G3{2, 2, 2} == 77);
+
+        % 9D. COW + Zero-Alloc Scalar Fast-Path Correctness & Kalman Benchmark
+        function [a_end, b_end] = cow_loop_test()
+            A = zeros(40, 40);
+            B = A; % shared Arc
+            for col = 1:40
+                for row = 1:40
+                    A(row, col) = row + 2 * col;
+                end
+            end
+            a_end = A(40, 40);
+            b_end = B(40, 40);
+        end
+        [ae, be] = cow_loop_test();
+        assert(ae == 120 && be == 0);
+
+        % 1D Constant-Velocity Kalman Filter
+        rng(7, 'twister');
+        dt = 0.1; Nk = 50;
+        Fk = [1, dt; 0, 1]; Hk = [1, 0];
+        Qk = 0.02 * [dt^3/3, dt^2/2; dt^2/2, dt]; Rk = 0.35;
+        x_tr = zeros(2, Nk); z_m = zeros(1, Nk); x_e = zeros(2, Nk);
+        xc = [0; 1.5]; xh = [0; 1.0]; Pk = eye(2);
+        for k = 1:Nk
+            if k > 1, xc = Fk * xc; end
+            x_tr(:, k) = xc;
+            z_m(k) = Hk * xc + sqrt(Rk) * randn();
+            xh = Fk * xh; Pk = Fk * Pk * Fk' + Qk;
+            Kk = Pk * Hk' / (Hk * Pk * Hk' + Rk);
+            xh = xh + Kk * (z_m(k) - Hk * xh);
+            Pk = (eye(2) - Kk * Hk) * Pk;
+            x_e(:, k) = xh;
+        end
+        rmse_raw = sqrt(mean((z_m - x_tr(1, :)).^2));
+        rmse_kf  = sqrt(mean((x_e(1, :) - x_tr(1, :)).^2));
+        assert(rmse_kf < rmse_raw);
+        "#,
+    )
+    .unwrap();
+}

@@ -484,7 +484,13 @@ fn render_panel(svg: &mut String, panel: &PlotPanel, width: f64, height: f64) {
     }
 
     let pad_l = 58.0;
-    let pad_r = if panel.heatmap.is_some() { 54.0 } else { 20.0 };
+    let pad_r = if panel.heatmap.is_some() && panel.show_colorbar {
+        70.0
+    } else if panel.heatmap.is_some() {
+        26.0
+    } else {
+        20.0
+    };
     let pad_t = if panel.title.is_empty() { 20.0 } else { 36.0 };
     let pad_b = if panel.xlabel.is_empty() { 36.0 } else { 48.0 };
     let pw = (width - pad_l - pad_r).max(40.0);

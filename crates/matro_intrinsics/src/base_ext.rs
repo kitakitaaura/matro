@@ -1132,7 +1132,13 @@ pub fn fn_nonzeros(args: &[Value]) -> Result<Vec<Value>> {
         return Err(MatroError::arity("nonzeros", "1", args.len()));
     }
     match &args[0] {
-        Value::Sparse(s) => ok1(Value::matrix(Matrix::col_vec(s.nonzeros()))),
+        Value::Sparse(s) => {
+            if s.is_complex() {
+                ok1(Value::matrix(Matrix::complex_col_vec(s.nonzeros_c()).normalize()))
+            } else {
+                ok1(Value::matrix(Matrix::col_vec(s.nonzeros())))
+            }
+        }
         other => {
             let m = other.to_dense_matrix()?;
             let nz: Vec<Complex> = (0..m.len())
@@ -2871,11 +2877,7 @@ pub fn fn_struct2cell(args: &[Value]) -> Result<Vec<Value>> {
         Value::Struct(map) => {
             let vals: Vec<Value> = map.values().cloned().collect();
             let n = vals.len();
-            ok1(Value::Cell(CellArray {
-                rows: n,
-                cols: if n == 0 { 0 } else { 1 },
-                data: vals,
-            }))
+            ok1(Value::Cell(CellArray::from_vec(n, if n == 0 { 0 } else { 1 }, vals)))
         }
         Value::StructArray(sa) => {
             let keys: Vec<String> = sa

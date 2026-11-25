@@ -76,6 +76,7 @@ fn make_string_obj(rows: usize, cols: usize, elems: Vec<String>) -> Value {
         rows,
         cols,
         data: elems.into_iter().map(Value::String).collect(),
+        extra_dims: Vec::new(),
     };
     let mut fields = BTreeMap::new();
     fields.insert("Data".to_string(), Value::Cell(cell));

@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
 use matro_parser::{
-    AssignTarget, BinaryOp, Expr, ExprKind, IndexArg, Program, Stmt, StmtKind, UnaryOp,
+    AssignTarget, BinaryOp, Expr, ExprKind, IndexArg, LValueStep, Program, Stmt, StmtKind, UnaryOp,
 };
 use matro_types::{MatroError, Result, Value};
 
-use crate::op::{Chunk, ClassProto, CompiledArgSpec, FunctionProto, OpCode, PropProto};
+use crate::op::{ChainStep, Chunk, ClassProto, CompiledArgSpec, FunctionProto, OpCode, PropProto};
 
 struct LoopContext {
     is_for: bool,
@@ -136,7 +136,8 @@ impl Compiler {
                         | AssignTarget::CellIndex { name: n, .. }
                         | AssignTarget::Field { name: n, .. }
                         | AssignTarget::IndexedField { name: n, .. }
-                        | AssignTarget::FieldIndex { name: n, .. } => n,
+                        | AssignTarget::FieldIndex { name: n, .. }
+                        | AssignTarget::Chain { name: n, .. } => n,
                     };
                     if matches!(target, AssignTarget::FieldIndex { .. }) {
                         self.alloc_local("__matro_fi_tmp");
@@ -693,6 +694,61 @@ impl Compiler {
                         let name_idx = self.chunk.add_name(name);
                         self.chunk
                             .emit(OpCode::StoreField { name_idx, path_idx }, line);
+                        if !stmt.suppressed {
+                            self.chunk.emit(OpCode::LoadVar(name_idx), line);
+                            self.chunk.emit(OpCode::PrintVar(name_idx), line);
+                        }
+                    }
+                }
+                AssignTarget::Chain { name, steps } => {
+                    self.compile_expr(value, 1, false)?;
+                    let mut compiled_steps = Vec::with_capacity(steps.len());
+                    for step in steps {
+                        match step {
+                            LValueStep::Field(f) => {
+                                let f_idx = self.chunk.add_name(f);
+                                compiled_steps.push(ChainStep::Field(f_idx));
+                            }
+                            LValueStep::Paren(indices) => {
+                                for arg in indices {
+                                    match arg {
+                                        IndexArg::Colon => {
+                                            self.chunk.emit(OpCode::PushColon, line);
+                                        }
+                                        IndexArg::Expr(e) => {
+                                            self.compile_expr(e, 1, true)?;
+                                        }
+                                    }
+                                }
+                                compiled_steps.push(ChainStep::Paren(indices.len() as u8));
+                            }
+                            LValueStep::Brace(indices) => {
+                                for arg in indices {
+                                    match arg {
+                                        IndexArg::Colon => {
+                                            self.chunk.emit(OpCode::PushColon, line);
+                                        }
+                                        IndexArg::Expr(e) => {
+                                            self.compile_expr(e, 1, true)?;
+                                        }
+                                    }
+                                }
+                                compiled_steps.push(ChainStep::Brace(indices.len() as u8));
+                            }
+                        }
+                    }
+                    let spec_idx = self.chunk.add_chain_spec(compiled_steps);
+                    if let Some(slot) = self.lookup_local(name) {
+                        self.chunk
+                            .emit(OpCode::StoreChainLocal { slot, spec_idx }, line);
+                        if !stmt.suppressed {
+                            self.chunk.emit(OpCode::LoadLocal(slot), line);
+                            self.chunk.emit(OpCode::PrintLocal(slot), line);
+                        }
+                    } else {
+                        let name_idx = self.chunk.add_name(name);
+                        self.chunk
+                            .emit(OpCode::StoreChain { name_idx, spec_idx }, line);
                         if !stmt.suppressed {
                             self.chunk.emit(OpCode::LoadVar(name_idx), line);
                             self.chunk.emit(OpCode::PrintVar(name_idx), line);

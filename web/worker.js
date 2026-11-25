@@ -30,7 +30,7 @@ self.onmessage = async (e) => {
         disasm: dis.output,
         vars: rt.vars(),
         files: rt.files(),
-        svg: rt.plotSvg(600, 280),
+        svg: rt.plotSvg(680, 340),
       });
     } else if (msg.type === "repl") {
       const res = rt.eval(msg.code);
@@ -41,17 +41,17 @@ self.onmessage = async (e) => {
         output: res.output,
         vars: rt.vars(),
         files: rt.files(),
-        svg: rt.plotSvg(600, 280),
+        svg: rt.plotSvg(680, 340),
       });
     } else if (msg.type === "mount_file") {
       rt.mountFile(msg.path, msg.content);
-      self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: rt.plotSvg(600, 280) });
+      self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: rt.plotSvg(680, 340) });
     } else if (msg.type === "mount_bytes") {
       rt.mountBytes(msg.path, new Uint8Array(msg.bytes));
-      self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: rt.plotSvg(600, 280) });
+      self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: rt.plotSvg(680, 340) });
     } else if (msg.type === "clear_files") {
       rt.clearFiles();
-      self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: rt.plotSvg(600, 280) });
+      self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: rt.plotSvg(680, 340) });
     } else if (msg.type === "reset") {
       rt.reset();
       self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: "" });

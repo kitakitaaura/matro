@@ -684,6 +684,7 @@ pub fn fn_regexp(args: &[Value], nargout: usize, default_icase: bool) -> Result<
                 rows: c.rows,
                 cols: c.cols,
                 data: items,
+                extra_dims: Vec::new(),
             }));
         }
         return Ok(final_outs);
@@ -796,6 +797,7 @@ pub fn fn_regexprep(args: &[Value]) -> Result<Vec<Value>> {
             rows: c.rows,
             cols: c.cols,
             data,
+            extra_dims: Vec::new(),
         })]);
     }
     let text = args[0].as_str()?;

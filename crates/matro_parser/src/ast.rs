@@ -101,6 +101,13 @@ pub struct MethodDef {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum LValueStep {
+    Field(String),
+    Paren(Vec<IndexArg>),
+    Brace(Vec<IndexArg>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum AssignTarget {
     Var(String),
     Index { name: String, indices: Vec<IndexArg> },
@@ -116,6 +123,11 @@ pub enum AssignTarget {
         name: String,
         fields: Vec<String>,
         indices: Vec<IndexArg>,
+    },
+    /// Arbitrary-depth chained L-value target, e.g. `s(2).arr{1}(3, :) = val` or `c{1}(2) = val`.
+    Chain {
+        name: String,
+        steps: Vec<LValueStep>,
     },
 }
 

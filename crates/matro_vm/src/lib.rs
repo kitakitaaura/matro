@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
-use matro_bytecode::{Chunk, ClassProto, FunctionProto, OpCode, compile};
+use matro_bytecode::{ChainStep, Chunk, ClassProto, FunctionProto, OpCode, compile};
 use matro_intrinsics::{IntrinsicContext, call_intrinsic};
 use matro_loader::{ModuleLoader, Vfs};
 use matro_types::plot::json_str;
@@ -398,6 +398,11 @@ impl<'a> LocalFrame<'a> {
             }
             *cell = Some(Value::scalar(x));
         }
+    }
+
+    #[inline]
+    fn get_mut(&mut self, slot: u16) -> Option<&mut Value> {
+        self.slots.get_mut(slot as usize).and_then(Option::as_mut)
     }
 
     fn take(&mut self, slot: u16) -> Option<Value> {
@@ -1400,6 +1405,48 @@ impl Vm {
                 argc,
                 nargout,
             } => {
+                // Fast-path: 1D or 2D scalar indexing into a real double 2D local Matrix without boxing or Vec alloc
+                if nargout <= 1 && (argc == 1 || argc == 2) {
+                    if let Some(Value::Matrix(m)) = frame.as_deref().and_then(|f| f.get(slot)) {
+                        if !m.is_complex()
+                            && m.dtype() == matro_types::NumericClass::Double
+                            && m.ndims() == 2
+                        {
+                            let slen = stack.len();
+                            if argc == 1 && slen >= 1 {
+                                if let StackItem::Scalar(x) = stack[slen - 1] {
+                                    if x >= 1.0 && x.fract() == 0.0 && (x as usize) <= m.len() {
+                                        let v = m.data()[x as usize - 1];
+                                        stack.pop();
+                                        if nargout == 1 {
+                                            stack.push(StackItem::Scalar(v));
+                                        }
+                                        return Ok(true);
+                                    }
+                                }
+                            } else if argc == 2 && slen >= 2 {
+                                if let (StackItem::Scalar(r), StackItem::Scalar(c)) =
+                                    (&stack[slen - 2], &stack[slen - 1])
+                                {
+                                    let (r, c) = (*r, *c);
+                                    if r >= 1.0 && r.fract() == 0.0 && c >= 1.0 && c.fract() == 0.0
+                                    {
+                                        let ri = r as usize - 1;
+                                        let ci = c as usize - 1;
+                                        if ri < m.rows() && ci < m.cols() {
+                                            let v = m.get(ri, ci);
+                                            stack.truncate(slen - 2);
+                                            if nargout == 1 {
+                                                stack.push(StackItem::Scalar(v));
+                                            }
+                                            return Ok(true);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let raw_args = pop_items(stack, argc as usize)?;
                 let val = frame
                     .as_deref()
@@ -1434,6 +1481,51 @@ impl Vm {
                 argc,
                 nargout,
             } => {
+                // Fast-path: 1D or 2D scalar indexing into a real double 2D Matrix without cloning name/args
+                if nargout <= 1 && (argc == 1 || argc == 2) {
+                    let name_ref = &chunk.names[name_idx as usize];
+                    if let Some(Value::Matrix(m)) =
+                        lookup_var(name_ref, frame.as_deref(), &self.globals)
+                    {
+                        if !m.is_complex()
+                            && m.dtype() == matro_types::NumericClass::Double
+                            && m.ndims() == 2
+                        {
+                            let slen = stack.len();
+                            if argc == 1 && slen >= 1 {
+                                if let StackItem::Scalar(x) = stack[slen - 1] {
+                                    if x >= 1.0 && x.fract() == 0.0 && (x as usize) <= m.len() {
+                                        let v = m.data()[x as usize - 1];
+                                        stack.pop();
+                                        if nargout == 1 {
+                                            stack.push(StackItem::Scalar(v));
+                                        }
+                                        return Ok(true);
+                                    }
+                                }
+                            } else if argc == 2 && slen >= 2 {
+                                if let (StackItem::Scalar(r), StackItem::Scalar(c)) =
+                                    (&stack[slen - 2], &stack[slen - 1])
+                                {
+                                    let (r, c) = (*r, *c);
+                                    if r >= 1.0 && r.fract() == 0.0 && c >= 1.0 && c.fract() == 0.0
+                                    {
+                                        let ri = r as usize - 1;
+                                        let ci = c as usize - 1;
+                                        if ri < m.rows() && ci < m.cols() {
+                                            let v = m.get(ri, ci);
+                                            stack.truncate(slen - 2);
+                                            if nargout == 1 {
+                                                stack.push(StackItem::Scalar(v));
+                                            }
+                                            return Ok(true);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let name = chunk.names[name_idx as usize].clone();
                 let raw_args = pop_items(stack, argc as usize)?;
                 let env_val = frame
@@ -1525,11 +1617,11 @@ impl Vm {
                                 let n = causes.len();
                                 updated.fields.insert(
                                     "cause".to_string(),
-                                    Value::Cell(CellArray {
-                                        rows: n,
-                                        cols: if n == 0 { 0 } else { 1 },
-                                        data: causes,
-                                    }),
+                                    Value::Cell(CellArray::from_vec(
+                                        n,
+                                        if n == 0 { 0 } else { 1 },
+                                        causes,
+                                    )),
                                 );
                                 push_call_results(
                                     stack,
@@ -1746,18 +1838,134 @@ impl Vm {
                 )?;
             }
             OpCode::StoreIndex { name_idx, argc } => {
+                // Drop previous last_value reference first so COW `Arc::make_mut` sees strong_count == 1
+                *last_value = None;
+                // Fast-path: 1D/2D scalar write directly into global real double 2D Matrix in-place
+                if frame.is_none() && (argc == 1 || argc == 2) {
+                    let slen = stack.len();
+                    let name_ref = &chunk.names[name_idx as usize];
+                    if argc == 1 && slen >= 2 {
+                        if let (StackItem::Scalar(x), StackItem::Scalar(rhs_f)) =
+                            (&stack[slen - 2], &stack[slen - 1])
+                        {
+                            let (x, rhs_f) = (*x, *rhs_f);
+                            if x >= 1.0 && x.fract() == 0.0 {
+                                let idx = x as usize - 1;
+                                if let Some(Value::Matrix(arc)) = self.globals.get_mut(name_ref) {
+                                    if !arc.is_complex()
+                                        && arc.dtype() == matro_types::NumericClass::Double
+                                        && arc.ndims() == 2
+                                        && idx < arc.len()
+                                    {
+                                        std::sync::Arc::make_mut(arc).data_mut()[idx] = rhs_f;
+                                        *last_value = Some(Value::Matrix(arc.clone()));
+                                        stack.truncate(slen - 2);
+                                        return Ok(true);
+                                    }
+                                }
+                            }
+                        }
+                    } else if argc == 2 && slen >= 3 {
+                        if let (
+                            StackItem::Scalar(r),
+                            StackItem::Scalar(c),
+                            StackItem::Scalar(rhs_f),
+                        ) = (&stack[slen - 3], &stack[slen - 2], &stack[slen - 1])
+                        {
+                            let (r, c, rhs_f) = (*r, *c, *rhs_f);
+                            if r >= 1.0 && r.fract() == 0.0 && c >= 1.0 && c.fract() == 0.0 {
+                                let ri = r as usize - 1;
+                                let ci = c as usize - 1;
+                                if let Some(Value::Matrix(arc)) = self.globals.get_mut(name_ref) {
+                                    if !arc.is_complex()
+                                        && arc.dtype() == matro_types::NumericClass::Double
+                                        && arc.ndims() == 2
+                                        && ri < arc.rows()
+                                        && ci < arc.cols()
+                                    {
+                                        std::sync::Arc::make_mut(arc).set(ri, ci, rhs_f);
+                                        *last_value = Some(Value::Matrix(arc.clone()));
+                                        stack.truncate(slen - 3);
+                                        return Ok(true);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let rhs = pop_val(stack)?;
                 let raw_args = pop_items(stack, argc as usize)?;
                 let name = chunk.names[name_idx as usize].clone();
-                let mut val = lookup_var(&name, frame.as_deref(), &self.globals)
-                    .cloned()
-                    .unwrap_or_else(Value::empty);
-                remove_var(&name, frame.as_deref_mut(), &mut self.globals);
+                let mut val = if frame.is_none() {
+                    self.globals.remove(&name).unwrap_or_else(Value::empty)
+                } else {
+                    let v = lookup_var(&name, frame.as_deref(), &self.globals)
+                        .cloned()
+                        .unwrap_or_else(Value::empty);
+                    remove_var(&name, frame.as_deref_mut(), &mut self.globals);
+                    v
+                };
                 self.assign_value_index(&mut val, &raw_args, rhs, stdout)?;
-                *last_value = Some(val.clone());
+                if frame.is_none() {
+                    *last_value = Some(val.clone());
+                }
                 store_var(name, val, frame.as_deref_mut(), &mut self.globals);
             }
             OpCode::StoreIndexLocal { slot, argc } => {
+                // Fast-path: 1D/2D scalar write into local real double 2D Matrix in-place (zero alloc, true COW)
+                if argc == 1 || argc == 2 {
+                    let slen = stack.len();
+                    if argc == 1 && slen >= 2 {
+                        if let (StackItem::Scalar(x), StackItem::Scalar(rhs_f)) =
+                            (&stack[slen - 2], &stack[slen - 1])
+                        {
+                            let (x, rhs_f) = (*x, *rhs_f);
+                            if x >= 1.0 && x.fract() == 0.0 {
+                                let idx = x as usize - 1;
+                                if let Some(Value::Matrix(arc)) =
+                                    frame.as_deref_mut().and_then(|f| f.get_mut(slot))
+                                {
+                                    if !arc.is_complex()
+                                        && arc.dtype() == matro_types::NumericClass::Double
+                                        && arc.ndims() == 2
+                                        && idx < arc.len()
+                                    {
+                                        std::sync::Arc::make_mut(arc).data_mut()[idx] = rhs_f;
+                                        stack.truncate(slen - 2);
+                                        return Ok(true);
+                                    }
+                                }
+                            }
+                        }
+                    } else if argc == 2 && slen >= 3 {
+                        if let (
+                            StackItem::Scalar(r),
+                            StackItem::Scalar(c),
+                            StackItem::Scalar(rhs_f),
+                        ) = (&stack[slen - 3], &stack[slen - 2], &stack[slen - 1])
+                        {
+                            let (r, c, rhs_f) = (*r, *c, *rhs_f);
+                            if r >= 1.0 && r.fract() == 0.0 && c >= 1.0 && c.fract() == 0.0 {
+                                let ri = r as usize - 1;
+                                let ci = c as usize - 1;
+                                if let Some(Value::Matrix(arc)) =
+                                    frame.as_deref_mut().and_then(|f| f.get_mut(slot))
+                                {
+                                    if !arc.is_complex()
+                                        && arc.dtype() == matro_types::NumericClass::Double
+                                        && arc.ndims() == 2
+                                        && ri < arc.rows()
+                                        && ci < arc.cols()
+                                    {
+                                        std::sync::Arc::make_mut(arc).set(ri, ci, rhs_f);
+                                        stack.truncate(slen - 3);
+                                        return Ok(true);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let rhs = pop_val(stack)?;
                 let raw_args = pop_items(stack, argc as usize)?;
                 let mut val = frame
@@ -1766,7 +1974,6 @@ impl Vm {
                     .take(slot)
                     .unwrap_or_else(Value::empty);
                 self.assign_value_index(&mut val, &raw_args, rhs, stdout)?;
-                *last_value = Some(val.clone());
                 if let Some(f) = frame.as_deref_mut() {
                     f.set(slot, val);
                 }
@@ -2091,6 +2298,29 @@ impl Vm {
                 let updated = assign_struct_array_field(cur, &raw_args, path, rhs)?;
                 *last_value = Some(updated.clone());
                 f.set(slot, updated);
+            }
+            OpCode::StoreChain { name_idx, spec_idx } => {
+                let name = chunk.names[name_idx as usize].clone();
+                self.exec_store_chain(
+                    Some(&name),
+                    None,
+                    spec_idx,
+                    chunk,
+                    stack,
+                    frame,
+                    last_value,
+                )?;
+            }
+            OpCode::StoreChainLocal { slot, spec_idx } => {
+                self.exec_store_chain(
+                    None,
+                    Some(slot),
+                    spec_idx,
+                    chunk,
+                    stack,
+                    frame,
+                    last_value,
+                )?;
             }
             OpCode::DefineFunc(idx) => {
                 let mut proto = chunk.functions[idx as usize].clone();
@@ -2546,7 +2776,7 @@ impl Vm {
                     ov
                 } else {
                     match v {
-                        Value::Sparse(s) => Value::sparse(s.transpose()),
+                        Value::Sparse(s) => Value::sparse(s.ctranspose()),
                         other => Value::matrix(other.as_matrix()?.ctranspose()),
                     }
                 }
@@ -2614,11 +2844,11 @@ impl Vm {
             },
             OpCode::ElemMul => match (&a, &b) {
                 (Value::Sparse(sa), Value::Sparse(sb)) => Value::sparse(sa.elem_mul(sb)?),
-                (Value::Sparse(sa), Value::Matrix(mb)) if mb.as_scalar().is_some() => {
-                    Value::sparse(sa.scale(mb.as_scalar().unwrap()))
+                (Value::Sparse(sa), Value::Matrix(mb)) if mb.as_complex_scalar().is_some() => {
+                    Value::sparse(sa.scale_c(mb.as_complex_scalar().unwrap()))
                 }
-                (Value::Matrix(ma), Value::Sparse(sb)) if ma.as_scalar().is_some() => {
-                    Value::sparse(sb.scale(ma.as_scalar().unwrap()))
+                (Value::Matrix(ma), Value::Sparse(sb)) if ma.as_complex_scalar().is_some() => {
+                    Value::sparse(sb.scale_c(ma.as_complex_scalar().unwrap()))
                 }
                 _ => Value::matrix(
                     a.to_dense_matrix()?
@@ -2626,10 +2856,10 @@ impl Vm {
                 ),
             },
             OpCode::ElemDiv => match (&a, &b) {
-                (Value::Sparse(sa), Value::Matrix(mb)) if mb.as_scalar().is_some() => {
-                    let sc = mb.as_scalar().unwrap();
-                    if sc != 0.0 && sc.is_finite() {
-                        Value::sparse(sa.scale(1.0 / sc))
+                (Value::Sparse(sa), Value::Matrix(mb)) if mb.as_complex_scalar().is_some() => {
+                    let sc = mb.as_complex_scalar().unwrap();
+                    if !sc.is_zero() && sc.re.is_finite() && sc.im.is_finite() {
+                        Value::sparse(sa.scale_c(Complex::ONE / sc))
                     } else {
                         Value::matrix(
                             sa.to_dense()
@@ -2643,10 +2873,10 @@ impl Vm {
                 ),
             },
             OpCode::ElemLeftDiv => match (&a, &b) {
-                (Value::Matrix(ma), Value::Sparse(sb)) if ma.as_scalar().is_some() => {
-                    let sc = ma.as_scalar().unwrap();
-                    if sc != 0.0 && sc.is_finite() {
-                        Value::sparse(sb.scale(1.0 / sc))
+                (Value::Matrix(ma), Value::Sparse(sb)) if ma.as_complex_scalar().is_some() => {
+                    let sc = ma.as_complex_scalar().unwrap();
+                    if !sc.is_zero() && sc.re.is_finite() && sc.im.is_finite() {
+                        Value::sparse(sb.scale_c(Complex::ONE / sc))
                     } else {
                         Value::matrix(
                             ma.elementwise_c(&sb.to_dense(), |x, y| y / x)?,
@@ -2665,15 +2895,15 @@ impl Vm {
             OpCode::Mul => match (&a, &b) {
                 (Value::Sparse(sa), Value::Sparse(sb)) => Value::sparse(sa.matmul_sparse(sb)?),
                 (Value::Sparse(sa), Value::Matrix(mb)) => {
-                    if let Some(sc) = mb.as_scalar() {
-                        Value::sparse(sa.scale(sc))
+                    if let Some(sc) = mb.as_complex_scalar() {
+                        Value::sparse(sa.scale_c(sc))
                     } else {
                         Value::matrix(sa.matmul_dense(mb)?)
                     }
                 }
                 (Value::Matrix(ma), Value::Sparse(sb)) => {
-                    if let Some(sc) = ma.as_scalar() {
-                        Value::sparse(sb.scale(sc))
+                    if let Some(sc) = ma.as_complex_scalar() {
+                        Value::sparse(sb.scale_c(sc))
                     } else {
                         Value::matrix(ma.matmul(&sb.to_dense())?)
                     }
@@ -2681,8 +2911,9 @@ impl Vm {
                 _ => Value::matrix(a.as_matrix()?.matmul(b.as_matrix()?)?),
             },
             OpCode::Div => match (&a, &b) {
-                (Value::Sparse(sa), Value::Matrix(mb)) if mb.as_scalar().is_some() => {
-                    Value::sparse(sa.scale(1.0 / mb.as_scalar().unwrap()))
+                (Value::Sparse(sa), Value::Matrix(mb)) if mb.as_complex_scalar().is_some() => {
+                    let sc = mb.as_complex_scalar().unwrap();
+                    Value::sparse(sa.scale_c(Complex::ONE / sc))
                 }
                 _ => Value::matrix(a.to_dense_matrix()?.rdivide(&b.to_dense_matrix()?)?),
             },
@@ -4664,6 +4895,7 @@ impl Vm {
                 rows,
                 cols,
                 data: results,
+                extra_dims: Vec::new(),
             })])
         }
     }
@@ -4745,6 +4977,7 @@ impl Vm {
                 rows,
                 cols,
                 data: results,
+                extra_dims: Vec::new(),
             })])
         }
     }
@@ -4818,6 +5051,58 @@ impl Vm {
     }
 
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn exec_store_chain(
+        &mut self,
+        var_name: Option<&str>,
+        local_slot: Option<u16>,
+        spec_idx: u16,
+        chunk: &Chunk,
+        stack: &mut Vec<StackItem>,
+        mut frame: Option<&mut LocalFrame>,
+        last_value: &mut Option<Value>,
+    ) -> Result<()> {
+        let spec = &chunk.chain_specs[spec_idx as usize];
+        // Pop index args in reverse order of steps
+        let mut step_args: Vec<Vec<StackItem>> = vec![Vec::new(); spec.len()];
+        for (i, step) in spec.iter().enumerate().rev() {
+            match *step {
+                ChainStep::Field(_) => {}
+                ChainStep::Paren(argc) | ChainStep::Brace(argc) => {
+                    step_args[i] = pop_items(stack, argc as usize)?;
+                }
+            }
+        }
+        let rhs = pop_val(stack)?;
+
+        let mut root = if let Some(slot) = local_slot {
+            frame
+                .as_deref_mut()
+                .ok_or_else(|| MatroError::runtime("StoreChainLocal outside function"))?
+                .take(slot)
+                .unwrap_or_else(Value::empty)
+        } else if let Some(name) = var_name {
+            lookup_var(name, frame.as_deref(), &self.globals)
+                .cloned()
+                .unwrap_or_else(Value::empty)
+        } else {
+            Value::empty()
+        };
+
+        assign_chain_step(&mut root, spec, &step_args, &chunk.names, rhs, &mut self.handles)?;
+        *last_value = Some(root.clone());
+
+        if let Some(slot) = local_slot {
+            if let Some(f) = frame {
+                f.set(slot, root);
+            }
+        } else if let Some(name) = var_name {
+            store_var(name.to_string(), root, frame, &mut self.globals);
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
     fn exec_spfun(&mut self, call_args: &[Value], stdout: &mut String) -> Result<Vec<Value>> {
         if call_args.len() != 2 {
             return Err(MatroError::arity("spfun", "2 (fun, S)", call_args.len()));
@@ -4826,12 +5111,17 @@ impl Vm {
             Value::Sparse(s) => (**s).clone(),
             other => SparseMatrix::from_dense(&other.to_dense_matrix()?),
         };
-        let triplets = sp.triplets();
+        let triplets = sp.triplets_c();
         if triplets.is_empty() {
             return Ok(vec![Value::sparse(SparseMatrix::zeros(sp.rows(), sp.cols()))]);
         }
-        let nz_vals: Vec<f64> = triplets.iter().map(|&(_, _, v)| v).collect();
-        let nz_col = Value::matrix(Matrix::col_vec(nz_vals));
+        let nz_col = if sp.is_complex() {
+            let nz_vals: Vec<Complex> = triplets.iter().map(|&(_, _, v)| v).collect();
+            Value::matrix(Matrix::complex_col_vec(nz_vals).normalize())
+        } else {
+            let nz_vals: Vec<f64> = triplets.iter().map(|&(_, _, v)| v.re).collect();
+            Value::matrix(Matrix::col_vec(nz_vals))
+        };
         let mapped = self.invoke_callable_val(&call_args[0], &[nz_col], stdout)?;
         let mapped_mat = mapped.to_dense_matrix()?;
         if mapped_mat.len() != triplets.len() {
@@ -4841,12 +5131,24 @@ impl Vm {
                 triplets.len()
             )));
         }
-        let new_triplets: Vec<(usize, usize, f64)> = triplets
-            .iter()
-            .zip(mapped_mat.data().iter())
-            .filter_map(|(&(r, c, _), &v)| if v != 0.0 { Some((r, c, v)) } else { None })
-            .collect();
-        let out = SparseMatrix::from_triplets(sp.rows(), sp.cols(), &new_triplets)?;
+        let out = if mapped_mat.is_complex() {
+            let new_triplets: Vec<(usize, usize, Complex)> = triplets
+                .iter()
+                .enumerate()
+                .filter_map(|(k, &(r, c, _))| {
+                    let v = mapped_mat.get_linear_c(k);
+                    if !v.is_zero() { Some((r, c, v)) } else { None }
+                })
+                .collect();
+            SparseMatrix::from_complex_triplets(sp.rows(), sp.cols(), &new_triplets)?
+        } else {
+            let new_triplets: Vec<(usize, usize, f64)> = triplets
+                .iter()
+                .zip(mapped_mat.data().iter())
+                .filter_map(|(&(r, c, _), &v)| if v != 0.0 { Some((r, c, v)) } else { None })
+                .collect();
+            SparseMatrix::from_triplets(sp.rows(), sp.cols(), &new_triplets)?
+        };
         Ok(vec![Value::sparse(out)])
     }
 
@@ -4959,6 +5261,7 @@ impl Vm {
                     rows: 1,
                     cols: 1,
                     data: vec![ws],
+                    extra_dims: Vec::new(),
                 }),
             );
         } else {
@@ -5554,6 +5857,7 @@ fn make_mexception(identifier: &str, message: &str, line: u32) -> Value {
             rows: 0,
             cols: 1,
             data: Vec::new(),
+            extra_dims: Vec::new(),
         }),
     );
     fields.insert(
@@ -5830,6 +6134,7 @@ fn assign_cell_parens(cell: &mut CellArray, args: &[StackItem], rhs: Value) -> R
                     rows: new_r,
                     cols: new_c,
                     data: vec![Value::empty(); new_r * new_c],
+                    extra_dims: Vec::new(),
                 };
                 for c in 0..cell.cols {
                     for r in 0..cell.rows {
@@ -6109,10 +6414,11 @@ fn end_for_value(val: &Value, dim: u8, total_dims: u8) -> usize {
         Value::Cell(c) => {
             if total_dims == 1 {
                 c.data.len()
-            } else if dim == 0 {
-                c.rows
+            } else if (dim as usize) == (total_dims as usize).saturating_sub(1) {
+                let dims = c.dims();
+                dims[(dim as usize)..].iter().product()
             } else {
-                c.cols
+                c.dim_size(dim as usize)
             }
         }
         Value::Table(t) => {
@@ -6602,16 +6908,16 @@ fn assign_sparse_index(s: &mut SparseMatrix, args: &[StackItem], rhs: &Matrix) -
             };
             let rows = parse_dim(&args[0], s.rows())?;
             let cols = parse_dim(&args[1], s.cols())?;
-            if let Some(sc) = rhs.as_scalar() {
+            if let Some(sc) = rhs.as_complex_scalar() {
                 for &c in &cols {
                     for &r in &rows {
-                        s.set(r, c, sc);
+                        s.set_c(r, c, sc);
                     }
                 }
             } else if rhs.rows() == rows.len() && rhs.cols() == cols.len() {
                 for (ci, &c) in cols.iter().enumerate() {
                     for (ri, &r) in rows.iter().enumerate() {
-                        s.set(r, c, rhs.get(ri, ci));
+                        s.set_c(r, c, rhs.get_c(ri, ci));
                     }
                 }
             } else if (rows.len() == 1 || cols.len() == 1)
@@ -6621,7 +6927,7 @@ fn assign_sparse_index(s: &mut SparseMatrix, args: &[StackItem], rhs: &Matrix) -
                 let mut k = 0usize;
                 for &c in &cols {
                     for &r in &rows {
-                        s.set(r, c, rhs.data()[k]);
+                        s.set_c(r, c, rhs.get_linear_c(k));
                         k += 1;
                     }
                 }
@@ -6744,13 +7050,25 @@ fn index_matrix(m: &Matrix, args: &[StackItem]) -> Result<Matrix> {
     Ok(preserve_dtype(res, orig_dtype))
 }
 
+fn effective_nd_dims(in_dims: &[usize], n: usize) -> Vec<usize> {
+    let mut eff = Vec::with_capacity(n);
+    for ax in 0..n {
+        if ax + 1 == n && in_dims.len() > n {
+            eff.push(in_dims[ax..].iter().product());
+        } else {
+            eff.push(in_dims.get(ax).copied().unwrap_or(1));
+        }
+    }
+    eff
+}
+
 fn index_cell_contents(cell: &CellArray, args: &[StackItem]) -> Result<Vec<Value>> {
     match args.len() {
         1 => {
             let idxs = resolve_indices(&args[0], cell.data.len())?;
             Ok(idxs.iter().map(|&i| cell.data[i].clone()).collect())
         }
-        2 => {
+        2 if cell.extra_dims.is_empty() => {
             let rows = resolve_indices(&args[0], cell.rows)?;
             let cols = resolve_indices(&args[1], cell.cols)?;
             let mut out = Vec::with_capacity(rows.len() * cols.len());
@@ -6761,9 +7079,35 @@ fn index_cell_contents(cell: &CellArray, args: &[StackItem]) -> Result<Vec<Value
             }
             Ok(out)
         }
-        n => Err(MatroError::index(format!(
-            "Only 1D and 2D cell indexing supported, got {n} indices"
-        ))),
+        n => {
+            let eff_dims = effective_nd_dims(&cell.dims(), n);
+            let mut dim_idxs = Vec::with_capacity(n);
+            let mut out_dims = Vec::with_capacity(n);
+            for ax in 0..n {
+                let idxs = resolve_indices(&args[ax], eff_dims[ax])?;
+                out_dims.push(idxs.len());
+                dim_idxs.push(idxs);
+            }
+            let in_strides = nd_strides(&eff_dims);
+            let total: usize = out_dims.iter().product();
+            let mut out = Vec::with_capacity(total);
+            let mut coord = vec![0usize; n];
+            for _ in 0..total {
+                let mut src = 0usize;
+                for ax in 0..n {
+                    src += dim_idxs[ax][coord[ax]] * in_strides[ax];
+                }
+                out.push(cell.data[src].clone());
+                for ax in 0..n {
+                    coord[ax] += 1;
+                    if coord[ax] < out_dims[ax] {
+                        break;
+                    }
+                    coord[ax] = 0;
+                }
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -6773,13 +7117,9 @@ fn index_cell_subarray(cell: &CellArray, args: &[StackItem]) -> Result<CellArray
             let idxs = resolve_indices(&args[0], cell.data.len())?;
             let data: Vec<Value> = idxs.iter().map(|&i| cell.data[i].clone()).collect();
             let len = data.len();
-            Ok(CellArray {
-                rows: if len == 0 { 0 } else { 1 },
-                cols: len,
-                data,
-            })
+            Ok(CellArray::from_vec(if len == 0 { 0 } else { 1 }, len, data))
         }
-        2 => {
+        2 if cell.extra_dims.is_empty() => {
             let rows = resolve_indices(&args[0], cell.rows)?;
             let cols = resolve_indices(&args[1], cell.cols)?;
             let mut row_items = Vec::with_capacity(rows.len());
@@ -6792,13 +7132,297 @@ fn index_cell_subarray(cell: &CellArray, args: &[StackItem]) -> Result<CellArray
             }
             CellArray::from_rows(row_items)
         }
+        n => {
+            let eff_dims = effective_nd_dims(&cell.dims(), n);
+            let mut dim_idxs = Vec::with_capacity(n);
+            let mut out_dims = Vec::with_capacity(n);
+            for ax in 0..n {
+                let idxs = resolve_indices(&args[ax], eff_dims[ax])?;
+                out_dims.push(idxs.len());
+                dim_idxs.push(idxs);
+            }
+            let in_strides = nd_strides(&eff_dims);
+            let total: usize = out_dims.iter().product();
+            let mut data = Vec::with_capacity(total);
+            let mut coord = vec![0usize; n];
+            for _ in 0..total {
+                let mut src = 0usize;
+                for ax in 0..n {
+                    src += dim_idxs[ax][coord[ax]] * in_strides[ax];
+                }
+                data.push(cell.data[src].clone());
+                for ax in 0..n {
+                    coord[ax] += 1;
+                    if coord[ax] < out_dims[ax] {
+                        break;
+                    }
+                    coord[ax] = 0;
+                }
+            }
+            while out_dims.len() > 2 && out_dims.last() == Some(&1) {
+                out_dims.pop();
+            }
+            let rows = out_dims.first().copied().unwrap_or(0);
+            let cols = out_dims.get(1).copied().unwrap_or(1);
+            let extra_dims = if out_dims.len() > 2 {
+                out_dims[2..].to_vec()
+            } else {
+                Vec::new()
+            };
+            Ok(CellArray {
+                rows,
+                cols,
+                data,
+                extra_dims,
+            })
+        }
+    }
+}
+
+fn assign_chain_step(
+    cur: &mut Value,
+    steps: &[ChainStep],
+    step_args: &[Vec<StackItem>],
+    names: &[String],
+    rhs: Value,
+    handles: &mut [ObjectInstance],
+) -> Result<()> {
+    if steps.is_empty() {
+        *cur = rhs;
+        return Ok(());
+    }
+    // Handle object reference mutation via VM heap
+    if let Value::Handle(h) = cur {
+        if let ChainStep::Field(f_idx) = steps[0] {
+            let fname = &names[f_idx as usize];
+            let hid = h.id;
+            if steps.len() == 1 {
+                let inst = handles
+                    .get_mut(hid)
+                    .ok_or_else(|| MatroError::runtime("Invalid object handle"))?;
+                inst.fields.insert(fname.clone(), rhs);
+                return Ok(());
+            } else {
+                let mut child = handles
+                    .get_mut(hid)
+                    .ok_or_else(|| MatroError::runtime("Invalid object handle"))?
+                    .fields
+                    .remove(fname)
+                    .unwrap_or_else(Value::empty);
+                assign_chain_step(&mut child, &steps[1..], &step_args[1..], names, rhs, handles)?;
+                if let Some(inst) = handles.get_mut(hid) {
+                    inst.fields.insert(fname.clone(), child);
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    match steps[0] {
+        ChainStep::Field(f_idx) => {
+            let fname = &names[f_idx as usize];
+            if steps.len() == 1 {
+                match cur {
+                    Value::Struct(map) => {
+                        map.insert(fname.clone(), rhs);
+                    }
+                    Value::Object(o) => {
+                        o.fields.insert(fname.clone(), rhs);
+                    }
+                    Value::StructArray(sa) if sa.items.len() == 1 => {
+                        sa.items[0].insert(fname.clone(), rhs);
+                    }
+                    _ => {
+                        let mut map = BTreeMap::new();
+                        map.insert(fname.clone(), rhs);
+                        *cur = Value::Struct(map);
+                    }
+                }
+                Ok(())
+            } else {
+                match cur {
+                    Value::Struct(map) => {
+                        let mut child = map.remove(fname).unwrap_or_else(Value::empty);
+                        assign_chain_step(&mut child, &steps[1..], &step_args[1..], names, rhs, handles)?;
+                        map.insert(fname.clone(), child);
+                    }
+                    Value::Object(o) => {
+                        let mut child = o.fields.remove(fname).unwrap_or_else(Value::empty);
+                        assign_chain_step(&mut child, &steps[1..], &step_args[1..], names, rhs, handles)?;
+                        o.fields.insert(fname.clone(), child);
+                    }
+                    Value::StructArray(sa) if sa.items.len() == 1 => {
+                        let mut child = sa.items[0].remove(fname).unwrap_or_else(Value::empty);
+                        assign_chain_step(&mut child, &steps[1..], &step_args[1..], names, rhs, handles)?;
+                        sa.items[0].insert(fname.clone(), child);
+                    }
+                    _ => {
+                        let mut child = Value::empty();
+                        assign_chain_step(&mut child, &steps[1..], &step_args[1..], names, rhs, handles)?;
+                        let mut map = BTreeMap::new();
+                        map.insert(fname.clone(), child);
+                        *cur = Value::Struct(map);
+                    }
+                }
+                Ok(())
+            }
+        }
+        ChainStep::Paren(_) => {
+            let args = &step_args[0];
+            if steps.len() == 1 {
+                match cur {
+                    Value::Sparse(sp) => {
+                        let m_rhs = rhs.to_dense_matrix()?;
+                        assign_sparse_index(std::sync::Arc::make_mut(sp), args, &m_rhs)?;
+                    }
+                    Value::Matrix(m) => {
+                        let m_rhs = rhs.to_dense_matrix()?;
+                        assign_matrix_index(std::sync::Arc::make_mut(m), args, &m_rhs)?;
+                    }
+                    Value::StructArray(sa) => {
+                        let idx = resolve_struct_array_pos(sa, args)?;
+                        if let Value::Struct(map) = rhs {
+                            sa.items[idx] = map;
+                        } else {
+                            return Err(MatroError::runtime("Expected struct for struct array assignment"));
+                        }
+                    }
+                    Value::Cell(c) => {
+                        let item = match rhs {
+                            Value::Cell(rc) if rc.data.len() == 1 => rc.data.into_iter().next().unwrap(),
+                            other => other,
+                        };
+                        assign_cell_index(c, args, item)?;
+                    }
+                    _ => {
+                        if let Value::Struct(map) = rhs {
+                            let mut sa = StructArray { rows: 0, cols: 0, items: Vec::new() };
+                            let idx = resolve_struct_array_pos(&mut sa, args)?;
+                            sa.items[idx] = map;
+                            *cur = Value::StructArray(sa);
+                        } else {
+                            let mut m = Matrix::zeros(0, 0);
+                            let m_rhs = rhs.to_dense_matrix()?;
+                            assign_matrix_index(&mut m, args, &m_rhs)?;
+                            *cur = Value::matrix(m);
+                        }
+                    }
+                }
+                Ok(())
+            } else {
+                // Intermediate `(...)` step (most commonly struct array `s(k).field...`)
+                match cur {
+                    Value::Struct(map) => {
+                        let mut sa = StructArray {
+                            rows: 1,
+                            cols: 1,
+                            items: vec![std::mem::take(map)],
+                        };
+                        let idx = resolve_struct_array_pos(&mut sa, args)?;
+                        let mut elem = Value::Struct(std::mem::take(&mut sa.items[idx]));
+                        assign_chain_step(&mut elem, &steps[1..], &step_args[1..], names, rhs, handles)?;
+                        if let Value::Struct(m) = elem {
+                            sa.items[idx] = m;
+                        }
+                        *cur = Value::StructArray(sa);
+                        Ok(())
+                    }
+                    Value::StructArray(sa) => {
+                        let idx = resolve_struct_array_pos(sa, args)?;
+                        let mut elem = Value::Struct(std::mem::take(&mut sa.items[idx]));
+                        assign_chain_step(&mut elem, &steps[1..], &step_args[1..], names, rhs, handles)?;
+                        if let Value::Struct(m) = elem {
+                            sa.items[idx] = m;
+                        }
+                        Ok(())
+                    }
+                    Value::Cell(c) => {
+                        let pos = ensure_cell_pos(c, args)?;
+                        let mut child = std::mem::replace(&mut c.data[pos], Value::empty());
+                        assign_chain_step(&mut child, &steps[1..], &step_args[1..], names, rhs, handles)?;
+                        c.data[pos] = child;
+                        Ok(())
+                    }
+                    _ => {
+                        let mut sa = StructArray { rows: 0, cols: 0, items: Vec::new() };
+                        let idx = resolve_struct_array_pos(&mut sa, args)?;
+                        let mut elem = Value::Struct(std::mem::take(&mut sa.items[idx]));
+                        assign_chain_step(&mut elem, &steps[1..], &step_args[1..], names, rhs, handles)?;
+                        if let Value::Struct(m) = elem {
+                            sa.items[idx] = m;
+                        }
+                        *cur = Value::StructArray(sa);
+                        Ok(())
+                    }
+                }
+            }
+        }
+        ChainStep::Brace(_) => {
+            let args = &step_args[0];
+            if !matches!(cur, Value::Cell(_)) {
+                *cur = Value::Cell(CellArray::empty());
+            }
+            let Value::Cell(c) = cur else { unreachable!() };
+            if steps.len() == 1 {
+                assign_cell_index(c, args, rhs)
+            } else {
+                let pos = ensure_cell_pos(c, args)?;
+                let mut child = std::mem::replace(&mut c.data[pos], Value::empty());
+                assign_chain_step(&mut child, &steps[1..], &step_args[1..], names, rhs, handles)?;
+                c.data[pos] = child;
+                Ok(())
+            }
+        }
+    }
+}
+
+fn resolve_struct_array_pos(sa: &mut StructArray, args: &[StackItem]) -> Result<usize> {
+    match args.len() {
+        1 => {
+            let idx = args[0].clone().into_val()?.as_scalar()?.round() as isize;
+            if idx < 1 {
+                return Err(MatroError::index("Struct array index must be >= 1"));
+            }
+            let i = (idx - 1) as usize;
+            if i >= sa.items.len() {
+                sa.items.resize(i + 1, BTreeMap::new());
+                if sa.rows == 0 {
+                    sa.rows = 1;
+                }
+                sa.cols = sa.items.len().div_ceil(sa.rows);
+            }
+            Ok(i)
+        }
+        2 => {
+            let r = args[0].clone().into_val()?.as_scalar()?.round() as isize;
+            let c = args[1].clone().into_val()?.as_scalar()?.round() as isize;
+            if r < 1 || c < 1 {
+                return Err(MatroError::index("Struct array indices must be >= 1"));
+            }
+            let r = (r - 1) as usize;
+            let c = (c - 1) as usize;
+            let new_r = sa.rows.max(r + 1);
+            let new_c = sa.cols.max(c + 1);
+            if new_r != sa.rows || new_c != sa.cols {
+                let mut grown = vec![BTreeMap::new(); new_r * new_c];
+                for cc in 0..sa.cols {
+                    for rr in 0..sa.rows {
+                        grown[cc * new_r + rr] = std::mem::take(&mut sa.items[cc * sa.rows + rr]);
+                    }
+                }
+                sa.rows = new_r;
+                sa.cols = new_c;
+                sa.items = grown;
+            }
+            Ok(c * sa.rows + r)
+        }
         n => Err(MatroError::index(format!(
-            "Only 1D and 2D cell indexing supported, got {n} indices"
+            "Unsupported struct array indexing with {n} indices"
         ))),
     }
 }
 
-fn assign_cell_index(cell: &mut CellArray, args: &[StackItem], rhs: Value) -> Result<()> {
+fn ensure_cell_pos(cell: &mut CellArray, args: &[StackItem]) -> Result<usize> {
     match args.len() {
         1 => {
             let idx = args[0].clone().into_val()?.as_scalar()?.round() as isize;
@@ -6808,38 +7432,37 @@ fn assign_cell_index(cell: &mut CellArray, args: &[StackItem], rhs: Value) -> Re
             let i = (idx - 1) as usize;
             if i >= cell.data.len() {
                 cell.data.resize(i + 1, Value::empty());
-                cell.rows = 1;
-                cell.cols = cell.data.len();
-            }
-            cell.data[i] = rhs;
-            Ok(())
-        }
-        2 => {
-            let r = args[0].clone().into_val()?.as_scalar()?.round() as isize;
-            let c = args[1].clone().into_val()?.as_scalar()?.round() as isize;
-            if r < 1 || c < 1 {
-                return Err(MatroError::index("Cell indices must be >= 1"));
-            }
-            let r = (r - 1) as usize;
-            let c = (c - 1) as usize;
-            let new_r = cell.rows.max(r + 1);
-            let new_c = cell.cols.max(c + 1);
-            if new_r != cell.rows || new_c != cell.cols {
-                let mut grown = CellArray::new_empty_cells(new_r, new_c);
-                for cc in 0..cell.cols {
-                    for rr in 0..cell.rows {
-                        grown.set(rr, cc, cell.get(rr, cc).clone());
-                    }
+                if cell.rows == 0 {
+                    cell.rows = 1;
                 }
-                *cell = grown;
+                cell.cols = cell.data.len();
+                cell.extra_dims.clear();
             }
-            cell.set(r, c, rhs);
-            Ok(())
+            Ok(i)
         }
-        n => Err(MatroError::index(format!(
-            "Only 1D and 2D cell assignment supported, got {n} indices"
-        ))),
+        n => {
+            let mut coords = Vec::with_capacity(n);
+            let mut req = Vec::with_capacity(n);
+            for a in args {
+                let idx = a.clone().into_val()?.as_scalar()?.round() as isize;
+                if idx < 1 {
+                    return Err(MatroError::index("Cell indices must be >= 1"));
+                }
+                let c0 = (idx - 1) as usize;
+                coords.push(c0);
+                req.push(c0 + 1);
+            }
+            cell.grow_to_nd(&req);
+            cell.linear_index(&coords)
+                .ok_or_else(|| MatroError::index("Cell index out of bounds"))
+        }
     }
+}
+
+fn assign_cell_index(cell: &mut CellArray, args: &[StackItem], rhs: Value) -> Result<()> {
+    let pos = ensure_cell_pos(cell, args)?;
+    cell.data[pos] = rhs;
+    Ok(())
 }
 
 fn assign_matrix_index(m: &mut Matrix, args: &[StackItem], rhs: &Matrix) -> Result<()> {

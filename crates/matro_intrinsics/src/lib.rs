@@ -66,9 +66,18 @@ pub fn call_intrinsic(
 
         // Complex utilities
         "complex" => fn_complex(args),
-        "real" => fn_unary_mat(name, args, |m| Ok(m.real_part())),
-        "imag" => fn_unary_mat(name, args, |m| Ok(m.imag_part())),
-        "conj" => fn_unary_mat(name, args, |m| Ok(m.conj())),
+        "real" => match args {
+            [Value::Sparse(s)] => ok1(Value::sparse(s.real_part())),
+            _ => fn_unary_mat(name, args, |m| Ok(m.real_part())),
+        },
+        "imag" => match args {
+            [Value::Sparse(s)] => ok1(Value::sparse(s.imag_part())),
+            _ => fn_unary_mat(name, args, |m| Ok(m.imag_part())),
+        },
+        "conj" => match args {
+            [Value::Sparse(s)] => ok1(Value::sparse(s.conj())),
+            _ => fn_unary_mat(name, args, |m| Ok(m.conj())),
+        },
         "angle" => fn_unary_mat(name, args, |m| Ok(m.map_c_to_real(Complex::arg))),
         "isreal" => fn_isreal(args),
 
@@ -204,8 +213,14 @@ pub fn call_intrinsic(
         "reshape" => fn_reshape(args),
         "ind2sub" => fn_ind2sub(args, nargout),
         "sub2ind" => fn_sub2ind(args),
-        "transpose" => fn_unary_mat(name, args, |m| Ok(m.transpose())),
-        "ctranspose" => fn_unary_mat(name, args, |m| Ok(m.ctranspose())),
+        "transpose" => match args {
+            [Value::Sparse(s)] => ok1(Value::sparse(s.transpose())),
+            _ => fn_unary_mat(name, args, |m| Ok(m.transpose())),
+        },
+        "ctranspose" => match args {
+            [Value::Sparse(s)] => ok1(Value::sparse(s.ctranspose())),
+            _ => fn_unary_mat(name, args, |m| Ok(m.ctranspose())),
+        },
 
         // Linear algebra, signal processing & numerics
         "det" => fn_unary_mat(name, args, |m| Ok(Matrix::complex_scalar(m.det_c()?).normalize())),
@@ -978,7 +993,7 @@ fn fn_isreal(args: &[Value]) -> Result<Vec<Value>> {
     }
     let real = match &args[0] {
         Value::Matrix(m) => !m.is_complex(),
-        Value::Sparse(_) => true,
+        Value::Sparse(s) => !s.is_complex(),
         _ => true,
     };
     ok1(Value::bool(real))
@@ -1560,16 +1575,37 @@ fn fn_meshgrid(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
 }
 
 fn fn_cell(args: &[Value]) -> Result<Vec<Value>> {
-    let (r, c) = match args.len() {
-        0 => (0, 0),
+    match args.len() {
+        0 => ok1(Value::Cell(CellArray::new_empty_cells(0, 0))),
         1 => {
-            let n = as_usize(&args[0], "cell")?;
-            (n, n)
+            let m = args[0].to_dense_matrix()?;
+            if m.len() == 1 {
+                let n = as_usize(&args[0], "cell")?;
+                ok1(Value::Cell(CellArray::new_empty_cells(n, n)))
+            } else {
+                let mut dims = Vec::with_capacity(m.len());
+                for &x in m.data() {
+                    if x < 0.0 || !x.is_finite() {
+                        return Err(MatroError::runtime("cell: dimensions must be non-negative integers"));
+                    }
+                    dims.push(x.round() as usize);
+                }
+                ok1(Value::Cell(CellArray::new_empty_nd(dims)))
+            }
         }
-        2 => (as_usize(&args[0], "cell")?, as_usize(&args[1], "cell")?),
-        n => return Err(MatroError::arity("cell", "0..=2", n)),
-    };
-    ok1(Value::Cell(CellArray::new_empty_cells(r, c)))
+        2 => {
+            let r = as_usize(&args[0], "cell")?;
+            let c = as_usize(&args[1], "cell")?;
+            ok1(Value::Cell(CellArray::new_empty_cells(r, c)))
+        }
+        _ => {
+            let mut dims = Vec::with_capacity(args.len());
+            for a in args {
+                dims.push(as_usize(a, "cell")?);
+            }
+            ok1(Value::Cell(CellArray::new_empty_nd(dims)))
+        }
+    }
 }
 
 fn fn_struct(args: &[Value]) -> Result<Vec<Value>> {
@@ -1724,7 +1760,9 @@ fn fn_sparse(args: &[Value]) -> Result<Vec<Value>> {
             let jv = jm.data();
             let mut max_r = 0usize;
             let mut max_c = 0usize;
-            let mut triplets = Vec::with_capacity(n_entries);
+            let is_complex = vv.is_complex();
+            let mut real_triplets = if is_complex { Vec::new() } else { Vec::with_capacity(n_entries) };
+            let mut cplx_triplets = if is_complex { Vec::with_capacity(n_entries) } else { Vec::new() };
             for k in 0..n_entries {
                 let r = (if iv.len() == 1 { iv[0] } else { iv[k] }).round() as isize;
                 let c = (if jv.len() == 1 { jv[0] } else { jv[k] }).round() as isize;
@@ -1735,8 +1773,13 @@ fn fn_sparse(args: &[Value]) -> Result<Vec<Value>> {
                 let c0 = (c - 1) as usize;
                 max_r = max_r.max(r0 + 1);
                 max_c = max_c.max(c0 + 1);
-                let val = if vv.len() == 1 { vv.data()[0] } else { vv.data()[k] };
-                triplets.push((r0, c0, val));
+                if is_complex {
+                    let val = if vv.len() == 1 { vv.get_linear_c(0) } else { vv.get_linear_c(k) };
+                    cplx_triplets.push((r0, c0, val));
+                } else {
+                    let val = if vv.len() == 1 { vv.data()[0] } else { vv.data()[k] };
+                    real_triplets.push((r0, c0, val));
+                }
             }
             let (rows, cols) = if args.len() >= 5 {
                 (as_usize(&args[3], "sparse")?, as_usize(&args[4], "sparse")?)
@@ -1746,7 +1789,12 @@ fn fn_sparse(args: &[Value]) -> Result<Vec<Value>> {
             if args.len() == 6 {
                 let _nzmax = as_usize(&args[5], "sparse")?;
             }
-            ok1(Value::sparse(SparseMatrix::from_triplets(rows, cols, &triplets)?))
+            let sp = if is_complex {
+                SparseMatrix::from_complex_triplets(rows, cols, &cplx_triplets)?
+            } else {
+                SparseMatrix::from_triplets(rows, cols, &real_triplets)?
+            };
+            ok1(Value::sparse(sp))
         }
         n => Err(MatroError::arity("sparse", "1, 2, 3, 5, or 6", n)),
     }
@@ -2222,7 +2270,7 @@ fn value_dims(v: &Value) -> Vec<usize> {
     match v {
         Value::Matrix(m) => m.dims(),
         Value::Sparse(s) => vec![s.rows(), s.cols()],
-        Value::Cell(c) => vec![c.rows, c.cols],
+        Value::Cell(c) => c.dims(),
         Value::StructArray(sa) => vec![sa.rows, sa.cols],
         Value::String(s) => vec![1, s.chars().count()],
         Value::Table(t) => vec![t.nrows, t.col_names.len()],
@@ -2649,7 +2697,11 @@ fn fn_lu(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
         .is_some_and(|s| s.eq_ignore_ascii_case("vector"));
     if let Value::Sparse(sp) = &args[0] {
         if sp.rows() == sp.cols() {
-            let (l, u, perm) = sp.lu_sparse()?;
+            let (l, u, perm) = if sp.is_complex() {
+                sp.lu_sparse_complex()?
+            } else {
+                sp.lu_sparse()?
+            };
             let n = perm.len();
             if nargout >= 3 {
                 let p_val = if vec_perm {

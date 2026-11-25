@@ -287,6 +287,8 @@ pub struct CellArray {
     pub rows: usize,
     pub cols: usize,
     pub data: Vec<Value>,
+    /// Extra dimensions beyond 2D (empty for standard 2D cell arrays, e.g. `[4]` for `2x3x4`).
+    pub extra_dims: Vec<usize>,
 }
 
 impl CellArray {
@@ -295,7 +297,115 @@ impl CellArray {
             rows: 0,
             cols: 0,
             data: Vec::new(),
+            extra_dims: Vec::new(),
         }
+    }
+
+    pub fn from_vec(rows: usize, cols: usize, data: Vec<Value>) -> Self {
+        Self {
+            rows,
+            cols,
+            data,
+            extra_dims: Vec::new(),
+        }
+    }
+
+    pub fn dims(&self) -> Vec<usize> {
+        let mut d = Vec::with_capacity(2 + self.extra_dims.len());
+        d.push(self.rows);
+        d.push(self.cols);
+        d.extend_from_slice(&self.extra_dims);
+        while d.len() > 2 && d.last() == Some(&1) {
+            d.pop();
+        }
+        d
+    }
+
+    pub fn ndims(&self) -> usize {
+        self.dims().len()
+    }
+
+    pub fn dim_size(&self, dim: usize) -> usize {
+        match dim {
+            0 => self.rows,
+            1 => self.cols,
+            k => self.extra_dims.get(k - 2).copied().unwrap_or(1),
+        }
+    }
+
+    pub fn new_empty_nd(mut dims: Vec<usize>) -> Self {
+        while dims.len() < 2 {
+            dims.push(1);
+        }
+        while dims.len() > 2 && dims.last() == Some(&1) {
+            dims.pop();
+        }
+        let total: usize = dims.iter().product();
+        let rows = dims[0];
+        let cols = dims[1];
+        let extra_dims = dims[2..].to_vec();
+        Self {
+            rows,
+            cols,
+            data: vec![Value::empty(); total],
+            extra_dims,
+        }
+    }
+
+    pub fn linear_index(&self, coords: &[usize]) -> Option<usize> {
+        let dims = self.dims();
+        let mut stride = 1usize;
+        let mut lin = 0usize;
+        for (i, &c) in coords.iter().enumerate() {
+            let d = dims.get(i).copied().unwrap_or(1);
+            if c >= d {
+                return None;
+            }
+            lin += c * stride;
+            stride *= d;
+        }
+        if lin < self.data.len() { Some(lin) } else { None }
+    }
+
+    pub fn grow_to_nd(&mut self, req_dims: &[usize]) {
+        let old_dims = self.dims();
+        let nd = old_dims.len().max(req_dims.len()).max(2);
+        let mut new_dims = Vec::with_capacity(nd);
+        for i in 0..nd {
+            let od = old_dims.get(i).copied().unwrap_or(1);
+            let rd = req_dims.get(i).copied().unwrap_or(1);
+            new_dims.push(od.max(rd));
+        }
+        while new_dims.len() > 2 && new_dims.last() == Some(&1) {
+            new_dims.pop();
+        }
+        if new_dims == old_dims {
+            return;
+        }
+        let mut grown = Self::new_empty_nd(new_dims.clone());
+        let old_total = self.data.len();
+        let mut old_strides = vec![1usize; nd];
+        let mut new_strides = vec![1usize; nd];
+        for i in 1..nd {
+            old_strides[i] = old_strides[i - 1] * old_dims.get(i - 1).copied().unwrap_or(1);
+            new_strides[i] = new_strides[i - 1] * new_dims.get(i - 1).copied().unwrap_or(1);
+        }
+        for lin in 0..old_total {
+            let mut rem = lin;
+            let mut dst = 0usize;
+            for i in 0..nd {
+                let od = old_dims.get(i).copied().unwrap_or(1);
+                let coord = if od > 0 { rem % od } else { 0 };
+                if od > 0 {
+                    rem /= od;
+                }
+                dst += coord * new_strides[i];
+            }
+            if dst < grown.data.len() {
+                grown.data[dst] = std::mem::replace(&mut self.data[lin], Value::empty());
+            }
+        }
+        *self = grown;
     }
 
     pub fn from_rows(row_items: Vec<Vec<Value>>) -> Result<Self> {
@@ -317,7 +427,12 @@ impl CellArray {
                 data[c * rows + r] = val;
             }
         }
-        Ok(Self { rows, cols, data })
+        Ok(Self {
+            rows,
+            cols,
+            data,
+            extra_dims: Vec::new(),
+        })
     }
 
     pub fn new_empty_cells(rows: usize, cols: usize) -> Self {
@@ -325,6 +440,7 @@ impl CellArray {
             rows,
             cols,
             data: vec![Value::empty(); rows * cols],
+            extra_dims: Vec::new(),
         }
     }
 
@@ -398,11 +514,7 @@ impl TableData {
                 }
                 Value::Cell(c) => {
                     let n = c.data.len();
-                    let col_c = CellArray {
-                        rows: n,
-                        cols: if n == 0 { 0 } else { 1 },
-                        data: c.data,
-                    };
+                    let col_c = CellArray::from_vec(n, if n == 0 { 0 } else { 1 }, c.data);
                     (Value::Cell(col_c), n)
                 }
                 Value::String(s) => {
@@ -410,6 +522,7 @@ impl TableData {
                         rows: 1,
                         cols: 1,
                         data: vec![Value::String(s)],
+                        extra_dims: Vec::new(),
                     };
                     (Value::Cell(col_c), 1)
                 }
@@ -468,11 +581,7 @@ impl TableData {
             Value::Cell(c) => {
                 let n = c.data.len();
                 (
-                    Value::Cell(CellArray {
-                        rows: n,
-                        cols: if n == 0 { 0 } else { 1 },
-                        data: c.data,
-                    }),
+                    Value::Cell(CellArray::from_vec(n, if n == 0 { 0 } else { 1 }, c.data)),
                     n,
                 )
             }
@@ -532,11 +641,7 @@ impl TableData {
                 Value::Cell(cell) => {
                     let vals: Vec<Value> = rows.iter().map(|&r| cell.data[r].clone()).collect();
                     let n = vals.len();
-                    Value::Cell(CellArray {
-                        rows: n,
-                        cols: if n == 0 { 0 } else { 1 },
-                        data: vals,
-                    })
+                    Value::Cell(CellArray::from_vec(n, if n == 0 { 0 } else { 1 }, vals))
                 }
                 other => other.clone(),
             };

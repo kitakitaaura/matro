@@ -57,11 +57,7 @@ pub fn fn_table(args: &[Value]) -> Result<Vec<Value>> {
                 let col = match vt.as_str() {
                     "string" | "cell" | "cellstr" | "char" => {
                         let data = vec![Value::String(String::new()); nr];
-                        Value::Cell(CellArray {
-                            rows: nr,
-                            cols: if nr == 0 { 0 } else { 1 },
-                            data,
-                        })
+                        Value::Cell(CellArray::from_vec(nr, if nr == 0 { 0 } else { 1 }, data))
                     }
                     "logical" => Value::matrix(Matrix::zeros(nr, 1).with_logical(true)),
                     _ => Value::matrix(Matrix::zeros(nr, 1)),
@@ -364,11 +360,7 @@ pub fn fn_readtable(args: &[Value], loader: &ModuleLoader) -> Result<Vec<Value>>
         } else {
             let vals: Vec<Value> = col.into_iter().map(Value::String).collect();
             let n = vals.len();
-            columns.push(Value::Cell(CellArray {
-                rows: n,
-                cols: if n == 0 { 0 } else { 1 },
-                data: vals,
-            }));
+            columns.push(Value::Cell(CellArray::from_vec(n, if n == 0 { 0 } else { 1 }, vals)));
         }
     }
     ok1(Value::Table(TableData::new(col_names, columns)?))
@@ -1181,11 +1173,8 @@ pub fn fn_struct2table(args: &[Value]) -> Result<Vec<Value>> {
                         .iter()
                         .map(|st| st.get(nm).cloned().unwrap_or_else(Value::empty))
                         .collect();
-                    cols.push(Value::Cell(CellArray {
-                        rows: data.len(),
-                        cols: if data.is_empty() { 0 } else { 1 },
-                        data,
-                    }));
+                    let n = data.len();
+                    cols.push(Value::Cell(CellArray::from_vec(n, if n == 0 { 0 } else { 1 }, data)));
                 }
             }
             ok1(Value::Table(TableData::new(names, cols)?))
@@ -1231,11 +1220,7 @@ pub fn fn_cell2table(args: &[Value]) -> Result<Vec<Value>> {
         if all_num {
             cols.push(Value::matrix(Matrix::col_vec(nums)));
         } else {
-            cols.push(Value::Cell(CellArray {
-                rows: c.rows,
-                cols: if c.rows == 0 { 0 } else { 1 },
-                data: vals,
-            }));
+            cols.push(Value::Cell(CellArray::from_vec(c.rows, if c.rows == 0 { 0 } else { 1 }, vals)));
         }
     }
     ok1(Value::Table(TableData::new(names, cols)?))

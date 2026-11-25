@@ -2,7 +2,7 @@ pub mod compiler;
 pub mod op;
 
 pub use compiler::Compiler;
-pub use op::{Chunk, ClassProto, CompiledArgSpec, FunctionProto, OpCode, PropProto};
+pub use op::{ChainStep, Chunk, ClassProto, CompiledArgSpec, FunctionProto, OpCode, PropProto};
 
 use matro_parser::parse;
 use matro_types::Result;

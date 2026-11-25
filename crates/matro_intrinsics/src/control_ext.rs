@@ -1734,6 +1734,7 @@ pub fn fn_tfdata(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
                 rows: 1,
                 cols: 1,
                 data: vec![Value::matrix(m)],
+                extra_dims: Vec::new(),
             })
         }
     };

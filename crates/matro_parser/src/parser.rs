@@ -1,4 +1,4 @@
-use matro_types::{MatroError, Result};
+use matro_types::{MatroError, Result, Span};
 
 use crate::ast::*;
 use crate::lexer::{Lexer, Token, TokenKind};
@@ -857,11 +857,18 @@ impl Parser {
                 },
                 ExprKind::CellIndex { target, indices } => match target.kind {
                     ExprKind::Ident(name) => AssignTarget::CellIndex { name, indices },
-                    _ => return Err(MatroError::syntax(span, "Invalid cell assignment target")),
+                    _ => {
+                        let rebuilt = Expr {
+                            kind: ExprKind::CellIndex { target, indices },
+                            span,
+                        };
+                        Self::unwrap_lvalue_chain(rebuilt, span)?
+                    }
                 },
                 ExprKind::FieldAccess { .. } => {
                     let mut fields = Vec::new();
-                    let mut cur = expr;
+                    let mut cur = expr.clone();
+                    let mut fast_target = None;
                     loop {
                         match cur.kind {
                             ExprKind::FieldAccess { object, field } => {
@@ -870,23 +877,24 @@ impl Parser {
                             }
                             ExprKind::Ident(name) => {
                                 fields.reverse();
-                                break AssignTarget::Field { name, fields };
+                                fast_target = Some(AssignTarget::Field { name, fields });
+                                break;
                             }
                             ExprKind::CallOrIndex { callee, args } => {
                                 fields.reverse();
-                                break AssignTarget::IndexedField {
+                                fast_target = Some(AssignTarget::IndexedField {
                                     name: callee,
                                     indices: args,
                                     fields,
-                                };
+                                });
+                                break;
                             }
-                            _ => {
-                                return Err(MatroError::syntax(
-                                    span,
-                                    "Invalid struct field assignment target",
-                                ));
-                            }
+                            _ => break,
                         }
+                    }
+                    match fast_target {
+                        Some(t) => t,
+                        None => Self::unwrap_lvalue_chain(expr, span)?,
                     }
                 }
                 ExprKind::MethodCall {
@@ -894,31 +902,41 @@ impl Parser {
                     method,
                     args,
                 } => {
+                    let orig = Expr {
+                        kind: ExprKind::MethodCall {
+                            object: object.clone(),
+                            method: method.clone(),
+                            args: args.clone(),
+                        },
+                        span,
+                    };
                     let mut fields = vec![method];
                     let mut cur = *object;
+                    let mut fast_target = None;
                     loop {
                         match cur.kind {
                             ExprKind::Ident(n) => {
                                 fields.reverse();
-                                break AssignTarget::FieldIndex {
+                                fast_target = Some(AssignTarget::FieldIndex {
                                     name: n,
                                     fields,
                                     indices: args,
-                                };
+                                });
+                                break;
                             }
                             ExprKind::FieldAccess { object: o, field: f } => {
                                 fields.push(f);
                                 cur = *o;
                             }
-                            _ => {
-                                return Err(MatroError::syntax(
-                                    span,
-                                    "Invalid field-index assignment target",
-                                ));
-                            }
+                            _ => break,
                         }
                     }
+                    match fast_target {
+                        Some(t) => t,
+                        None => Self::unwrap_lvalue_chain(orig, span)?,
+                    }
                 }
+                ExprKind::DynamicCall { .. } => Self::unwrap_lvalue_chain(expr, span)?,
                 _ => {
                     return Err(MatroError::syntax(span, "Invalid assignment target"));
                 }
@@ -926,6 +944,50 @@ impl Parser {
             Ok(StmtKind::Assign { target, value })
         } else {
             Ok(StmtKind::Expr(expr))
+        }
+    }
+
+    fn unwrap_lvalue_chain(mut expr: Expr, span: Span) -> Result<AssignTarget> {
+        let mut steps = Vec::new();
+        loop {
+            match expr.kind {
+                ExprKind::Ident(name) => {
+                    steps.reverse();
+                    if steps.is_empty() {
+                        return Ok(AssignTarget::Var(name));
+                    }
+                    return Ok(AssignTarget::Chain { name, steps });
+                }
+                ExprKind::CallOrIndex { callee, args } => {
+                    steps.push(LValueStep::Paren(args));
+                    steps.reverse();
+                    return Ok(AssignTarget::Chain { name: callee, steps });
+                }
+                ExprKind::FieldAccess { object, field } => {
+                    steps.push(LValueStep::Field(field));
+                    expr = *object;
+                }
+                ExprKind::MethodCall {
+                    object,
+                    method,
+                    args,
+                } => {
+                    steps.push(LValueStep::Paren(args));
+                    steps.push(LValueStep::Field(method));
+                    expr = *object;
+                }
+                ExprKind::CellIndex { target, indices } => {
+                    steps.push(LValueStep::Brace(indices));
+                    expr = *target;
+                }
+                ExprKind::DynamicCall { target, args } => {
+                    steps.push(LValueStep::Paren(args));
+                    expr = *target;
+                }
+                _ => {
+                    return Err(MatroError::syntax(span, "Invalid chained assignment target"));
+                }
+            }
         }
     }
 

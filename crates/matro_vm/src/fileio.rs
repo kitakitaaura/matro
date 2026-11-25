@@ -622,11 +622,11 @@ impl FileTable {
                 ColBuf::Float(v) => Value::matrix(Matrix::col_vec(v)),
                 ColBuf::Str(v) => {
                     let rows = v.len();
-                    Value::Cell(CellArray {
+                    Value::Cell(CellArray::from_vec(
                         rows,
-                        cols: if rows == 0 { 0 } else { 1 },
-                        data: v,
-                    })
+                        if rows == 0 { 0 } else { 1 },
+                        v,
+                    ))
                 }
             })
             .collect();
