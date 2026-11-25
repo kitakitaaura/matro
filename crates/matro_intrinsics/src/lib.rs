@@ -172,6 +172,8 @@ pub fn call_intrinsic(
         "rows" => fn_rows(args),
         "cols" => fn_cols(args),
         "reshape" => fn_reshape(args),
+        "ind2sub" => fn_ind2sub(args, nargout),
+        "sub2ind" => fn_sub2ind(args),
         "transpose" => fn_unary_mat(name, args, |m| Ok(m.transpose())),
         "ctranspose" => fn_unary_mat(name, args, |m| Ok(m.ctranspose())),
 
@@ -1526,6 +1528,151 @@ fn fn_reshape(args: &[Value]) -> Result<Vec<Value>> {
         Matrix::from_nd_col_major(dims, m.data().to_vec())?
     };
     ok1(Value::matrix(out))
+}
+
+fn fn_ind2sub(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.len() != 2 {
+        return Err(MatroError::arity("ind2sub", "2 (sz, ind)", args.len()));
+    }
+    let sz_mat = args[0].as_matrix()?;
+    if sz_mat.is_empty() {
+        return Err(MatroError::dimension("ind2sub: size vector cannot be empty"));
+    }
+    let mut dims: Vec<usize> = Vec::with_capacity(sz_mat.len());
+    for &v in sz_mat.data() {
+        let d = v.round() as isize;
+        if !v.is_finite() || (v - d as f64).abs() > 1e-12 || d < 0 {
+            return Err(MatroError::dimension(
+                "ind2sub: size vector must contain non-negative integers",
+            ));
+        }
+        dims.push(d as usize);
+    }
+    let total: usize = dims.iter().copied().product();
+    let ind_mat = args[1].as_matrix()?;
+    let nout = nargout.max(1);
+    let out_shape = ind_mat.dims();
+    let n_elem = ind_mat.len();
+
+    let mut outputs: Vec<Vec<f64>> = (0..nout).map(|_| vec![1.0; n_elem]).collect();
+    for (idx_pos, &raw) in ind_mat.data().iter().enumerate() {
+        let one_based = raw.round() as isize;
+        if !raw.is_finite()
+            || (raw - one_based as f64).abs() > 1e-12
+            || one_based < 1
+            || (one_based as usize) > total
+        {
+            return Err(MatroError::index(format!(
+                "ind2sub: linear index {raw} out of bounds for size {:?} (numel = {total})",
+                dims
+            )));
+        }
+        let mut rem = (one_based - 1) as usize;
+        if nout == 1 {
+            outputs[0][idx_pos] = one_based as f64;
+        } else {
+            // Decompose along first `min(nout - 1, dims.len())` dimensions;
+            // the last requested output absorbs all remaining trailing dimensions (MATLAB rule),
+            // and any outputs beyond `dims.len()` remain 1 (trailing singleton dims).
+            let last_active = (nout - 1).min(dims.len());
+            for k in 0..last_active {
+                let dk = dims[k];
+                let sub = rem % dk;
+                rem /= dk;
+                outputs[k][idx_pos] = (sub + 1) as f64;
+            }
+            if nout - 1 < dims.len() {
+                outputs[nout - 1][idx_pos] = (rem + 1) as f64;
+            }
+        }
+    }
+
+    outputs
+        .into_iter()
+        .map(|buf| Ok(Value::matrix(Matrix::from_nd_col_major(out_shape.clone(), buf)?)))
+        .collect()
+}
+
+fn fn_sub2ind(args: &[Value]) -> Result<Vec<Value>> {
+    if args.len() < 2 {
+        return Err(MatroError::arity("sub2ind", ">= 2 (sz, i1, i2, ...)", args.len()));
+    }
+    let sz_mat = args[0].as_matrix()?;
+    if sz_mat.is_empty() {
+        return Err(MatroError::dimension("sub2ind: size vector cannot be empty"));
+    }
+    let mut dims: Vec<usize> = Vec::with_capacity(sz_mat.len());
+    for &v in sz_mat.data() {
+        let d = v.round() as isize;
+        if !v.is_finite() || (v - d as f64).abs() > 1e-12 || d < 0 {
+            return Err(MatroError::dimension(
+                "sub2ind: size vector must contain non-negative integers",
+            ));
+        }
+        dims.push(d as usize);
+    }
+    let k = args.len() - 1;
+    let mut eff_dims = Vec::with_capacity(k);
+    for ax in 0..k {
+        if ax + 1 < k {
+            eff_dims.push(dims.get(ax).copied().unwrap_or(1));
+        } else if ax < dims.len() {
+            eff_dims.push(dims[ax..].iter().copied().product());
+        } else {
+            eff_dims.push(1);
+        }
+    }
+    let mut strides = Vec::with_capacity(k);
+    let mut s = 1usize;
+    for &d in &eff_dims {
+        strides.push(s);
+        s = s.saturating_mul(d);
+    }
+
+    let sub_mats: Vec<&Matrix> = args[1..]
+        .iter()
+        .map(|v| v.as_matrix())
+        .collect::<Result<_>>()?;
+    let mut out_shape: Option<Vec<usize>> = None;
+    for m in &sub_mats {
+        if m.len() != 1 {
+            if let Some(ref prev) = out_shape {
+                if *prev != m.dims() {
+                    return Err(MatroError::dimension(
+                        "sub2ind: subscript arrays must have matching dimensions",
+                    ));
+                }
+            } else {
+                out_shape = Some(m.dims());
+            }
+        }
+    }
+    let out_shape = out_shape.unwrap_or_else(|| sub_mats[0].dims());
+    let n_elem: usize = out_shape.iter().copied().product();
+    let mut out = vec![0.0; n_elem];
+
+    for pos in 0..n_elem {
+        let mut lin = 1usize;
+        for (ax, m) in sub_mats.iter().enumerate() {
+            let raw = if m.len() == 1 { m.data()[0] } else { m.data()[pos] };
+            let sub = raw.round() as isize;
+            if !raw.is_finite()
+                || (raw - sub as f64).abs() > 1e-12
+                || sub < 1
+                || (sub as usize) > eff_dims[ax]
+            {
+                return Err(MatroError::index(format!(
+                    "sub2ind: subscript {raw} out of bounds for dimension {} (size {})",
+                    ax + 1,
+                    eff_dims[ax]
+                )));
+            }
+            lin += ((sub - 1) as usize) * strides[ax];
+        }
+        out[pos] = lin as f64;
+    }
+
+    ok1(Value::matrix(Matrix::from_nd_col_major(out_shape, out)?))
 }
 
 fn fn_unary_mat(

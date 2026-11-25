@@ -1108,6 +1108,35 @@ fn core_sparse_fem_kron_reshape_and_2d_index() {
         G(3, :) = [7; 8; 9];
         assert(isequal(G(:, 2), [10; 20; 8]));
         assert(isequal(G(3, :), [7, 8, 9]));
+
+        % 8. ind2sub and sub2ind (2D, 3D, fewer outputs collapse, extra singleton outputs, array inputs)
+        [r, c] = ind2sub([3, 4], 8);
+        assert(r == 2 && c == 3);
+        assert(sub2ind([3, 4], r, c) == 8);
+
+        % 3D example: [i, j, k] = ind2sub([4 5 6], 87) -> 87-1=86: i=86%4+1=3, rem=21; j=21%5+1=2, rem=4; k=5
+        [i3, j3, k3] = ind2sub([4, 5, 6], 87);
+        assert(i3 == 3 && j3 == 2 && k3 == 5);
+        assert(sub2ind([4, 5, 6], i3, j3, k3) == 87);
+
+        % Fewer outputs than dimensions collapses trailing dims into last output
+        [r2, c2] = ind2sub([2, 3, 4], 15);
+        assert(r2 == 1 && c2 == 8);
+        assert(sub2ind([2, 3, 4], r2, c2) == 15);
+        [lin1] = ind2sub([2, 3, 4], 15);
+        assert(lin1 == 15);
+
+        % More outputs than dimensions pads trailing singletons with 1
+        [r4, c4, p4, q4] = ind2sub([3, 4], 8);
+        assert(r4 == 2 && c4 == 3 && p4 == 1 && q4 == 1);
+
+        % Vector & matrix inputs preserve index shape + round-trip
+        idxs = [1, 4, 8; 3, 7, 12];
+        [rr, cc] = ind2sub([3, 4], idxs);
+        assert(size(rr, 1) == 2 && size(rr, 2) == 3);
+        assert(isequal(sub2ind([3, 4], rr, cc), idxs));
+        % Scalar broadcast in sub2ind
+        assert(isequal(sub2ind([3, 4], [1, 2, 3], 2), [4, 5, 6]));
         "#,
     )
     .unwrap();
