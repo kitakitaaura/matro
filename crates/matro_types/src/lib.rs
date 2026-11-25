@@ -17,19 +17,102 @@ pub use sparse::SparseMatrix;
 #[derive(Debug, Clone)]
 pub struct Rng {
     state: u64,
+    seed_val: u64,
+    gen_type: String,
+    shuffle_seq: u64,
 }
 
 impl Default for Rng {
     fn default() -> Self {
         Self {
             state: 0x9e37_79b9_7f4a_7c15,
+            seed_val: 0,
+            gen_type: "twister".to_string(),
+            shuffle_seq: 0,
         }
     }
 }
 
 impl Rng {
+    pub fn canonical_generator(name: &str) -> Option<&'static str> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "twister" | "mt19937ar" => Some("twister"),
+            "simdtwister" | "dsfmt19937" => Some("simdTwister"),
+            "combrecursive" | "mrg32k3a" => Some("combRecursive"),
+            "multfibonacci" | "mlfg6331_64" => Some("multFibonacci"),
+            "philox" | "philox4x32_10" => Some("philox"),
+            "threefry" | "threefry4x64_20" => Some("threefry"),
+            "v5uniform" | "mcg16807" => Some("v5uniform"),
+            "v5normal" => Some("v5normal"),
+            "v4" => Some("v4"),
+            _ => None,
+        }
+    }
+
     pub fn seed(&mut self, s: u64) {
-        self.state = if s == 0 { 0x9e37_79b9_7f4a_7c15 } else { s };
+        self.seed_val = s;
+        let salt = Self::gen_salt(&self.gen_type);
+        let mixed = s ^ salt;
+        self.state = if mixed == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            mixed
+        };
+    }
+
+    pub fn seed_with_generator(&mut self, s: u64, gen_type: &str) {
+        self.gen_type = gen_type.to_string();
+        self.seed(s);
+    }
+
+    pub fn reset_default(&mut self) {
+        self.gen_type = "twister".to_string();
+        self.seed(0);
+    }
+
+    pub fn shuffle(&mut self, gen_override: Option<&str>) {
+        if let Some(g) = gen_override {
+            self.gen_type = g.to_string();
+        }
+        self.shuffle_seq = self.shuffle_seq.wrapping_add(1);
+        #[cfg(not(target_arch = "wasm32"))]
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x517c_c1b7_2722_0a95);
+        #[cfg(target_arch = "wasm32")]
+        let base = self.state.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let s = (base ^ self.shuffle_seq.wrapping_mul(0x9e37_79b9_7f4a_7c15)) & 0xffff_ffff;
+        self.seed(s);
+    }
+
+    pub fn state_snapshot(&self) -> (&str, u64, u64) {
+        (&self.gen_type, self.seed_val, self.state)
+    }
+
+    pub fn restore_state(&mut self, gen_type: String, seed_val: u64, state: u64) {
+        self.gen_type = gen_type;
+        self.seed_val = seed_val;
+        self.state = if state == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            state
+        };
+    }
+
+    fn gen_salt(gen_type: &str) -> u64 {
+        match gen_type {
+            "twister" => 0,
+            "simdTwister" => 0x1111_2222_3333_4444,
+            "combRecursive" => 0x2222_3333_4444_5555,
+            "multFibonacci" => 0x3333_4444_5555_6666,
+            "philox" => 0x4444_5555_6666_7777,
+            "threefry" => 0x5555_6666_7777_8888,
+            "v5uniform" => 0x6666_7777_8888_9999,
+            "v5normal" => 0x7777_8888_9999_aaaa,
+            "v4" => 0x8888_9999_aaaa_bbbb,
+            _ => 0,
+        }
     }
 
     pub fn next_u64(&mut self) -> u64 {

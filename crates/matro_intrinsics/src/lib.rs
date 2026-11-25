@@ -115,7 +115,7 @@ pub fn call_intrinsic(
         "eye" => fn_fill(name, args, Matrix::eye),
         "rand" => fn_rand(args, ctx.rng, false),
         "randn" => fn_rand(args, ctx.rng, true),
-        "rng" => fn_rng(args, ctx.rng),
+        "rng" => fn_rng(args, nargout, ctx.rng),
         "linspace" => fn_linspace(args),
         "logspace" => fn_logspace(args),
         "meshgrid" => fn_meshgrid(args),
@@ -754,16 +754,127 @@ fn fn_rand(args: &[Value], rng: &mut Rng, normal: bool) -> Result<Vec<Value>> {
     ok1(Value::matrix(Matrix::from_nd_col_major(dims, data)?))
 }
 
-fn fn_rng(args: &[Value], rng: &mut Rng) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("rng", "1", args.len()));
+fn rng_state_struct(rng: &Rng) -> Value {
+    let (gen_type, seed_val, state) = rng.state_snapshot();
+    let mut map = BTreeMap::new();
+    map.insert("Type".to_string(), Value::String(gen_type.to_string()));
+    map.insert("Seed".to_string(), Value::scalar(seed_val as f64));
+    let lo = (state & 0xffff_ffff) as f64;
+    let hi = ((state >> 32) & 0xffff_ffff) as f64;
+    map.insert(
+        "State".to_string(),
+        Value::matrix(Matrix::col_vec(vec![lo, hi])),
+    );
+    Value::Struct(map)
+}
+
+fn value_as_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Object(o) if o.class_name == "string" => {
+            if let Some(Value::Cell(c)) = o.fields.get("Data") {
+                c.data.first().and_then(|x| x.as_str().ok()).map(String::from)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
-    let seed = match &args[0] {
-        Value::String(s) if s == "default" => 0,
-        other => other.as_scalar()?.max(0.0).round() as u64,
-    };
-    rng.seed(seed);
-    Ok(vec![])
+}
+
+fn fn_rng(args: &[Value], nargout: usize, rng: &mut Rng) -> Result<Vec<Value>> {
+    let prev = rng_state_struct(rng);
+    match args.len() {
+        0 => ok1(prev),
+        1 => {
+            match &args[0] {
+                Value::Struct(map) => {
+                    let gen_raw = map
+                        .get("Type")
+                        .and_then(value_as_text)
+                        .unwrap_or_else(|| "twister".to_string());
+                    let gen_name = Rng::canonical_generator(&gen_raw).ok_or_else(|| {
+                        MatroError::runtime(format!("rng: unknown generator '{gen_raw}'"))
+                    })?;
+                    let seed_val = map
+                        .get("Seed")
+                        .and_then(|v| v.as_scalar().ok())
+                        .unwrap_or(0.0)
+                        .max(0.0)
+                        .round() as u64;
+                    if let Some(st_val) = map.get("State") {
+                        let m = st_val.as_matrix()?;
+                        if m.len() >= 2 {
+                            let lo = m.data()[0].max(0.0).round() as u64 & 0xffff_ffff;
+                            let hi = m.data()[1].max(0.0).round() as u64 & 0xffff_ffff;
+                            rng.restore_state(gen_name.to_string(), seed_val, (hi << 32) | lo);
+                        } else if m.len() == 1 {
+                            rng.restore_state(
+                                gen_name.to_string(),
+                                seed_val,
+                                m.data()[0].max(0.0).round() as u64,
+                            );
+                        } else {
+                            rng.seed_with_generator(seed_val, gen_name);
+                        }
+                    } else {
+                        rng.seed_with_generator(seed_val, gen_name);
+                    }
+                }
+                other => {
+                    if let Some(txt) = value_as_text(other) {
+                        match txt.trim().to_ascii_lowercase().as_str() {
+                            "default" => rng.reset_default(),
+                            "shuffle" => rng.shuffle(None),
+                            _ => {
+                                return Err(MatroError::runtime(format!(
+                                    "rng: invalid option '{txt}' (expected 'default', 'shuffle', seed, or state struct)"
+                                )));
+                            }
+                        }
+                    } else {
+                        let s = other.as_scalar()?;
+                        if !s.is_finite() || s < 0.0 {
+                            return Err(MatroError::runtime(
+                                "rng: seed must be a non-negative integer",
+                            ));
+                        }
+                        rng.seed(s.round() as u64);
+                    }
+                }
+            }
+            if nargout > 0 { ok1(prev) } else { Ok(vec![]) }
+        }
+        2 => {
+            let gen_txt = value_as_text(&args[1]).ok_or_else(|| {
+                MatroError::runtime("rng: second argument must be a generator name string")
+            })?;
+            let gen_name = Rng::canonical_generator(&gen_txt).ok_or_else(|| {
+                MatroError::runtime(format!("rng: unknown generator '{gen_txt}'"))
+            })?;
+            if let Some(seed_txt) = value_as_text(&args[0]) {
+                match seed_txt.trim().to_ascii_lowercase().as_str() {
+                    "shuffle" => rng.shuffle(Some(gen_name)),
+                    "default" => rng.seed_with_generator(0, gen_name),
+                    _ => {
+                        return Err(MatroError::runtime(format!(
+                            "rng: invalid seed option '{seed_txt}'"
+                        )));
+                    }
+                }
+            } else {
+                let s = args[0].as_scalar()?;
+                if !s.is_finite() || s < 0.0 {
+                    return Err(MatroError::runtime(
+                        "rng: seed must be a non-negative integer",
+                    ));
+                }
+                rng.seed_with_generator(s.round() as u64, gen_name);
+            }
+            if nargout > 0 { ok1(prev) } else { Ok(vec![]) }
+        }
+        n => Err(MatroError::arity("rng", "0, 1, or 2", n)),
+    }
 }
 
 fn fn_meshgrid(args: &[Value]) -> Result<Vec<Value>> {

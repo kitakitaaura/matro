@@ -1044,4 +1044,42 @@ fn core_sparse_fem_kron_reshape_and_2d_index() {
     let out = vm.eval_file(Some("mini_topopt.m"), fem_src, true).unwrap();
     let final_c = out.last_value.unwrap().as_scalar().unwrap();
     assert!(final_c > 0.0 && final_c.is_finite());
+
+    // 6. Full MATLAB rng() API: 0-arg query, 1-arg seed/default/shuffle/struct, 2-arg (seed, generator)
+    vm.eval(
+        r#"
+        rng(42, 'twister');
+        a1 = rand(1, 5);
+        s_mid = rng();
+        assert(strcmp(s_mid.Type, 'twister') && s_mid.Seed == 42);
+        a2 = rand(1, 5);
+
+        % Restoring saved state struct reproduces exact sequence
+        rng(s_mid);
+        a2_again = rand(1, 5);
+        assert(isequal(a2, a2_again));
+
+        % Re-seeding with 2-arg form reproduces exact sequence
+        old = rng(42, 'twister');
+        assert(strcmp(old.Type, 'twister'));
+        assert(isequal(rand(1, 5), a1));
+
+        % Different generator names accepted (case-insensitive & string object)
+        rng(42, 'philox');
+        sp = rng;
+        assert(strcmp(sp.Type, 'philox') && sp.Seed == 42);
+        p1 = rand(1, 4);
+        rng(42, string('philox'));
+        assert(isequal(rand(1, 4), p1));
+
+        rng('shuffle', 'combRecursive');
+        sc = rng();
+        assert(strcmp(sc.Type, 'combRecursive'));
+
+        rng('default');
+        sd = rng();
+        assert(strcmp(sd.Type, 'twister') && sd.Seed == 0);
+        "#,
+    )
+    .unwrap();
 }
