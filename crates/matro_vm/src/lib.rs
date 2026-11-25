@@ -100,6 +100,15 @@ struct TryHandler {
     err_is_local: bool,
     stack_depth: usize,
     loop_depth: usize,
+    end_depth: usize,
+}
+
+#[derive(Debug, Clone)]
+struct EndFrame {
+    val: Value,
+    dim: u8,
+    total_dims: u8,
+    inherited: bool,
 }
 
 /// Fast indexed local frame for functions & closures (no HashMap per call!).
@@ -436,6 +445,7 @@ impl Vm {
         let mut stack: Vec<StackItem> = Vec::with_capacity(64);
         let mut for_loops: Vec<ForLoopState> = Vec::new();
         let mut try_stack: Vec<TryHandler> = Vec::new();
+        let mut end_targets: Vec<Option<EndFrame>> = Vec::new();
         let mut ip: usize = 0;
 
         while ip < chunk.code.len() {
@@ -457,6 +467,7 @@ impl Vm {
                 &mut stack,
                 &mut for_loops,
                 &mut try_stack,
+                &mut end_targets,
                 frame.as_deref_mut(),
                 stdout,
                 last_value,
@@ -473,6 +484,7 @@ impl Vm {
                     if let Some(handler) = try_stack.pop() {
                         stack.truncate(handler.stack_depth);
                         for_loops.truncate(handler.loop_depth);
+                        end_targets.truncate(handler.end_depth);
                         if handler.err_var != u32::MAX {
                             let mut info = BTreeMap::new();
                             info.insert("message".to_string(), Value::String(err.bare_message()));
@@ -510,6 +522,7 @@ impl Vm {
         stack: &mut Vec<StackItem>,
         for_loops: &mut Vec<ForLoopState>,
         try_stack: &mut Vec<TryHandler>,
+        end_targets: &mut Vec<Option<EndFrame>>,
         mut frame: Option<&mut LocalFrame<'_>>,
         stdout: &mut String,
         last_value: &mut Option<Value>,
@@ -893,6 +906,7 @@ impl Vm {
                     err_is_local,
                     stack_depth: stack.len(),
                     loop_depth: for_loops.len(),
+                    end_depth: end_targets.len(),
                 });
             }
             OpCode::TryExit => {
@@ -1073,28 +1087,31 @@ impl Vm {
             OpCode::PushColon => {
                 stack.push(StackItem::Colon);
             }
-            OpCode::PushEnd {
-                var_idx,
-                dim,
-                total_dims,
-            } => {
-                let name = &chunk.names[var_idx as usize];
-                let val = lookup_var(name, frame.as_deref(), &self.globals)
-                    .ok_or_else(|| MatroError::undefined(name))?;
-                stack.push(StackItem::Val(Value::scalar(end_for_value(val, dim, total_dims) as f64)));
+            OpCode::PushEndTarget { .. }
+            | OpCode::PushEndFieldTarget { .. }
+            | OpCode::PushEndVarTarget { .. }
+            | OpCode::PushEndLocalTarget { .. } => {
+                self.exec_push_end_target(op, chunk, stack, end_targets, frame.as_deref(), stdout)?;
             }
-            OpCode::PushEndLocal {
-                slot,
-                dim,
-                total_dims,
-            } => {
-                let f = frame
-                    .as_deref()
-                    .ok_or_else(|| MatroError::runtime("PushEndLocal outside function"))?;
-                let val = f
-                    .get(slot)
-                    .ok_or_else(|| MatroError::undefined(&f.names[slot as usize]))?;
-                stack.push(StackItem::Val(Value::scalar(end_for_value(val, dim, total_dims) as f64)));
+            OpCode::SetEndDim(dim) => {
+                if let Some(Some(top)) = end_targets.last_mut() {
+                    if !top.inherited {
+                        top.dim = dim;
+                    }
+                }
+            }
+            OpCode::PushEndTop => {
+                let top = end_targets
+                    .last()
+                    .and_then(|o| o.as_ref())
+                    .ok_or_else(|| {
+                        MatroError::runtime("'end' can only be used inside an indexing expression")
+                    })?;
+                let n = end_for_value(&top.val, top.dim, top.total_dims);
+                stack.push(StackItem::Scalar(n as f64));
+            }
+            OpCode::PopEndTarget => {
+                end_targets.pop();
             }
             OpCode::CallOrIndexLocal {
                 slot,
@@ -1318,13 +1335,51 @@ impl Vm {
                 }
 
                 // 2. Otherwise fall back to field lookup (e.g. `s.fn(x)` or `obj.vec(1)`)
+                let cur_fn = frame.as_deref().map(|f| f.func_name);
                 let field_val = match &receiver {
                     Value::Struct(map) => map.get(&method_name).cloned(),
-                    Value::Object(obj) => obj.fields.get(&method_name).cloned(),
-                    Value::Handle(h) => self
-                        .handles
-                        .get(h.id)
-                        .and_then(|o| o.fields.get(&method_name).cloned()),
+                    Value::Object(obj) => {
+                        let getter = format!("get.{method_name}");
+                        if cur_fn != Some(getter.as_str()) {
+                            if let Some(proto) = self.find_class_method(&obj.class_name, &getter) {
+                                let rets = self.call_user_func(
+                                    &proto,
+                                    &[receiver.clone()],
+                                    1,
+                                    None,
+                                    stdout,
+                                )?;
+                                Some(rets.into_iter().next().unwrap_or_else(Value::empty))
+                            } else {
+                                obj.fields.get(&method_name).cloned()
+                            }
+                        } else {
+                            obj.fields.get(&method_name).cloned()
+                        }
+                    }
+                    Value::Handle(h) => {
+                        let getter = format!("get.{method_name}");
+                        if cur_fn != Some(getter.as_str()) {
+                            if let Some(proto) = self.find_class_method(&h.class_name, &getter) {
+                                let rets = self.call_user_func(
+                                    &proto,
+                                    &[receiver.clone()],
+                                    1,
+                                    None,
+                                    stdout,
+                                )?;
+                                Some(rets.into_iter().next().unwrap_or_else(Value::empty))
+                            } else {
+                                self.handles
+                                    .get(h.id)
+                                    .and_then(|o| o.fields.get(&method_name).cloned())
+                            }
+                        } else {
+                            self.handles
+                                .get(h.id)
+                                .and_then(|o| o.fields.get(&method_name).cloned())
+                        }
+                    }
                     Value::Table(t) => t.get_col(&method_name).cloned(),
                     other => {
                         return Err(MatroError::runtime(format!(
@@ -1792,6 +1847,30 @@ impl Vm {
                 let indexed = index_matrix(&m, &raw_args)?;
                 stack.push(StackItem::Val(Value::matrix(indexed)));
             }
+            Value::String(s) => {
+                let chars: Vec<char> = s.chars().collect();
+                let out: String = match raw_args.len() {
+                    1 => {
+                        let idxs = resolve_indices(&raw_args[0], chars.len())?;
+                        idxs.into_iter().map(|i| chars[i]).collect()
+                    }
+                    2 => {
+                        let r_idxs = resolve_indices(&raw_args[0], 1)?;
+                        let c_idxs = resolve_indices(&raw_args[1], chars.len())?;
+                        if r_idxs.is_empty() || c_idxs.is_empty() {
+                            String::new()
+                        } else {
+                            c_idxs.into_iter().map(|j| chars[j]).collect()
+                        }
+                    }
+                    _ => {
+                        return Err(MatroError::index(
+                            "Character vector indexing expects 1 or 2 subscripts",
+                        ));
+                    }
+                };
+                stack.push(StackItem::Val(Value::String(out)));
+            }
             Value::Sparse(s) => {
                 let indexed = index_sparse(&s, &raw_args)?;
                 stack.push(StackItem::Val(Value::matrix(indexed)));
@@ -1880,12 +1959,213 @@ impl Vm {
                     )));
                 }
             }
-            other => {
-                return Err(MatroError::runtime(format!(
-                    "Cannot call or index value of type {}",
-                    other.type_name()
-                )));
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn exec_push_end_target(
+        &mut self,
+        op: OpCode,
+        chunk: &Chunk,
+        stack: &[StackItem],
+        end_targets: &mut Vec<Option<EndFrame>>,
+        frame: Option<&LocalFrame<'_>>,
+        stdout: &mut String,
+    ) -> Result<()> {
+        let inherit_outer = |end_targets: &mut Vec<Option<EndFrame>>| {
+            if let Some(Some(outer)) = end_targets.last().cloned() {
+                end_targets.push(Some(EndFrame {
+                    val: outer.val,
+                    dim: outer.dim,
+                    total_dims: outer.total_dims,
+                    inherited: true,
+                }));
+            } else {
+                end_targets.push(None);
             }
+        };
+
+        match op {
+            OpCode::PushEndTarget { total_dims } => {
+                let target_val = match stack.last() {
+                    Some(StackItem::Val(v)) => v.clone(),
+                    Some(StackItem::Scalar(x)) => Value::scalar(*x),
+                    _ => {
+                        return Err(MatroError::runtime(
+                            "VM stack underflow resolving 'end' target",
+                        ));
+                    }
+                };
+                if matches!(target_val, Value::Closure(_)) {
+                    inherit_outer(end_targets);
+                } else {
+                    end_targets.push(Some(EndFrame {
+                        val: target_val,
+                        dim: 0,
+                        total_dims,
+                        inherited: false,
+                    }));
+                }
+            }
+            OpCode::PushEndFieldTarget {
+                field_idx,
+                total_dims,
+            } => {
+                let field_name = chunk.names[field_idx as usize].clone();
+                let receiver = match stack.last() {
+                    Some(StackItem::Val(v)) => v.clone(),
+                    Some(StackItem::Scalar(x)) => Value::scalar(*x),
+                    _ => {
+                        return Err(MatroError::runtime(
+                            "VM stack underflow resolving 'end' target",
+                        ));
+                    }
+                };
+                // Check if this dot-call is a method/namespace/package call rather than field indexing.
+                let is_method_call = match &receiver {
+                    Value::Object(o) => {
+                        matches!(
+                            o.class_name.as_str(),
+                            "__ns_containers" | "__class_ref" | "__pkg_ref"
+                        ) || (field_name == "predict"
+                            && matches!(
+                                o.class_name.as_str(),
+                                "LinearModel"
+                                    | "ClassificationKNN"
+                                    | "ClassificationSVM"
+                                    | "ClassificationNaiveBayes"
+                            ))
+                            || self.find_class_method(&o.class_name, &field_name).is_some()
+                    }
+                    Value::Handle(h) => {
+                        h.class_name == "inputParser"
+                            || matches!(field_name.as_str(), "addlistener" | "notify")
+                            || self.find_class_method(&h.class_name, &field_name).is_some()
+                    }
+                    Value::Map(_) => true,
+                    _ => false,
+                };
+                if is_method_call {
+                    inherit_outer(end_targets);
+                    return Ok(());
+                }
+                let cur_fn = frame.map(|f| f.func_name);
+                let field_val = match &receiver {
+                    Value::Struct(map) => map.get(&field_name).cloned(),
+                    Value::Object(obj) => {
+                        let getter = format!("get.{field_name}");
+                        if cur_fn != Some(getter.as_str()) {
+                            if let Some(proto) = self.find_class_method(&obj.class_name, &getter) {
+                                let rets = self.call_user_func(
+                                    &proto,
+                                    &[receiver.clone()],
+                                    1,
+                                    None,
+                                    stdout,
+                                )?;
+                                Some(rets.into_iter().next().unwrap_or_else(Value::empty))
+                            } else {
+                                obj.fields.get(&field_name).cloned()
+                            }
+                        } else {
+                            obj.fields.get(&field_name).cloned()
+                        }
+                    }
+                    Value::Handle(h) => {
+                        let getter = format!("get.{field_name}");
+                        if cur_fn != Some(getter.as_str()) {
+                            if let Some(proto) = self.find_class_method(&h.class_name, &getter) {
+                                let rets = self.call_user_func(
+                                    &proto,
+                                    &[receiver.clone()],
+                                    1,
+                                    None,
+                                    stdout,
+                                )?;
+                                Some(rets.into_iter().next().unwrap_or_else(Value::empty))
+                            } else {
+                                self.handles
+                                    .get(h.id)
+                                    .and_then(|o| o.fields.get(&field_name).cloned())
+                            }
+                        } else {
+                            self.handles
+                                .get(h.id)
+                                .and_then(|o| o.fields.get(&field_name).cloned())
+                        }
+                    }
+                    Value::Table(t) => t.get_col(&field_name).cloned(),
+                    _ => None,
+                };
+                if let Some(val) = field_val {
+                    if matches!(val, Value::Closure(_)) {
+                        inherit_outer(end_targets);
+                    } else {
+                        end_targets.push(Some(EndFrame {
+                            val,
+                            dim: 0,
+                            total_dims,
+                            inherited: false,
+                        }));
+                    }
+                } else {
+                    inherit_outer(end_targets);
+                }
+            }
+            OpCode::PushEndVarTarget {
+                var_idx,
+                total_dims,
+            } => {
+                let name = &chunk.names[var_idx as usize];
+                let env_val = frame
+                    .and_then(|f| f.env_id)
+                    .and_then(|eid| self.envs.get(eid))
+                    .and_then(|env| env.get(name))
+                    .cloned();
+                let persistent_val = {
+                    let fn_name = frame.map_or("<main>", |f| f.func_name);
+                    self.persistents
+                        .get(&(fn_name.to_string(), name.clone()))
+                        .cloned()
+                };
+                let found = lookup_var(name, frame, &self.globals)
+                    .cloned()
+                    .or(env_val)
+                    .or(persistent_val);
+                if let Some(val) = found {
+                    if matches!(val, Value::Closure(_)) {
+                        inherit_outer(end_targets);
+                    } else {
+                        end_targets.push(Some(EndFrame {
+                            val,
+                            dim: 0,
+                            total_dims,
+                            inherited: false,
+                        }));
+                    }
+                } else {
+                    inherit_outer(end_targets);
+                }
+            }
+            OpCode::PushEndLocalTarget { slot, total_dims } => {
+                let found = frame.and_then(|f| f.get(slot)).cloned();
+                if let Some(val) = found {
+                    if matches!(val, Value::Closure(_)) {
+                        inherit_outer(end_targets);
+                    } else {
+                        end_targets.push(Some(EndFrame {
+                            val,
+                            dim: 0,
+                            total_dims,
+                            inherited: false,
+                        }));
+                    }
+                } else {
+                    inherit_outer(end_targets);
+                }
+            }
+            _ => unreachable!(),
         }
         Ok(())
     }
@@ -3618,6 +3898,32 @@ fn end_for_value(val: &Value, dim: u8, total_dims: u8) -> usize {
                 t.col_names.len()
             }
         }
+        Value::String(s) => {
+            if total_dims == 1 || dim == 1 {
+                s.chars().count()
+            } else {
+                1
+            }
+        }
+        Value::Object(o) => match o.class_name.as_str() {
+            "string" => o
+                .fields
+                .get("Data")
+                .map_or(1, |v| end_for_value(v, dim, total_dims)),
+            "datetime" => o
+                .fields
+                .get("EpochSec")
+                .map_or(1, |v| end_for_value(v, dim, total_dims)),
+            "duration" => o
+                .fields
+                .get("Seconds")
+                .map_or(1, |v| end_for_value(v, dim, total_dims)),
+            "categorical" => o
+                .fields
+                .get("Codes")
+                .map_or(1, |v| end_for_value(v, dim, total_dims)),
+            _ => 1,
+        },
         Value::Map(m) => m.entries.len(),
         _ => 1,
     }

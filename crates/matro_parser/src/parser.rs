@@ -320,6 +320,10 @@ impl Parser {
                         kind: TokenKind::Ident(p),
                         ..
                     } => params.push(p),
+                    Token {
+                        kind: TokenKind::Tilde,
+                        ..
+                    } => params.push(format!("__ignored_{}", params.len())),
                     other => {
                         return Err(MatroError::syntax(other.span, "Expected parameter name"));
                     }
@@ -962,6 +966,10 @@ impl Parser {
                         kind: TokenKind::Ident(p),
                         ..
                     } => params.push(p),
+                    Token {
+                        kind: TokenKind::Tilde,
+                        ..
+                    } => params.push(format!("__ignored_{}", params.len())),
                     other => {
                         return Err(MatroError::syntax(
                             other.span,

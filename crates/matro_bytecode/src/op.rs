@@ -71,8 +71,13 @@ pub enum OpCode {
     ForPop,
 
     PushColon,
-    PushEnd { var_idx: u32, dim: u8, total_dims: u8 },
-    PushEndLocal { slot: u16, dim: u8, total_dims: u8 },
+    PushEndTarget { total_dims: u8 },
+    PushEndFieldTarget { field_idx: u32, total_dims: u8 },
+    PushEndVarTarget { var_idx: u32, total_dims: u8 },
+    PushEndLocalTarget { slot: u16, total_dims: u8 },
+    SetEndDim(u8),
+    PushEndTop,
+    PopEndTarget,
 
     CallOrIndex { name_idx: u32, argc: u8, nargout: u8 },
     CallOrIndexLocal { slot: u16, argc: u8, nargout: u8 },

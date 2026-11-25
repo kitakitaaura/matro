@@ -499,3 +499,143 @@ fn stdlib_handle_graphics_fs_utils_and_media_io() {
     assert!(svg.contains("stroke-width=\"3.50\""));
     assert!(svg.contains("#ff0000"));
 }
+
+#[test]
+fn core_end_keyword_universal_indexing() {
+    let mut vm = Vm::new();
+    vm.eval(
+        r#"
+        classdef EndBox
+            properties
+                Data = [10, 20, 30, 40, 50];
+            end
+            properties (Dependent)
+                Scaled
+            end
+            methods
+                function v = get.Scaled(obj)
+                    v = obj.Data * 2;
+                end
+                function idx = pick(~, n)
+                    idx = n - 1;
+                end
+                function sub = tail_slice(obj)
+                    sub = obj.Data(floor(end/2):end);
+                end
+            end
+        end
+
+        function v = make_vec(n)
+            v = (1:n) * 10;
+        end
+
+        function out = local_end_check(A, s, c)
+            p1 = A(floor(end/2):end);
+            p2 = s.vec(2:end-1);
+            p3 = c{end}(2:end);
+            out = sum(p1) + sum(p2) + sum(p3);
+        end
+
+        % 1. Struct field & struct array indexing with 'end'
+        s.vec = [10, 20, 30, 40, 50, 60];
+        s.mat = [1, 2, 3, 4; 5, 6, 7, 8; 9, 10, 11, 12];
+        assert(isequal(s.vec(1:end), [10, 20, 30, 40, 50, 60]));
+        assert(isequal(s.vec(2:end-1), [20, 30, 40, 50]));
+        assert(isequal(s.vec(floor(end/2):end), [30, 40, 50, 60]));
+        assert(isequal(s.mat(2:end, floor(end/2):end), [6, 7, 8; 10, 11, 12]));
+
+        arr(1).v = [1, 2, 3];
+        arr(2).v = [4, 5, 6, 7, 8];
+        assert(isequal(arr(end).v(2:end), [5, 6, 7, 8]));
+
+        % 2. Classdef property, dependent property, and method inside indexing
+        box = EndBox();
+        assert(isequal(box.Data(2:end-1), [20, 30, 40]));
+        assert(isequal(box.Scaled(3:end), [60, 80, 100]));
+        assert(isequal(box.tail_slice(), [20, 30, 40, 50]));
+        M = [1, 2, 3, 4; 5, 6, 7, 8];
+        assert(M(1, box.pick(end)) == 3);
+
+        % 3. Table & table column indexing with 'end'
+        T = table([1; 2; 3; 4], [10; 20; 30; 40], 'VariableNames', {'Id', 'Val'});
+        assert(isequal(T.Val(2:end), [20; 30; 40]));
+        assert(height(T(2:end, 1:end)) == 3 && width(T(2:end, 1:end)) == 2);
+
+        % 4. DynamicCall indexing with 'end' (cell{...}(...), fn()(...), expr(...))
+        c = {[1, 2, 3, 4], [10, 20, 30, 40, 50]};
+        assert(isequal(c{1}(2:end), [2, 3, 4]));
+        assert(isequal(c{end}(floor(end/2):end), [20, 30, 40, 50]));
+        assert(isequal(make_vec(5)(2:end-1), [20, 30, 40]));
+        A = [1, 2, 3, 4];
+        B = [10, 20, 30, 40];
+        assert(isequal((A + B)(2:end), [22, 33, 44]));
+        assert(isequal(([10, 20, 30, 40])(end-1:end), [30, 40]));
+
+        % 5. Compound CellIndex with 'end'
+        s.cells = {'alpha', 'beta', 'gamma'};
+        assert(strcmp(s.cells{end}, 'gamma'));
+        nested = {{100, 200, 300}};
+        assert(nested{1}{end} == 300);
+
+        % 6. Nested function calls, closures, and nested arrays inside indexing
+        V = [10, 20, 30, 40, 50, 60];
+        assert(isequal(V(floor(end/2):end), [30, 40, 50, 60]));
+        assert(M(1, min(3, end)) == 3);
+        assert(isequal(M(1, max(1, end-2):end), [2, 3, 4]));
+        idx_vec = [1, 2];
+        assert(M(2, max(end - 1, idx_vec(end))) == 7);
+        assert(M(2, min(end, idx_vec(end))) == 6);
+        fn = @(k) k - 1;
+        assert(V(fn(end)) == 50);
+        s.fn = @(k) k - 2;
+        assert(V(s.fn(end)) == 40);
+        fs = {@(k) k - 1};
+        assert(V(fs{1}(end)) == 50);
+        assert(isequal(V([1, end]), [10, 60]));
+
+        % 7. Char vector and string array indexing with 'end'
+        str = 'hello world';
+        assert(strcmp(str(7:end), 'world'));
+        assert(strcmp(str(1, 2:end-1), 'ello worl'));
+        assert(strcmp(s.cells{end}(2:end), 'amma'));
+        sa = string({'a', 'b', 'c', 'd'});
+        sa_sub = sa(2:end);
+        assert(length(sa_sub) == 3 && strcmp(char(sa_sub(1)), 'b') && strcmp(char(sa_sub(end)), 'd'));
+
+        % 8. LHS assignments with 'end' (including field-index + growing)
+        V(end+1) = 70;
+        assert(length(V) == 7 && V(end) == 70);
+        s.vec(floor(end/2):end) = 0;
+        assert(isequal(s.vec, [10, 20, 0, 0, 0, 0]));
+        s.vec(end+1) = 99;
+        assert(length(s.vec) == 7 && s.vec(end) == 99);
+
+        % 9. Function local-frame 'end' resolution
+        s2.vec = [1, 2, 3, 4, 5];
+        assert(local_end_check([10, 20, 30, 40], s2, c) == (20+30+40) + (2+3+4) + (20+30+40+50));
+
+        % 10. Clean try/catch unwinding if error occurs inside indexing arg
+        caught = 0;
+        try
+            bad = V(error('boom'), end);
+        catch
+            caught = 1;
+        end
+        assert(caught == 1);
+        assert(V(end) == 70);
+        "#,
+    )
+    .unwrap();
+
+    // 11. 'end' outside any indexing expression must still be rejected
+    let compile_err = vm.eval("x = end;").unwrap_err();
+    assert!(
+        compile_err.to_string().contains("indexing"),
+        "expected indexing error, got: {compile_err}"
+    );
+    let runtime_err = vm.eval("y = floor(end / 2);").unwrap_err();
+    assert!(
+        runtime_err.to_string().contains("indexing"),
+        "expected indexing error, got: {runtime_err}"
+    );
+}

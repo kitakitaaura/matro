@@ -106,6 +106,8 @@ pub fn call_intrinsic(
         "isinf" => fn_pred_mat(name, args, |c| c.re.is_infinite() || c.im.is_infinite()),
         "isfinite" => fn_pred_mat(name, args, |c| c.re.is_finite() && c.im.is_finite()),
         "isempty" => fn_isempty(args),
+        "isequal" => fn_isequal(args, false),
+        "isequaln" => fn_isequal(args, true),
 
         // Constructors & RNG
         "zeros" => fn_fill(name, args, Matrix::zeros),
@@ -1191,11 +1193,8 @@ fn fn_magic(args: &[Value]) -> Result<Vec<Value>> {
     ))
 }
 
-fn fn_size(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 2 {
-        return Err(MatroError::arity("size", "1 or 2", args.len()));
-    }
-    let dims: Vec<usize> = match &args[0] {
+fn value_dims(v: &Value) -> Vec<usize> {
+    match v {
         Value::Matrix(m) => m.dims(),
         Value::Sparse(s) => vec![s.rows(), s.cols()],
         Value::Cell(c) => vec![c.rows, c.cols],
@@ -1203,8 +1202,22 @@ fn fn_size(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
         Value::String(s) => vec![1, s.chars().count()],
         Value::Table(t) => vec![t.nrows, t.col_names.len()],
         Value::Map(m) => vec![m.entries.len(), 1],
-        Value::Struct(_) | Value::Object(_) | Value::Handle(_) | Value::Closure(_) => vec![1, 1],
-    };
+        Value::Object(o) => match o.class_name.as_str() {
+            "string" => o.fields.get("Data").map_or_else(|| vec![1, 1], value_dims),
+            "datetime" => o.fields.get("EpochSec").map_or_else(|| vec![1, 1], value_dims),
+            "duration" => o.fields.get("Seconds").map_or_else(|| vec![1, 1], value_dims),
+            "categorical" => o.fields.get("Codes").map_or_else(|| vec![1, 1], value_dims),
+            _ => vec![1, 1],
+        },
+        Value::Struct(_) | Value::Handle(_) | Value::Closure(_) => vec![1, 1],
+    }
+}
+
+fn fn_size(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity("size", "1 or 2", args.len()));
+    }
+    let dims = value_dims(&args[0]);
     if args.len() == 2 {
         let dim = as_usize(&args[1], "size")?;
         let val = if dim >= 1 {
@@ -1230,54 +1243,20 @@ fn fn_length(args: &[Value]) -> Result<Vec<Value>> {
     if args.len() != 1 {
         return Err(MatroError::arity("length", "1", args.len()));
     }
-    match &args[0] {
-        Value::Matrix(m) => {
-            let l = if m.is_empty() {
-                0
-            } else {
-                m.dims().into_iter().max().unwrap_or(0)
-            };
-            ok1(Value::scalar(l as f64))
-        }
-        Value::Sparse(s) => {
-            let l = if s.rows() == 0 || s.cols() == 0 {
-                0
-            } else {
-                s.rows().max(s.cols())
-            };
-            ok1(Value::scalar(l as f64))
-        }
-        Value::Cell(c) => {
-            let l = if c.data.is_empty() { 0 } else { c.rows.max(c.cols) };
-            ok1(Value::scalar(l as f64))
-        }
-        Value::StructArray(sa) => {
-            let l = if sa.items.is_empty() { 0 } else { sa.rows.max(sa.cols) };
-            ok1(Value::scalar(l as f64))
-        }
-        Value::String(s) => ok1(Value::scalar(s.chars().count() as f64)),
-        Value::Table(t) => ok1(Value::scalar(t.nrows.max(t.col_names.len()) as f64)),
-        Value::Map(m) => ok1(Value::scalar(m.entries.len() as f64)),
-        Value::Struct(_) | Value::Object(_) | Value::Handle(_) | Value::Closure(_) => {
-            ok1(Value::scalar(1.0))
-        }
-    }
+    let dims = value_dims(&args[0]);
+    let l = if dims.iter().any(|&d| d == 0) {
+        0
+    } else {
+        dims.into_iter().max().unwrap_or(0)
+    };
+    ok1(Value::scalar(l as f64))
 }
 
 fn fn_numel(args: &[Value]) -> Result<Vec<Value>> {
     if args.len() != 1 {
         return Err(MatroError::arity("numel", "1", args.len()));
     }
-    let n = match &args[0] {
-        Value::Matrix(m) => m.len(),
-        Value::Sparse(s) => s.rows().saturating_mul(s.cols()),
-        Value::Cell(c) => c.data.len(),
-        Value::StructArray(sa) => sa.items.len(),
-        Value::String(s) => s.chars().count(),
-        Value::Table(t) => t.nrows * t.col_names.len(),
-        Value::Map(m) => m.entries.len(),
-        Value::Struct(_) | Value::Object(_) | Value::Handle(_) | Value::Closure(_) => 1,
-    };
+    let n: usize = value_dims(&args[0]).into_iter().product();
     ok1(Value::scalar(n as f64))
 }
 
@@ -2336,4 +2315,110 @@ fn fn_bitset(args: &[Value]) -> Result<Vec<Value>> {
         out as f64
     })?;
     ok1(Value::matrix(res.cast_to(dtype)))
+}
+
+fn fn_isequal(args: &[Value], nan_eq: bool) -> Result<Vec<Value>> {
+    if args.len() < 2 {
+        return Err(MatroError::arity(
+            if nan_eq { "isequaln" } else { "isequal" },
+            "at least 2",
+            args.len(),
+        ));
+    }
+    let first = &args[0];
+    let eq = args[1..].iter().all(|other| values_equal(first, other, nan_eq));
+    ok1(Value::bool(eq))
+}
+
+fn values_equal(a: &Value, b: &Value, nan_eq: bool) -> bool {
+    let f_eq = |x: f64, y: f64| -> bool {
+        if nan_eq && x.is_nan() && y.is_nan() {
+            true
+        } else {
+            x == y
+        }
+    };
+    match (a, b) {
+        (Value::Matrix(ma), Value::Matrix(mb)) => {
+            if ma.dims() != mb.dims() {
+                return false;
+            }
+            if !ma.is_complex() && !mb.is_complex() {
+                ma.data()
+                    .iter()
+                    .zip(mb.data().iter())
+                    .all(|(&x, &y)| f_eq(x, y))
+            } else {
+                let re_ok = ma
+                    .data()
+                    .iter()
+                    .zip(mb.data().iter())
+                    .all(|(&x, &y)| f_eq(x, y));
+                if !re_ok {
+                    return false;
+                }
+                let im_a = ma.imag_data();
+                let im_b = mb.imag_data();
+                (0..ma.len()).all(|i| {
+                    let xa = im_a.map_or(0.0, |v| v[i]);
+                    let xb = im_b.map_or(0.0, |v| v[i]);
+                    f_eq(xa, xb)
+                })
+            }
+        }
+        (Value::Sparse(sa), Value::Sparse(sb)) => {
+            values_equal(&Value::matrix(sa.to_dense()), &Value::matrix(sb.to_dense()), nan_eq)
+        }
+        (Value::Matrix(_), Value::Sparse(sb)) => {
+            values_equal(a, &Value::matrix(sb.to_dense()), nan_eq)
+        }
+        (Value::Sparse(sa), Value::Matrix(_)) => {
+            values_equal(&Value::matrix(sa.to_dense()), b, nan_eq)
+        }
+        (Value::String(sa), Value::String(sb)) => sa == sb,
+        (Value::Cell(ca), Value::Cell(cb)) => {
+            ca.rows == cb.rows
+                && ca.cols == cb.cols
+                && ca
+                    .data
+                    .iter()
+                    .zip(cb.data.iter())
+                    .all(|(x, y)| values_equal(x, y, nan_eq))
+        }
+        (Value::Struct(sa), Value::Struct(sb)) => {
+            sa.len() == sb.len()
+                && sa
+                    .iter()
+                    .all(|(k, v)| sb.get(k).is_some_and(|bv| values_equal(v, bv, nan_eq)))
+        }
+        (Value::StructArray(sa), Value::StructArray(sb)) => {
+            sa.rows == sb.rows
+                && sa.cols == sb.cols
+                && sa.items.iter().zip(sb.items.iter()).all(|(ia, ib)| {
+                    ia.len() == ib.len()
+                        && ia
+                            .iter()
+                            .all(|(k, v)| ib.get(k).is_some_and(|bv| values_equal(v, bv, nan_eq)))
+                })
+        }
+        (Value::Object(oa), Value::Object(ob)) => {
+            oa.class_name == ob.class_name
+                && oa.fields.len() == ob.fields.len()
+                && oa.fields.iter().all(|(k, v)| {
+                    ob.fields
+                        .get(k)
+                        .is_some_and(|bv| values_equal(v, bv, nan_eq))
+                })
+        }
+        (Value::Table(ta), Value::Table(tb)) => {
+            ta.nrows == tb.nrows
+                && ta.col_names == tb.col_names
+                && ta
+                    .columns
+                    .iter()
+                    .zip(tb.columns.iter())
+                    .all(|(ca, cb)| values_equal(ca, cb, nan_eq))
+        }
+        _ => false,
+    }
 }

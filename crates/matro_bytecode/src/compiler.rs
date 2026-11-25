@@ -14,12 +14,6 @@ struct LoopContext {
     break_patches: Vec<usize>,
 }
 
-#[derive(Clone, Copy)]
-enum EndTarget {
-    Global(u32),
-    Local(u16),
-}
-
 pub struct Compiler {
     chunk: Chunk,
     loops: Vec<LoopContext>,
@@ -356,7 +350,7 @@ impl Compiler {
             outer_locals: HashSet::new(),
             has_nested: false,
         };
-        sub.compile_expr(expr, 1, None)?;
+        sub.compile_expr(expr, 1, false)?;
         let idx = sub.chunk.add_name(target_var);
         sub.chunk.emit(OpCode::StoreVar(idx), expr.span.line as u32);
         sub.chunk.emit(OpCode::Return, expr.span.line as u32);
@@ -390,10 +384,10 @@ impl Compiler {
                                 | "ls"
                         )
                 ) {
-                    self.compile_expr(expr, 0, None)?;
+                    self.compile_expr(expr, 0, false)?;
                     return Ok(());
                 }
-                self.compile_expr(expr, 1, None)?;
+                self.compile_expr(expr, 1, false)?;
                 if stmt.suppressed {
                     if let Some(slot) = self.lookup_local("ans") {
                         self.chunk.emit(OpCode::StoreLocal(slot), line);
@@ -407,7 +401,7 @@ impl Compiler {
             }
             StmtKind::Assign { target, value } => match target {
                 AssignTarget::Var(name) => {
-                    self.compile_expr(value, 1, None)?;
+                    self.compile_expr(value, 1, false)?;
                     if self.globals_declared.contains(name) {
                         let idx = self.chunk.add_name(name);
                         if !stmt.suppressed {
@@ -448,13 +442,12 @@ impl Compiler {
                 AssignTarget::Index { name, indices } => {
                     let total_dims = indices.len() as u8;
                     if let Some(slot) = self.lookup_local(name) {
-                        for (dim, arg) in indices.iter().enumerate() {
-                            self.compile_index_arg(
-                                arg,
-                                Some((EndTarget::Local(slot), dim as u8, total_dims)),
-                            )?;
-                        }
-                        self.compile_expr(value, 1, None)?;
+                        self.compile_index_args_stack_end(
+                            indices,
+                            OpCode::PushEndLocalTarget { slot, total_dims },
+                            line,
+                        )?;
+                        self.compile_expr(value, 1, false)?;
                         self.chunk.emit(
                             OpCode::StoreIndexLocal {
                                 slot,
@@ -468,13 +461,15 @@ impl Compiler {
                         }
                     } else {
                         let name_idx = self.chunk.add_name(name);
-                        for (dim, arg) in indices.iter().enumerate() {
-                            self.compile_index_arg(
-                                arg,
-                                Some((EndTarget::Global(name_idx), dim as u8, total_dims)),
-                            )?;
-                        }
-                        self.compile_expr(value, 1, None)?;
+                        self.compile_index_args_stack_end(
+                            indices,
+                            OpCode::PushEndVarTarget {
+                                var_idx: name_idx,
+                                total_dims,
+                            },
+                            line,
+                        )?;
+                        self.compile_expr(value, 1, false)?;
                         self.chunk.emit(
                             OpCode::StoreIndex {
                                 name_idx,
@@ -491,13 +486,12 @@ impl Compiler {
                 AssignTarget::CellIndex { name, indices } => {
                     let total_dims = indices.len() as u8;
                     if let Some(slot) = self.lookup_local(name) {
-                        for (dim, arg) in indices.iter().enumerate() {
-                            self.compile_index_arg(
-                                arg,
-                                Some((EndTarget::Local(slot), dim as u8, total_dims)),
-                            )?;
-                        }
-                        self.compile_expr(value, 1, None)?;
+                        self.compile_index_args_stack_end(
+                            indices,
+                            OpCode::PushEndLocalTarget { slot, total_dims },
+                            line,
+                        )?;
+                        self.compile_expr(value, 1, false)?;
                         self.chunk.emit(
                             OpCode::StoreCellIndexLocal {
                                 slot,
@@ -511,13 +505,15 @@ impl Compiler {
                         }
                     } else {
                         let name_idx = self.chunk.add_name(name);
-                        for (dim, arg) in indices.iter().enumerate() {
-                            self.compile_index_arg(
-                                arg,
-                                Some((EndTarget::Global(name_idx), dim as u8, total_dims)),
-                            )?;
-                        }
-                        self.compile_expr(value, 1, None)?;
+                        self.compile_index_args_stack_end(
+                            indices,
+                            OpCode::PushEndVarTarget {
+                                var_idx: name_idx,
+                                total_dims,
+                            },
+                            line,
+                        )?;
+                        self.compile_expr(value, 1, false)?;
                         self.chunk.emit(
                             OpCode::StoreCellIndex {
                                 name_idx,
@@ -532,7 +528,7 @@ impl Compiler {
                     }
                 }
                 AssignTarget::Field { name, fields } => {
-                    self.compile_expr(value, 1, None)?;
+                    self.compile_expr(value, 1, false)?;
                     let path_idx = self.chunk.add_field_path(fields.clone());
                     if let Some(slot) = self.lookup_local(name) {
                         self.chunk
@@ -559,13 +555,12 @@ impl Compiler {
                     let total_dims = indices.len() as u8;
                     let path_idx = self.chunk.add_field_path(fields.clone());
                     if let Some(slot) = self.lookup_local(name) {
-                        for (dim, arg) in indices.iter().enumerate() {
-                            self.compile_index_arg(
-                                arg,
-                                Some((EndTarget::Local(slot), dim as u8, total_dims)),
-                            )?;
-                        }
-                        self.compile_expr(value, 1, None)?;
+                        self.compile_index_args_stack_end(
+                            indices,
+                            OpCode::PushEndLocalTarget { slot, total_dims },
+                            line,
+                        )?;
+                        self.compile_expr(value, 1, false)?;
                         self.chunk.emit(
                             OpCode::StoreIndexedFieldLocal {
                                 slot,
@@ -580,13 +575,15 @@ impl Compiler {
                         }
                     } else {
                         let name_idx = self.chunk.add_name(name);
-                        for (dim, arg) in indices.iter().enumerate() {
-                            self.compile_index_arg(
-                                arg,
-                                Some((EndTarget::Global(name_idx), dim as u8, total_dims)),
-                            )?;
-                        }
-                        self.compile_expr(value, 1, None)?;
+                        self.compile_index_args_stack_end(
+                            indices,
+                            OpCode::PushEndVarTarget {
+                                var_idx: name_idx,
+                                total_dims,
+                            },
+                            line,
+                        )?;
+                        self.compile_expr(value, 1, false)?;
                         self.chunk.emit(
                             OpCode::StoreIndexedField {
                                 name_idx,
@@ -621,13 +618,15 @@ impl Compiler {
                     }
                     if let Some(tmp_slot) = self.lookup_local("__matro_fi_tmp") {
                         self.chunk.emit(OpCode::StoreLocal(tmp_slot), line);
-                        for (dim, arg) in indices.iter().enumerate() {
-                            self.compile_index_arg(
-                                arg,
-                                Some((EndTarget::Local(tmp_slot), dim as u8, total_dims)),
-                            )?;
-                        }
-                        self.compile_expr(value, 1, None)?;
+                        self.compile_index_args_stack_end(
+                            indices,
+                            OpCode::PushEndLocalTarget {
+                                slot: tmp_slot,
+                                total_dims,
+                            },
+                            line,
+                        )?;
+                        self.compile_expr(value, 1, false)?;
                         self.chunk.emit(
                             OpCode::StoreIndexLocal {
                                 slot: tmp_slot,
@@ -639,13 +638,15 @@ impl Compiler {
                     } else {
                         let tmp_idx = self.chunk.add_name("__matro_fi_tmp");
                         self.chunk.emit(OpCode::StoreVar(tmp_idx), line);
-                        for (dim, arg) in indices.iter().enumerate() {
-                            self.compile_index_arg(
-                                arg,
-                                Some((EndTarget::Global(tmp_idx), dim as u8, total_dims)),
-                            )?;
-                        }
-                        self.compile_expr(value, 1, None)?;
+                        self.compile_index_args_stack_end(
+                            indices,
+                            OpCode::PushEndVarTarget {
+                                var_idx: tmp_idx,
+                                total_dims,
+                            },
+                            line,
+                        )?;
+                        self.compile_expr(value, 1, false)?;
                         self.chunk.emit(
                             OpCode::StoreIndex {
                                 name_idx: tmp_idx,
@@ -675,7 +676,7 @@ impl Compiler {
             },
             StmtKind::MultiAssign { targets, value } => {
                 let nargout = targets.len() as u8;
-                self.compile_expr(value, nargout, None)?;
+                self.compile_expr(value, nargout, false)?;
                 for target in targets.iter().rev() {
                     if target == "~" {
                         self.chunk.emit(OpCode::Pop, line);
@@ -706,7 +707,7 @@ impl Compiler {
                 else_body,
             } => {
                 let mut end_jumps = Vec::new();
-                self.compile_expr(cond, 1, None)?;
+                self.compile_expr(cond, 1, false)?;
                 let mut false_jump = self.chunk.emit(OpCode::JumpIfFalse(0), line);
 
                 for s in then_body {
@@ -719,7 +720,7 @@ impl Compiler {
                     self.chunk.code[false_jump] = OpCode::JumpIfFalse(target);
 
                     let eline = econd.span.line as u32;
-                    self.compile_expr(econd, 1, None)?;
+                    self.compile_expr(econd, 1, false)?;
                     false_jump = self.chunk.emit(OpCode::JumpIfFalse(0), eline);
                     for s in ebody {
                         self.compile_stmt(s)?;
@@ -745,12 +746,12 @@ impl Compiler {
                 cases,
                 otherwise,
             } => {
-                self.compile_expr(expr, 1, None)?;
+                self.compile_expr(expr, 1, false)?;
                 let mut end_jumps = Vec::new();
 
                 for (case_expr, body) in cases {
                     let cline = case_expr.span.line as u32;
-                    self.compile_expr(case_expr, 1, None)?;
+                    self.compile_expr(case_expr, 1, false)?;
                     self.chunk.emit(OpCode::SwitchMatch, cline);
                     let next_case = self.chunk.emit(OpCode::JumpIfFalse(0), cline);
                     self.chunk.emit(OpCode::Pop, cline);
@@ -817,7 +818,7 @@ impl Compiler {
             }
             StmtKind::While { cond, body } => {
                 let loop_start = self.chunk.code.len();
-                self.compile_expr(cond, 1, None)?;
+                self.compile_expr(cond, 1, false)?;
                 let exit_jump = self.chunk.emit(OpCode::JumpIfFalse(0), line);
 
                 self.loops.push(LoopContext {
@@ -843,17 +844,17 @@ impl Compiler {
             StmtKind::For { var, iter, body } => {
                 let local_slot = self.lookup_local(var);
                 let range_has_step = if let ExprKind::Range { start, step, stop } = &iter.kind {
-                    self.compile_expr(start, 1, None)?;
+                    self.compile_expr(start, 1, false)?;
                     let hs = if let Some(st) = step {
-                        self.compile_expr(st, 1, None)?;
+                        self.compile_expr(st, 1, false)?;
                         true
                     } else {
                         false
                     };
-                    self.compile_expr(stop, 1, None)?;
+                    self.compile_expr(stop, 1, false)?;
                     Some(hs)
                 } else {
-                    self.compile_expr(iter, 1, None)?;
+                    self.compile_expr(iter, 1, false)?;
                     None
                 };
 
@@ -1088,26 +1089,41 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_index_arg(
+    fn compile_index_args_stack_end(
         &mut self,
-        arg: &IndexArg,
-        end_ctx: Option<(EndTarget, u8, u8)>,
+        args: &[IndexArg],
+        push_op: OpCode,
+        line: u32,
     ) -> Result<()> {
+        let has_end = args_has_end(args);
+        if has_end {
+            self.chunk.emit(push_op, line);
+        }
+        for (dim, arg) in args.iter().enumerate() {
+            if has_end && index_arg_has_end(arg) {
+                self.chunk.emit(OpCode::SetEndDim(dim as u8), line);
+                self.compile_index_arg(arg, true)?;
+            } else {
+                self.compile_index_arg(arg, false)?;
+            }
+        }
+        if has_end {
+            self.chunk.emit(OpCode::PopEndTarget, line);
+        }
+        Ok(())
+    }
+
+    fn compile_index_arg(&mut self, arg: &IndexArg, in_index: bool) -> Result<()> {
         match arg {
             IndexArg::Colon => {
                 self.chunk.emit(OpCode::PushColon, 0);
                 Ok(())
             }
-            IndexArg::Expr(e) => self.compile_expr(e, 1, end_ctx),
+            IndexArg::Expr(e) => self.compile_expr(e, 1, in_index),
         }
     }
 
-    fn compile_expr(
-        &mut self,
-        expr: &Expr,
-        nargout: u8,
-        end_ctx: Option<(EndTarget, u8, u8)>,
-    ) -> Result<()> {
+    fn compile_expr(&mut self, expr: &Expr, nargout: u8, in_index: bool) -> Result<()> {
         let line = expr.span.line as u32;
 
         // Compile-time constant folding for pure numeric literal expressions
@@ -1149,39 +1165,18 @@ impl Compiler {
                 }
             }
             ExprKind::EndKeyword => {
-                let Some((target, dim, total_dims)) = end_ctx else {
+                if !in_index {
                     return Err(MatroError::compile(
                         expr.span,
                         "'end' can only be used inside an indexing expression",
                     ));
-                };
-                match target {
-                    EndTarget::Global(var_idx) => {
-                        self.chunk.emit(
-                            OpCode::PushEnd {
-                                var_idx,
-                                dim,
-                                total_dims,
-                            },
-                            line,
-                        );
-                    }
-                    EndTarget::Local(slot) => {
-                        self.chunk.emit(
-                            OpCode::PushEndLocal {
-                                slot,
-                                dim,
-                                total_dims,
-                            },
-                            line,
-                        );
-                    }
                 }
+                self.chunk.emit(OpCode::PushEndTop, line);
             }
             ExprKind::Matrix(rows) => {
                 for row in rows {
                     for item in row {
-                        self.compile_expr(item, 1, end_ctx)?;
+                        self.compile_expr(item, 1, in_index)?;
                     }
                     self.chunk.emit(OpCode::BuildRow(row.len() as u32), line);
                 }
@@ -1199,7 +1194,7 @@ impl Compiler {
                         ));
                     }
                     for item in row {
-                        self.compile_expr(item, 1, end_ctx)?;
+                        self.compile_expr(item, 1, in_index)?;
                     }
                 }
                 self.chunk.emit(
@@ -1231,7 +1226,7 @@ impl Compiler {
                     None
                 };
                 let ret_slot = sub.alloc_local("__anon_ret");
-                sub.compile_expr(body, 1, None)?;
+                sub.compile_expr(body, 1, false)?;
                 sub.chunk.emit(OpCode::StoreLocal(ret_slot), line);
                 sub.chunk.emit(OpCode::Return, line);
 
@@ -1277,7 +1272,7 @@ impl Compiler {
                 self.chunk.emit(OpCode::MakeClosure(idx), line);
             }
             ExprKind::Unary { op, expr: inner } => {
-                self.compile_expr(inner, 1, end_ctx)?;
+                self.compile_expr(inner, 1, in_index)?;
                 let code = match op {
                     UnaryOp::Neg => OpCode::Neg,
                     UnaryOp::Pos => OpCode::Pos,
@@ -1286,44 +1281,44 @@ impl Compiler {
                 self.chunk.emit(code, line);
             }
             ExprKind::CTranspose(inner) => {
-                self.compile_expr(inner, 1, end_ctx)?;
+                self.compile_expr(inner, 1, in_index)?;
                 self.chunk.emit(OpCode::CTranspose, line);
             }
             ExprKind::Transpose(inner) => {
-                self.compile_expr(inner, 1, end_ctx)?;
+                self.compile_expr(inner, 1, in_index)?;
                 self.chunk.emit(OpCode::Transpose, line);
             }
             ExprKind::Range { start, step, stop } => {
-                self.compile_expr(start, 1, end_ctx)?;
+                self.compile_expr(start, 1, in_index)?;
                 let has_step = if let Some(st) = step {
-                    self.compile_expr(st, 1, end_ctx)?;
+                    self.compile_expr(st, 1, in_index)?;
                     true
                 } else {
                     false
                 };
-                self.compile_expr(stop, 1, end_ctx)?;
+                self.compile_expr(stop, 1, in_index)?;
                 self.chunk.emit(OpCode::MakeRange { has_step }, line);
             }
             ExprKind::Binary { op, left, right } => match op {
                 BinaryOp::ShortAnd => {
-                    self.compile_expr(left, 1, end_ctx)?;
+                    self.compile_expr(left, 1, in_index)?;
                     let skip = self.chunk.emit(OpCode::JumpIfFalsePeek(0), line);
                     self.chunk.emit(OpCode::Pop, line);
-                    self.compile_expr(right, 1, end_ctx)?;
+                    self.compile_expr(right, 1, in_index)?;
                     let end = self.chunk.code.len() as u32;
                     self.chunk.code[skip] = OpCode::JumpIfFalsePeek(end);
                 }
                 BinaryOp::ShortOr => {
-                    self.compile_expr(left, 1, end_ctx)?;
+                    self.compile_expr(left, 1, in_index)?;
                     let skip = self.chunk.emit(OpCode::JumpIfTruePeek(0), line);
                     self.chunk.emit(OpCode::Pop, line);
-                    self.compile_expr(right, 1, end_ctx)?;
+                    self.compile_expr(right, 1, in_index)?;
                     let end = self.chunk.code.len() as u32;
                     self.chunk.code[skip] = OpCode::JumpIfTruePeek(end);
                 }
                 _ => {
-                    self.compile_expr(left, 1, end_ctx)?;
-                    self.compile_expr(right, 1, end_ctx)?;
+                    self.compile_expr(left, 1, in_index)?;
+                    self.compile_expr(right, 1, in_index)?;
                     let code = match op {
                         BinaryOp::Add => OpCode::Add,
                         BinaryOp::Sub => OpCode::Sub,
@@ -1350,12 +1345,11 @@ impl Compiler {
             ExprKind::CallOrIndex { callee, args } => {
                 let total_dims = args.len() as u8;
                 if let Some(slot) = self.lookup_local(callee) {
-                    for (dim, arg) in args.iter().enumerate() {
-                        self.compile_index_arg(
-                            arg,
-                            Some((EndTarget::Local(slot), dim as u8, total_dims)),
-                        )?;
-                    }
+                    self.compile_index_args_stack_end(
+                        args,
+                        OpCode::PushEndLocalTarget { slot, total_dims },
+                        line,
+                    )?;
                     self.chunk.emit(
                         OpCode::CallOrIndexLocal {
                             slot,
@@ -1366,12 +1360,14 @@ impl Compiler {
                     );
                 } else {
                     let name_idx = self.chunk.add_name(callee);
-                    for (dim, arg) in args.iter().enumerate() {
-                        self.compile_index_arg(
-                            arg,
-                            Some((EndTarget::Global(name_idx), dim as u8, total_dims)),
-                        )?;
-                    }
+                    self.compile_index_args_stack_end(
+                        args,
+                        OpCode::PushEndVarTarget {
+                            var_idx: name_idx,
+                            total_dims,
+                        },
+                        line,
+                    )?;
                     self.chunk.emit(
                         OpCode::CallOrIndex {
                             name_idx,
@@ -1383,11 +1379,13 @@ impl Compiler {
                 }
             }
             ExprKind::DynamicCall { target, args } => {
-                self.compile_expr(target, 1, end_ctx)?;
+                self.compile_expr(target, 1, in_index)?;
                 let total_dims = args.len() as u8;
-                for arg in args {
-                    self.compile_index_arg(arg, None)?;
-                }
+                self.compile_index_args_stack_end(
+                    args,
+                    OpCode::PushEndTarget { total_dims },
+                    line,
+                )?;
                 self.chunk.emit(
                     OpCode::DynamicCall {
                         argc: total_dims,
@@ -1401,12 +1399,17 @@ impl Compiler {
                 method,
                 args,
             } => {
-                self.compile_expr(object, 1, end_ctx)?;
+                self.compile_expr(object, 1, in_index)?;
                 let total_dims = args.len() as u8;
-                for arg in args {
-                    self.compile_index_arg(arg, None)?;
-                }
                 let method_idx = self.chunk.add_name(method);
+                self.compile_index_args_stack_end(
+                    args,
+                    OpCode::PushEndFieldTarget {
+                        field_idx: method_idx,
+                        total_dims,
+                    },
+                    line,
+                )?;
                 self.chunk.emit(
                     OpCode::MethodCall {
                         method_idx,
@@ -1417,22 +1420,13 @@ impl Compiler {
                 );
             }
             ExprKind::CellIndex { target, indices } => {
-                let end_target = match &target.kind {
-                    ExprKind::Ident(n) => {
-                        if let Some(slot) = self.lookup_local(n) {
-                            Some(EndTarget::Local(slot))
-                        } else {
-                            Some(EndTarget::Global(self.chunk.add_name(n)))
-                        }
-                    }
-                    _ => None,
-                };
-                self.compile_expr(target, 1, end_ctx)?;
+                self.compile_expr(target, 1, in_index)?;
                 let total_dims = indices.len() as u8;
-                for (dim, arg) in indices.iter().enumerate() {
-                    let ctx = end_target.map(|t| (t, dim as u8, total_dims));
-                    self.compile_index_arg(arg, ctx)?;
-                }
+                self.compile_index_args_stack_end(
+                    indices,
+                    OpCode::PushEndTarget { total_dims },
+                    line,
+                )?;
                 self.chunk.emit(
                     OpCode::CellIndex {
                         argc: total_dims,
@@ -1442,13 +1436,53 @@ impl Compiler {
                 );
             }
             ExprKind::FieldAccess { object, field } => {
-                self.compile_expr(object, 1, end_ctx)?;
+                self.compile_expr(object, 1, in_index)?;
                 let f_idx = self.chunk.add_name(field);
                 self.chunk.emit(OpCode::GetField(f_idx), line);
             }
         }
         Ok(())
     }
+}
+
+fn expr_has_end(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::EndKeyword => true,
+        ExprKind::Number(_)
+        | ExprKind::Bool(_)
+        | ExprKind::ImagNumber(_)
+        | ExprKind::String(_)
+        | ExprKind::Ident(_)
+        | ExprKind::AnonFunc { .. } => false,
+        ExprKind::Unary { expr: inner, .. }
+        | ExprKind::CTranspose(inner)
+        | ExprKind::Transpose(inner)
+        | ExprKind::FieldAccess { object: inner, .. } => expr_has_end(inner),
+        ExprKind::Binary { left, right, .. } => expr_has_end(left) || expr_has_end(right),
+        ExprKind::Range { start, step, stop } => {
+            expr_has_end(start)
+                || step.as_deref().is_some_and(expr_has_end)
+                || expr_has_end(stop)
+        }
+        ExprKind::Matrix(rows) | ExprKind::Cell(rows) => {
+            rows.iter().any(|row| row.iter().any(expr_has_end))
+        }
+        ExprKind::CallOrIndex { args, .. } => args_has_end(args),
+        ExprKind::DynamicCall { target, args } => expr_has_end(target) || args_has_end(args),
+        ExprKind::MethodCall { object, args, .. } => expr_has_end(object) || args_has_end(args),
+        ExprKind::CellIndex { target, indices } => expr_has_end(target) || args_has_end(indices),
+    }
+}
+
+fn index_arg_has_end(arg: &IndexArg) -> bool {
+    match arg {
+        IndexArg::Colon => false,
+        IndexArg::Expr(e) => expr_has_end(e),
+    }
+}
+
+fn args_has_end(args: &[IndexArg]) -> bool {
+    args.iter().any(index_arg_has_end)
 }
 
 /// Pure scalar constant folder (only folds compound unary/binary expressions of numeric literals).
