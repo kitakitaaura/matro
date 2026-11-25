@@ -507,12 +507,12 @@ impl<'a> Lexer<'a> {
             "otherwise" => (TokenKind::Otherwise, false),
             "try" => (TokenKind::Try, false),
             "catch" => (TokenKind::Catch, false),
-            "end" | "endif" | "endfor" | "endwhile" | "endfunction" | "endswitch"
+            "end" | "endif" | "endfor" | "endparfor" | "endwhile" | "endfunction" | "endswitch"
             | "end_try_catch" | "endclassdef" | "endproperties" | "endmethods" => {
                 (TokenKind::End, true)
             }
             "while" => (TokenKind::While, false),
-            "for" => (TokenKind::For, false),
+            "for" | "parfor" => (TokenKind::For, false),
             "function" => (TokenKind::Function, false),
             "classdef" => (TokenKind::ClassDef, false),
             "global" => (TokenKind::Global, false),

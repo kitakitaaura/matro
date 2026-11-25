@@ -631,6 +631,458 @@ impl SparseMatrix {
         (kl, ku)
     }
 
+    /// $O(\text{nnz})$ sparse forward substitution for lower-triangular CSC matrices (`ku == 0`).
+    pub fn solve_lower_triangular(&self, b: &[f64]) -> Option<Vec<f64>> {
+        let n = self.rows;
+        if self.cols != n || b.len() != n {
+            return None;
+        }
+        let mut x = b.to_vec();
+        for c in 0..n {
+            let start = self.col_ptr[c];
+            let end = self.col_ptr[c + 1];
+            let mut diag = 0.0;
+            let mut diag_pos = None;
+            for idx in start..end {
+                if self.row_idx[idx] == c {
+                    diag = self.values[idx];
+                    diag_pos = Some(idx);
+                    break;
+                }
+            }
+            if diag.abs() < 1e-30 || !diag.is_finite() {
+                return None;
+            }
+            let xc = x[c] / diag;
+            x[c] = xc;
+            if xc != 0.0 {
+                let first_sub = diag_pos.map_or(start, |p| p + 1);
+                for idx in first_sub..end {
+                    let r = self.row_idx[idx];
+                    if r > c {
+                        x[r] -= self.values[idx] * xc;
+                    }
+                }
+            }
+        }
+        Some(x)
+    }
+
+    /// $O(\text{nnz})$ sparse back substitution for upper-triangular CSC matrices (`kl == 0`).
+    pub fn solve_upper_triangular(&self, b: &[f64]) -> Option<Vec<f64>> {
+        let n = self.rows;
+        if self.cols != n || b.len() != n {
+            return None;
+        }
+        let mut x = b.to_vec();
+        for c in (0..n).rev() {
+            let start = self.col_ptr[c];
+            let end = self.col_ptr[c + 1];
+            let mut diag = 0.0;
+            for idx in (start..end).rev() {
+                if self.row_idx[idx] == c {
+                    diag = self.values[idx];
+                    break;
+                }
+            }
+            if diag.abs() < 1e-30 || !diag.is_finite() {
+                return None;
+            }
+            let xc = x[c] / diag;
+            x[c] = xc;
+            if xc != 0.0 {
+                for idx in start..end {
+                    let r = self.row_idx[idx];
+                    if r < c {
+                        x[r] -= self.values[idx] * xc;
+                    }
+                }
+            }
+        }
+        Some(x)
+    }
+
+    /// Zero-fill Incomplete Cholesky `IC(0)` factorization returning lower-triangular sparse `L`
+    /// with the same lower-triangular sparsity pattern as `self` (`diagcomp >= 0` shifts diagonal by `diagcomp * diag(A)`).
+    pub fn ichol0(&self, diagcomp: f64) -> Result<Self> {
+        if self.rows != self.cols {
+            return Err(MatroError::dimension("ichol: matrix must be square"));
+        }
+        let n = self.rows;
+        if n == 0 {
+            return Ok(Self::zeros(0, 0));
+        }
+        let mut cols: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        for c in 0..n {
+            let mut has_diag = false;
+            for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
+                let r = self.row_idx[idx];
+                if r >= c {
+                    let mut v = self.values[idx];
+                    if r == c {
+                        has_diag = true;
+                        if diagcomp > 0.0 {
+                            v += diagcomp * v.abs().max(1.0);
+                        }
+                    }
+                    cols[c].push((r, v));
+                }
+            }
+            if !has_diag {
+                return Err(MatroError::runtime(format!(
+                    "ichol: missing positive diagonal at row {}",
+                    c + 1
+                )));
+            }
+        }
+        for j in 0..n {
+            let diag = cols[j][0].1;
+            if !diag.is_finite() || diag <= 0.0 {
+                return Err(MatroError::runtime(format!(
+                    "ichol: encountered nonpositive pivot ({diag:.3e}) at column {}",
+                    j + 1
+                )));
+            }
+            let ljj = diag.sqrt();
+            cols[j][0].1 = ljj;
+            let inv_ljj = 1.0 / ljj;
+            for entry in cols[j].iter_mut().skip(1) {
+                entry.1 *= inv_ljj;
+            }
+            let col_j: Vec<(usize, f64)> = cols[j][1..].to_vec();
+            for (idx_k, &(k, lkj)) in col_j.iter().enumerate() {
+                if lkj == 0.0 {
+                    continue;
+                }
+                // Update cols[k] at matching rows i >= k in col_j[idx_k..]
+                let sub_j = &col_j[idx_k..];
+                let col_k = &mut cols[k];
+                let mut pj = 0usize;
+                let mut pk = 0usize;
+                while pj < sub_j.len() && pk < col_k.len() {
+                    let rj = sub_j[pj].0;
+                    let rk = col_k[pk].0;
+                    if rj == rk {
+                        col_k[pk].1 -= sub_j[pj].1 * lkj;
+                        pj += 1;
+                        pk += 1;
+                    } else if rj < rk {
+                        pj += 1;
+                    } else {
+                        pk += 1;
+                    }
+                }
+            }
+        }
+        let mut col_ptr = Vec::with_capacity(n + 1);
+        let mut row_idx = Vec::new();
+        let mut values = Vec::new();
+        col_ptr.push(0);
+        for col in cols {
+            for (r, v) in col {
+                if v != 0.0 {
+                    row_idx.push(r);
+                    values.push(v);
+                }
+            }
+            col_ptr.push(row_idx.len());
+        }
+        Ok(Self {
+            rows: n,
+            cols: n,
+            col_ptr,
+            row_idx,
+            values,
+        })
+    }
+
+    /// Zero-fill Incomplete LU `ILU(0)` factorization returning `(L, U)` where `L` is unit lower-triangular
+    /// and `U` is upper-triangular with the sparsity pattern of `self`.
+    pub fn ilu0(&self) -> Result<(Self, Self)> {
+        if self.rows != self.cols {
+            return Err(MatroError::dimension("ilu: matrix must be square"));
+        }
+        let n = self.rows;
+        if n == 0 {
+            return Ok((Self::zeros(0, 0), Self::zeros(0, 0)));
+        }
+        // Build CSR rows (sorted by column index)
+        let mut rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        for c in 0..n {
+            for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
+                rows[self.row_idx[idx]].push((c, self.values[idx]));
+            }
+        }
+        let mut diag_pos = vec![0usize; n];
+        for i in 0..n {
+            match rows[i].binary_search_by_key(&i, |&(c, _)| c) {
+                Ok(pos) => diag_pos[i] = pos,
+                Err(pos) => {
+                    rows[i].insert(pos, (i, 0.0));
+                    diag_pos[i] = pos;
+                }
+            }
+        }
+        // IKJ zero-fill Gaussian elimination
+        for i in 0..n {
+            let d_i = diag_pos[i];
+            for pos_k in 0..d_i {
+                let k = rows[i][pos_k].0;
+                let u_kk = rows[k][diag_pos[k]].1;
+                if u_kk.abs() < 1e-30 || !u_kk.is_finite() {
+                    return Err(MatroError::runtime(format!(
+                        "ilu: zero pivot encountered at row {}",
+                        k + 1
+                    )));
+                }
+                let l_ik = rows[i][pos_k].1 / u_kk;
+                rows[i][pos_k].1 = l_ik;
+                if l_ik == 0.0 {
+                    continue;
+                }
+                // Merge-update rows[i][pos_k+1..] against rows[k][diag_pos[k]+1..]
+                let row_k_tail: Vec<(usize, f64)> = rows[k][(diag_pos[k] + 1)..].to_vec();
+                let mut pi = pos_k + 1;
+                let mut pk = 0usize;
+                while pi < rows[i].len() && pk < row_k_tail.len() {
+                    let ci = rows[i][pi].0;
+                    let ck = row_k_tail[pk].0;
+                    if ci == ck {
+                        rows[i][pi].1 -= l_ik * row_k_tail[pk].1;
+                        pi += 1;
+                        pk += 1;
+                    } else if ci < ck {
+                        pi += 1;
+                    } else {
+                        pk += 1;
+                    }
+                }
+            }
+            let u_ii = rows[i][d_i].1;
+            if u_ii.abs() < 1e-30 || !u_ii.is_finite() {
+                return Err(MatroError::runtime(format!(
+                    "ilu: zero pivot encountered at row {}",
+                    i + 1
+                )));
+            }
+        }
+
+        let mut l_triplets = Vec::with_capacity(self.nnz() + n);
+        let mut u_triplets = Vec::with_capacity(self.nnz() + n);
+        for (i, row) in rows.into_iter().enumerate() {
+            l_triplets.push((i, i, 1.0));
+            for (c, v) in row {
+                if v == 0.0 {
+                    continue;
+                }
+                if c < i {
+                    l_triplets.push((i, c, v));
+                } else {
+                    u_triplets.push((i, c, v));
+                }
+            }
+        }
+        Ok((
+            Self::from_triplets(n, n, &l_triplets)?,
+            Self::from_triplets(n, n, &u_triplets)?,
+        ))
+    }
+
+    /// Gilbert-Peierls sparse left-looking LU factorization with partial pivoting:
+    /// returns `(L, U, perm)` such that `A[perm[i], :] == (L * U)[i, :]`,
+    /// where `L` is unit lower-triangular sparse and `U` is upper-triangular sparse.
+    pub fn lu_sparse(&self) -> Result<(Self, Self, Vec<usize>)> {
+        if self.rows != self.cols {
+            return Err(MatroError::dimension("Sparse LU requires a square matrix"));
+        }
+        let n = self.rows;
+        if n == 0 {
+            return Ok((Self::zeros(0, 0), Self::zeros(0, 0), Vec::new()));
+        }
+        let mut l_cols: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        let mut u_cols: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        // pinv[orig_row] = pivot step k (0..n), or usize::MAX if unpivoted
+        let mut pinv = vec![usize::MAX; n];
+        let mut perm = vec![0usize; n];
+
+        let mut x = vec![0.0; n];
+        let mut mark = vec![0usize; n];
+        let mut dfs_stack: Vec<(usize, usize)> = Vec::new();
+        let mut topo: Vec<usize> = Vec::new();
+        let mut unpivoted: Vec<usize> = Vec::new();
+        let mut unpiv_mark = vec![0usize; n];
+        let mut cur_mark = 0usize;
+
+        for j in 0..n {
+            cur_mark += 1;
+            topo.clear();
+            unpivoted.clear();
+
+            // 1. Symbolic reachability DFS in DAG of L from nonzeros of A[:, j]
+            for idx in self.col_ptr[j]..self.col_ptr[j + 1] {
+                let r = self.row_idx[idx];
+                x[r] += self.values[idx];
+                let step = pinv[r];
+                if step == usize::MAX {
+                    if unpiv_mark[r] != cur_mark {
+                        unpiv_mark[r] = cur_mark;
+                        unpivoted.push(r);
+                    }
+                } else if mark[step] != cur_mark {
+                    mark[step] = cur_mark;
+                    dfs_stack.push((step, 0));
+                    while let Some((col_k, pos)) = dfs_stack.last_mut() {
+                        let k = *col_k;
+                        if *pos < l_cols[k].len() {
+                            let next_r = l_cols[k][*pos].0;
+                            *pos += 1;
+                            let next_step = pinv[next_r];
+                            if next_step == usize::MAX {
+                                if unpiv_mark[next_r] != cur_mark {
+                                    unpiv_mark[next_r] = cur_mark;
+                                    unpivoted.push(next_r);
+                                }
+                            } else if mark[next_step] != cur_mark {
+                                mark[next_step] = cur_mark;
+                                dfs_stack.push((next_step, 0));
+                            }
+                        } else {
+                            topo.push(k);
+                            dfs_stack.pop();
+                        }
+                    }
+                }
+            }
+
+            // 2. Numeric sparse triangular solve in reverse postorder (topological order)
+            for &k in topo.iter().rev() {
+                let piv_r = perm[k];
+                let uk = x[piv_r];
+                x[piv_r] = 0.0;
+                if uk != 0.0 {
+                    u_cols[j].push((k, uk));
+                    for &(r, lrk) in &l_cols[k] {
+                        x[r] -= lrk * uk;
+                        if pinv[r] == usize::MAX && unpiv_mark[r] != cur_mark {
+                            unpiv_mark[r] = cur_mark;
+                            unpivoted.push(r);
+                        }
+                    }
+                }
+            }
+
+            // 3. Partial pivoting among unpivoted nonzero rows
+            let mut best_row = usize::MAX;
+            let mut best_abs = 0.0;
+            for &r in &unpivoted {
+                let a = x[r].abs();
+                if a > best_abs {
+                    best_abs = a;
+                    best_row = r;
+                }
+            }
+            if best_row == usize::MAX || !best_abs.is_finite() || best_abs == 0.0 {
+                // Zero out any residual workspace entries and report singular
+                for &r in &unpivoted {
+                    x[r] = 0.0;
+                }
+                return Err(MatroError::runtime(format!(
+                    "Sparse LU: matrix is singular at column {}",
+                    j + 1
+                )));
+            }
+
+            let piv_val = x[best_row];
+            x[best_row] = 0.0;
+            pinv[best_row] = j;
+            perm[j] = best_row;
+            u_cols[j].push((j, piv_val));
+            u_cols[j].sort_unstable_by_key(|&(r, _)| r);
+
+            let inv_piv = 1.0 / piv_val;
+            for &r in &unpivoted {
+                if r == best_row {
+                    continue;
+                }
+                let v = x[r];
+                x[r] = 0.0;
+                if v != 0.0 {
+                    l_cols[j].push((r, v * inv_piv));
+                }
+            }
+        }
+
+        // Build CSC L (with row indices remapped through pinv + unit diagonal) and CSC U
+        let mut l_col_ptr = Vec::with_capacity(n + 1);
+        let mut l_row_idx = Vec::new();
+        let mut l_values = Vec::new();
+        l_col_ptr.push(0);
+        for (j, mut col) in l_cols.into_iter().enumerate() {
+            for (r, _) in &mut col {
+                *r = pinv[*r];
+            }
+            col.push((j, 1.0));
+            col.sort_unstable_by_key(|&(r, _)| r);
+            for (r, v) in col {
+                l_row_idx.push(r);
+                l_values.push(v);
+            }
+            l_col_ptr.push(l_row_idx.len());
+        }
+
+        let mut u_col_ptr = Vec::with_capacity(n + 1);
+        let mut u_row_idx = Vec::new();
+        let mut u_values = Vec::new();
+        u_col_ptr.push(0);
+        for col in u_cols {
+            for (r, v) in col {
+                u_row_idx.push(r);
+                u_values.push(v);
+            }
+            u_col_ptr.push(u_row_idx.len());
+        }
+
+        Ok((
+            Self {
+                rows: n,
+                cols: n,
+                col_ptr: l_col_ptr,
+                row_idx: l_row_idx,
+                values: l_values,
+            },
+            Self {
+                rows: n,
+                cols: n,
+                col_ptr: u_col_ptr,
+                row_idx: u_row_idx,
+                values: u_values,
+            },
+            perm,
+        ))
+    }
+
+    /// Solve `A * X = B` given a precomputed sparse LU factorization `(L, U, perm)`.
+    pub fn solve_with_lu(l: &Self, u: &Self, perm: &[usize], rhs: &Matrix) -> Result<Matrix> {
+        let n = perm.len();
+        let mut out = Matrix::zeros(n, rhs.cols());
+        for j in 0..rhs.cols() {
+            let mut pb = vec![0.0; n];
+            for i in 0..n {
+                pb[i] = rhs.get(perm[i], j);
+            }
+            let y = l
+                .solve_lower_triangular(&pb)
+                .ok_or_else(|| MatroError::runtime("Sparse LU forward solve failed"))?;
+            let x = u
+                .solve_upper_triangular(&y)
+                .ok_or_else(|| MatroError::runtime("Sparse LU back solve failed"))?;
+            for (i, &v) in x.iter().enumerate() {
+                out.set(i, j, v);
+            }
+        }
+        Ok(out)
+    }
+
     /// Exact Banded Cholesky factorization `A = L * L^T` for symmetric positive definite banded systems.
     fn factor_banded_cholesky(&self, bw: usize) -> Option<Vec<f64>> {
         let n = self.rows;
@@ -964,6 +1416,45 @@ impl SparseMatrix {
         }
 
         let (kl, ku) = self.bandwidth();
+
+        // O(nnz) exact direct triangular solves (makes ichol/ilu preconditioners blazing fast!)
+        if ku == 0 {
+            let mut out = Matrix::zeros(n, rhs.cols());
+            let mut ok = true;
+            for j in 0..rhs.cols() {
+                let b: Vec<f64> = (0..n).map(|r| rhs.get(r, j)).collect();
+                if let Some(x) = self.solve_lower_triangular(&b) {
+                    for (i, &v) in x.iter().enumerate() {
+                        out.set(i, j, v);
+                    }
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return Ok(out);
+            }
+        }
+        if kl == 0 {
+            let mut out = Matrix::zeros(n, rhs.cols());
+            let mut ok = true;
+            for j in 0..rhs.cols() {
+                let b: Vec<f64> = (0..n).map(|r| rhs.get(r, j)).collect();
+                if let Some(x) = self.solve_upper_triangular(&b) {
+                    for (i, &v) in x.iter().enumerate() {
+                        out.set(i, j, v);
+                    }
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return Ok(out);
+            }
+        }
+
         let sym = kl == ku && self.is_symmetric();
 
         // Fast exact direct Banded Cholesky for banded SPD matrices (e.g. 2D FEM stiffness matrices)
@@ -993,6 +1484,16 @@ impl SparseMatrix {
                     }
                 }
                 return Ok(out);
+            }
+        }
+
+        // Exact direct Gilbert-Peierls sparse left-looking LU for general non-banded sparse matrices
+        // (handles arbitrary graph / loop-closure / advection-diffusion sparsity without dense O(n^2) blowup)
+        if n <= 3000 {
+            if let Ok((l, u, perm)) = self.lu_sparse() {
+                if let Ok(sol) = Self::solve_with_lu(&l, &u, &perm, rhs) {
+                    return Ok(sol);
+                }
             }
         }
 

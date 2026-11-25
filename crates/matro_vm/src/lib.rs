@@ -486,6 +486,7 @@ pub struct Vm {
     tic_stack: Vec<TicMark>,
     profiling: bool,
     profile: HashMap<String, ProfileEntry>,
+    last_error: Option<(String, String, u32)>,
 }
 
 impl Default for Vm {
@@ -517,6 +518,7 @@ impl Vm {
             tic_stack: Vec::new(),
             profiling: false,
             profile: HashMap::new(),
+            last_error: None,
         }
     }
 
@@ -544,7 +546,7 @@ impl Vm {
     }
 
     fn invalidate_file(&mut self, path: &str) {
-        let key = matro_loader::MemoryVfs::normalize(path);
+        let key = matro_loader::normalize_preserve_abs(path);
         self.loaded_files.remove(&key);
         self.functions
             .retain(|_, f| f.source_file.as_deref() != Some(key.as_str()));
@@ -685,7 +687,7 @@ impl Vm {
         self.steps = 0;
         let mut chunk = compile(source)?;
         let norm_path = path
-            .map(matro_loader::MemoryVfs::normalize)
+            .map(matro_loader::normalize_preserve_abs)
             .filter(|s| !s.is_empty());
         let file_key = norm_path
             .clone()
@@ -814,19 +816,15 @@ impl Vm {
                     if err.is_step_limit() {
                         return Err(err.at_line(line));
                     }
+                    let err_id = err.identifier().to_string();
+                    let err_msg = err.bare_message();
+                    self.last_error = Some((err_id.clone(), err_msg.clone(), line));
                     if let Some(handler) = try_stack.pop() {
                         stack.truncate(handler.stack_depth);
                         for_loops.truncate(handler.loop_depth);
                         end_targets.truncate(handler.end_depth);
                         if handler.err_var != u32::MAX {
-                            let mut info = BTreeMap::new();
-                            info.insert("message".to_string(), Value::String(err.bare_message()));
-                            info.insert(
-                                "identifier".to_string(),
-                                Value::String(err.identifier().to_string()),
-                            );
-                            info.insert("line".to_string(), Value::scalar(line as f64));
-                            let err_val = Value::Struct(info);
+                            let err_val = make_mexception(&err_id, &err_msg, line);
                             if handler.err_is_local {
                                 if let Some(f) = frame.as_deref_mut() {
                                     f.set(handler.err_var as u16, err_val);
@@ -1489,6 +1487,59 @@ impl Vm {
                         let map_val = matro_intrinsics::tables::build_map(&call_args)?;
                         push_call_results(stack, vec![map_val], nargout as usize);
                         return Ok(true);
+                    }
+                    if o.class_name == "MException" {
+                        match method_name.as_str() {
+                            "throw" | "rethrow" | "throwAsCaller" => {
+                                return Err(mexception_to_error(&receiver));
+                            }
+                            "getReport" => {
+                                let id = o
+                                    .fields
+                                    .get("identifier")
+                                    .and_then(|v| v.as_str().ok())
+                                    .unwrap_or("Matro:Error");
+                                let msg = o
+                                    .fields
+                                    .get("message")
+                                    .and_then(|v| v.as_str().ok())
+                                    .unwrap_or("");
+                                let rep = if id.is_empty() {
+                                    msg.to_string()
+                                } else {
+                                    format!("{id}: {msg}")
+                                };
+                                push_call_results(stack, vec![Value::String(rep)], nargout as usize);
+                                return Ok(true);
+                            }
+                            "addCause" => {
+                                let call_args = flatten_call_args(raw_args)?;
+                                let mut updated = o.clone();
+                                let mut causes = match updated.fields.get("cause") {
+                                    Some(Value::Cell(c)) => c.data.clone(),
+                                    _ => Vec::new(),
+                                };
+                                if let Some(c) = call_args.first() {
+                                    causes.push(c.clone());
+                                }
+                                let n = causes.len();
+                                updated.fields.insert(
+                                    "cause".to_string(),
+                                    Value::Cell(CellArray {
+                                        rows: n,
+                                        cols: if n == 0 { 0 } else { 1 },
+                                        data: causes,
+                                    }),
+                                );
+                                push_call_results(
+                                    stack,
+                                    vec![Value::Object(updated)],
+                                    nargout as usize,
+                                );
+                                return Ok(true);
+                            }
+                            _ => {}
+                        }
                     }
                     if o.class_name == "__class_ref" {
                         let cname = o
@@ -3117,7 +3168,7 @@ impl Vm {
     /// Load and index a `.m` file by normalized VFS path, keeping its local subfunctions strictly file-scoped.
     #[inline(never)]
     fn load_file(&mut self, resolved_path: &str) -> Result<Option<LoadedFile>> {
-        let key = matro_loader::MemoryVfs::normalize(resolved_path);
+        let key = matro_loader::normalize_preserve_abs(resolved_path);
         if let Some(lf) = self.loaded_files.get(&key) {
             return Ok(Some(lf.clone()));
         }
@@ -3729,6 +3780,28 @@ impl Vm {
                 }
             }
             "bsxfun" => return self.exec_bsxfun(call_args, stdout),
+            "spfun" => return self.exec_spfun(call_args, stdout),
+            "MException" => return self.exec_mexception(call_args),
+            "throw" | "rethrow" => {
+                if call_args.len() != 1 {
+                    return Err(MatroError::arity(name, "1 (ME)", call_args.len()));
+                }
+                return Err(mexception_to_error(&call_args[0]));
+            }
+            "lasterror" => return self.exec_lasterror(call_args),
+            "functions" => return self.exec_functions(call_args),
+            "func2str" => return self.exec_func2str(call_args),
+            "str2func" => return self.exec_str2func(call_args, stdout),
+            "input" => {
+                let is_str = call_args
+                    .get(1)
+                    .and_then(|v| v.as_str().ok())
+                    .is_some_and(|s| s.eq_ignore_ascii_case("s"));
+                if is_str {
+                    return Ok(vec![Value::String(String::new())]);
+                }
+                return Ok(vec![Value::empty()]);
+            }
             "narginchk" | "nargoutchk" => {
                 if call_args.len() != 2 {
                     return Err(MatroError::arity(name, "2 (min, max)", call_args.len()));
@@ -4745,6 +4818,207 @@ impl Vm {
     }
 
     #[inline(never)]
+    fn exec_spfun(&mut self, call_args: &[Value], stdout: &mut String) -> Result<Vec<Value>> {
+        if call_args.len() != 2 {
+            return Err(MatroError::arity("spfun", "2 (fun, S)", call_args.len()));
+        }
+        let sp = match &call_args[1] {
+            Value::Sparse(s) => (**s).clone(),
+            other => SparseMatrix::from_dense(&other.to_dense_matrix()?),
+        };
+        let triplets = sp.triplets();
+        if triplets.is_empty() {
+            return Ok(vec![Value::sparse(SparseMatrix::zeros(sp.rows(), sp.cols()))]);
+        }
+        let nz_vals: Vec<f64> = triplets.iter().map(|&(_, _, v)| v).collect();
+        let nz_col = Value::matrix(Matrix::col_vec(nz_vals));
+        let mapped = self.invoke_callable_val(&call_args[0], &[nz_col], stdout)?;
+        let mapped_mat = mapped.to_dense_matrix()?;
+        if mapped_mat.len() != triplets.len() {
+            return Err(MatroError::dimension(format!(
+                "spfun: function returned {} elements, expected {}",
+                mapped_mat.len(),
+                triplets.len()
+            )));
+        }
+        let new_triplets: Vec<(usize, usize, f64)> = triplets
+            .iter()
+            .zip(mapped_mat.data().iter())
+            .filter_map(|(&(r, c, _), &v)| if v != 0.0 { Some((r, c, v)) } else { None })
+            .collect();
+        let out = SparseMatrix::from_triplets(sp.rows(), sp.cols(), &new_triplets)?;
+        Ok(vec![Value::sparse(out)])
+    }
+
+    #[inline(never)]
+    fn exec_mexception(&mut self, call_args: &[Value]) -> Result<Vec<Value>> {
+        if call_args.is_empty() {
+            return Ok(vec![make_mexception("", "", 0)]);
+        }
+        let id = call_args[0].as_str()?.to_string();
+        let msg = if call_args.len() == 1 {
+            String::new()
+        } else if call_args.len() == 2 {
+            call_args[1].as_str()?.to_string()
+        } else {
+            let mut tmp_out = String::new();
+            let mut ctx = matro_intrinsics::IntrinsicContext {
+                stdout: &mut tmp_out,
+                figure: &mut self.figure,
+                rng: &mut self.rng,
+                loader: &mut self.loader,
+            };
+            let formatted = matro_intrinsics::call_intrinsic("sprintf", &call_args[1..], 1, &mut ctx)
+                .transpose()?
+                .and_then(|v| v.into_iter().next())
+                .and_then(|v| v.as_str().ok().map(String::from))
+                .unwrap_or_default();
+            formatted
+        };
+        Ok(vec![make_mexception(&id, &msg, 0)])
+    }
+
+    #[inline(never)]
+    fn exec_lasterror(&mut self, call_args: &[Value]) -> Result<Vec<Value>> {
+        if let Some(arg) = call_args.first() {
+            if let Ok(s) = arg.as_str() {
+                if s.eq_ignore_ascii_case("reset") {
+                    self.last_error = None;
+                }
+            } else if let Value::Struct(map) | Value::Object(ObjectInstance { fields: map, .. }) = arg {
+                let id = map
+                    .get("identifier")
+                    .and_then(|v| v.as_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let msg = map
+                    .get("message")
+                    .and_then(|v| v.as_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                if id.is_empty() && msg.is_empty() {
+                    self.last_error = None;
+                } else {
+                    self.last_error = Some((id, msg, 0));
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        if let Some((id, msg, line)) = &self.last_error {
+            out.insert("message".to_string(), Value::String(msg.clone()));
+            out.insert("identifier".to_string(), Value::String(id.clone()));
+            out.insert("line".to_string(), Value::scalar(*line as f64));
+        } else {
+            out.insert("message".to_string(), Value::String(String::new()));
+            out.insert("identifier".to_string(), Value::String(String::new()));
+            out.insert("line".to_string(), Value::scalar(0.0));
+        }
+        out.insert(
+            "stack".to_string(),
+            Value::StructArray(matro_types::StructArray {
+                rows: 0,
+                cols: 1,
+                items: Vec::new(),
+            }),
+        );
+        Ok(vec![Value::Struct(out)])
+    }
+
+    #[inline(never)]
+    fn exec_functions(&self, call_args: &[Value]) -> Result<Vec<Value>> {
+        if call_args.len() != 1 {
+            return Err(MatroError::arity("functions", "1 (fh)", call_args.len()));
+        }
+        let Value::Closure(cl) = &call_args[0] else {
+            return Err(MatroError::runtime("functions: expected a function handle"));
+        };
+        let proto = self
+            .closures
+            .get(cl.id)
+            .ok_or_else(|| MatroError::runtime("functions: invalid closure handle"))?;
+        let mut info = BTreeMap::new();
+        if let Some(fname) = proto.name.strip_prefix('@') {
+            info.insert("function".to_string(), Value::String(fname.to_string()));
+            info.insert("type".to_string(), Value::String("simple".to_string()));
+            info.insert(
+                "file".to_string(),
+                Value::String(proto.source_file.clone().unwrap_or_default()),
+            );
+        } else if proto.name == "<anonymous>" {
+            let desc = format!("@({})<anonymous>", cl.params.join(","));
+            info.insert("function".to_string(), Value::String(desc));
+            info.insert("type".to_string(), Value::String("anonymous".to_string()));
+            info.insert(
+                "file".to_string(),
+                Value::String(proto.source_file.clone().unwrap_or_default()),
+            );
+            let ws = Value::Struct(cl.captures.clone());
+            info.insert(
+                "workspace".to_string(),
+                Value::Cell(CellArray {
+                    rows: 1,
+                    cols: 1,
+                    data: vec![ws],
+                }),
+            );
+        } else {
+            info.insert("function".to_string(), Value::String(proto.name.clone()));
+            info.insert("type".to_string(), Value::String("nested".to_string()));
+            info.insert(
+                "file".to_string(),
+                Value::String(proto.source_file.clone().unwrap_or_default()),
+            );
+        }
+        Ok(vec![Value::Struct(info)])
+    }
+
+    #[inline(never)]
+    fn exec_func2str(&self, call_args: &[Value]) -> Result<Vec<Value>> {
+        if call_args.len() != 1 {
+            return Err(MatroError::arity("func2str", "1 (fh)", call_args.len()));
+        }
+        let Value::Closure(cl) = &call_args[0] else {
+            return Err(MatroError::runtime("func2str: expected a function handle"));
+        };
+        let proto = self
+            .closures
+            .get(cl.id)
+            .ok_or_else(|| MatroError::runtime("func2str: invalid closure handle"))?;
+        let name = if let Some(fname) = proto.name.strip_prefix('@') {
+            fname.to_string()
+        } else if proto.name == "<anonymous>" {
+            format!("@({})<anonymous>", cl.params.join(","))
+        } else {
+            proto.name.clone()
+        };
+        Ok(vec![Value::String(name)])
+    }
+
+    #[inline(never)]
+    fn exec_str2func(&mut self, call_args: &[Value], stdout: &mut String) -> Result<Vec<Value>> {
+        if call_args.len() != 1 {
+            return Err(MatroError::arity("str2func", "1 (str)", call_args.len()));
+        }
+        let raw = call_args[0].as_str()?.trim();
+        let src = if raw.starts_with('@') {
+            format!("__str2func_res = {raw};")
+        } else {
+            format!("__str2func_res = @{raw};")
+        };
+        let chunk = compile(&src)?;
+        let prev = self.globals.remove("__str2func_res");
+        let mut last = None;
+        let run_res = self.run_frame(&chunk, None, stdout, &mut last);
+        let out = self.globals.remove("__str2func_res");
+        if let Some(p) = prev {
+            self.globals.insert("__str2func_res".to_string(), p);
+        }
+        run_res?;
+        let fh = out.ok_or_else(|| MatroError::runtime("str2func: failed to create handle"))?;
+        Ok(vec![fh])
+    }
+
+    #[inline(never)]
     fn exec_accumarray_closure(
         &mut self,
         call_args: &[Value],
@@ -5269,6 +5543,60 @@ fn exec_optimset(name: &str, args: &[Value]) -> Result<Value> {
     Ok(Value::Struct(map))
 }
 
+fn make_mexception(identifier: &str, message: &str, line: u32) -> Value {
+    let mut fields = BTreeMap::new();
+    fields.insert("identifier".to_string(), Value::String(identifier.to_string()));
+    fields.insert("message".to_string(), Value::String(message.to_string()));
+    fields.insert("line".to_string(), Value::scalar(line as f64));
+    fields.insert(
+        "cause".to_string(),
+        Value::Cell(CellArray {
+            rows: 0,
+            cols: 1,
+            data: Vec::new(),
+        }),
+    );
+    fields.insert(
+        "stack".to_string(),
+        Value::StructArray(matro_types::StructArray {
+            rows: 0,
+            cols: 1,
+            items: Vec::new(),
+        }),
+    );
+    Value::Object(ObjectInstance {
+        class_name: "MException".to_string(),
+        fields,
+    })
+}
+
+fn mexception_to_error(val: &Value) -> MatroError {
+    let map = match val {
+        Value::Object(o) => Some(&o.fields),
+        Value::Struct(m) => Some(m),
+        _ => None,
+    };
+    if let Some(fields) = map {
+        let id = fields
+            .get("identifier")
+            .and_then(|v| v.as_str().ok())
+            .unwrap_or("Matro:Error");
+        let msg = fields
+            .get("message")
+            .and_then(|v| v.as_str().ok())
+            .unwrap_or("Exception thrown");
+        if id.is_empty() {
+            MatroError::runtime(msg)
+        } else {
+            MatroError::custom(id, msg)
+        }
+    } else if let Ok(s) = val.as_str() {
+        MatroError::runtime(s)
+    } else {
+        MatroError::runtime("Exception thrown")
+    }
+}
+
 fn is_vm_or_intrinsic_builtin(name: &str) -> bool {
     matches!(
         name,
@@ -5279,6 +5607,15 @@ fn is_vm_or_intrinsic_builtin(name: &str) -> bool {
             | "cellfun"
             | "structfun"
             | "bsxfun"
+            | "spfun"
+            | "MException"
+            | "throw"
+            | "rethrow"
+            | "lasterror"
+            | "functions"
+            | "func2str"
+            | "str2func"
+            | "input"
             | "load"
             | "save"
             | "exist"

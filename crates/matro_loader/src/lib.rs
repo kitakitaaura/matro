@@ -54,10 +54,22 @@ pub trait Vfs: Debug {
     fn clear(&mut self);
 }
 
+pub fn normalize_preserve_abs(path: &str) -> String {
+    let p = path.trim().replace('\\', "/");
+    let is_abs = p.starts_with('/');
+    let trimmed = p.trim_start_matches("./").trim_start_matches('/').trim_end_matches('/');
+    if is_abs && !trimmed.is_empty() {
+        format!("/{trimmed}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Parent directory of a normalized VFS path (empty string for root-level files).
 pub fn parent_dir(path: &str) -> String {
-    let norm = MemoryVfs::normalize(path);
+    let norm = normalize_preserve_abs(path);
     match norm.rfind('/') {
+        Some(0) => "/".to_string(),
         Some(pos) => norm[..pos].to_string(),
         None => String::new(),
     }
@@ -65,7 +77,7 @@ pub fn parent_dir(path: &str) -> String {
 
 /// Filename stem (without directory or `.m` extension).
 pub fn file_stem(path: &str) -> String {
-    let norm = MemoryVfs::normalize(path);
+    let norm = normalize_preserve_abs(path);
     let base = match norm.rfind('/') {
         Some(pos) => &norm[pos + 1..],
         None => norm.as_str(),
@@ -75,12 +87,14 @@ pub fn file_stem(path: &str) -> String {
 
 /// Join a normalized directory (possibly empty for root) and a relative path.
 pub fn join_dir(dir: &str, rel: &str) -> String {
-    let d = MemoryVfs::normalize(dir);
+    let d = normalize_preserve_abs(dir);
     let r = MemoryVfs::normalize(rel);
     if d.is_empty() {
         r
     } else if r.is_empty() {
         d
+    } else if d == "/" {
+        format!("/{r}")
     } else {
         format!("{d}/{r}")
     }
@@ -368,7 +382,7 @@ impl ModuleLoader {
         self.resolve_cache.clear();
         let parts: Vec<String> = dirs
             .split([':', ';'])
-            .map(MemoryVfs::normalize)
+            .map(normalize_preserve_abs)
             .filter(|s| !s.is_empty())
             .collect();
         for clean in parts.into_iter().rev() {
@@ -381,7 +395,7 @@ impl ModuleLoader {
     pub fn add_path_end(&mut self, dirs: &str) {
         self.resolve_cache.clear();
         for raw in dirs.split([':', ';']) {
-            let clean = MemoryVfs::normalize(raw);
+            let clean = normalize_preserve_abs(raw);
             if !clean.is_empty() && !self.search_paths.contains(&clean) {
                 self.search_paths.push(clean);
             }
@@ -392,7 +406,7 @@ impl ModuleLoader {
     pub fn rm_path(&mut self, dirs: &str) {
         self.resolve_cache.clear();
         for raw in dirs.split([':', ';']) {
-            let clean = MemoryVfs::normalize(raw);
+            let clean = normalize_preserve_abs(raw);
             if !clean.is_empty() {
                 self.search_paths.retain(|d| d != &clean);
             }
@@ -460,7 +474,7 @@ impl ModuleLoader {
         if pdir.is_empty() {
             return false;
         }
-        let cwd = MemoryVfs::normalize(&self.vfs.cwd());
+        let cwd = normalize_preserve_abs(&self.vfs.cwd());
         if !cwd.is_empty() && self.vfs.is_dir(&join_dir(&cwd, &pdir)) {
             return true;
         }
@@ -486,7 +500,7 @@ impl ModuleLoader {
             return None;
         }
         let rel = format!("{pdir}/{member}.m");
-        let cwd = MemoryVfs::normalize(&self.vfs.cwd());
+        let cwd = normalize_preserve_abs(&self.vfs.cwd());
         if !cwd.is_empty() {
             let cwd_path = join_dir(&cwd, &rel);
             if self.vfs.exists(&cwd_path) {
@@ -557,7 +571,7 @@ impl ModuleLoader {
         if self.vfs.is_empty_fs() || name.is_empty() {
             return None;
         }
-        let norm_caller = caller_dir.map(MemoryVfs::normalize);
+        let norm_caller = caller_dir.map(normalize_preserve_abs);
         let key = (norm_caller.clone(), name.to_string());
         if let Some(cached) = self.resolve_cache.get(&key) {
             return cached.clone();
@@ -589,7 +603,7 @@ impl ModuleLoader {
                     });
                 }
             }
-            let cwd = MemoryVfs::normalize(&self.vfs.cwd());
+            let cwd = normalize_preserve_abs(&self.vfs.cwd());
             if !cwd.is_empty() {
                 let p = join_dir(&cwd, &target);
                 if self.vfs.exists(&p) {
@@ -600,7 +614,7 @@ impl ModuleLoader {
                     });
                 }
             }
-            let norm = MemoryVfs::normalize(&target);
+            let norm = normalize_preserve_abs(&target);
             if self.vfs.exists(&norm) {
                 return Some(ResolvedModule {
                     dir: parent_dir(&norm),
@@ -633,7 +647,7 @@ impl ModuleLoader {
         }
 
         // 3. Current working directory
-        let cwd = MemoryVfs::normalize(&self.vfs.cwd());
+        let cwd = normalize_preserve_abs(&self.vfs.cwd());
         if caller_dir != Some(cwd.as_str()) {
             if let Some(m) = self.probe_dir_for_name(&cwd, name) {
                 return Some(m);
@@ -666,7 +680,7 @@ impl ModuleLoader {
                 return Some(p);
             }
         }
-        let cwd = MemoryVfs::normalize(&self.vfs.cwd());
+        let cwd = normalize_preserve_abs(&self.vfs.cwd());
         if !cwd.is_empty() {
             let p = join_dir(&cwd, &rel);
             if self.vfs.exists(&p) {
@@ -695,7 +709,7 @@ impl ModuleLoader {
         } else {
             vec![format!("{name_or_path}.m"), name_or_path.to_string()]
         };
-        let cwd = MemoryVfs::normalize(&self.vfs.cwd());
+        let cwd = normalize_preserve_abs(&self.vfs.cwd());
         for cand in &candidates {
             if !cwd.is_empty() {
                 let cwd_p = join_dir(&cwd, cand);
@@ -704,7 +718,7 @@ impl ModuleLoader {
                 }
             }
             if self.vfs.exists(cand) {
-                return Some(MemoryVfs::normalize(cand));
+                return Some(normalize_preserve_abs(cand));
             }
             for dir in &self.search_paths {
                 if dir.is_empty() {
@@ -712,7 +726,7 @@ impl ModuleLoader {
                 }
                 let joined = format!("{dir}/{cand}");
                 if self.vfs.exists(&joined) {
-                    return Some(MemoryVfs::normalize(&joined));
+                    return Some(normalize_preserve_abs(&joined));
                 }
             }
         }
@@ -721,7 +735,7 @@ impl ModuleLoader {
 
     /// Load and compile a `.m` file at an already-resolved path (cached & stamped with `source_file`).
     pub fn load_module_at(&mut self, resolved_path: &str) -> Result<Option<Chunk>> {
-        let key = MemoryVfs::normalize(resolved_path);
+        let key = normalize_preserve_abs(resolved_path);
         if let Some(chunk) = self.cache.get(&key) {
             return Ok(Some(chunk.clone()));
         }

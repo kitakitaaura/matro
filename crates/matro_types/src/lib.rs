@@ -162,6 +162,7 @@ pub enum MatroError {
     Syntax { span: Span, message: String },
     Compile { span: Span, message: String },
     Runtime { message: String },
+    Custom { identifier: String, message: String },
     Dimension { message: String },
     Index { message: String },
     Undefined { name: String },
@@ -181,6 +182,13 @@ impl MatroError {
 
     pub fn runtime(msg: impl Into<String>) -> Self {
         Self::Runtime { message: msg.into() }
+    }
+
+    pub fn custom(identifier: impl Into<String>, msg: impl Into<String>) -> Self {
+        Self::Custom {
+            identifier: identifier.into(),
+            message: msg.into(),
+        }
     }
 
     pub fn dimension(msg: impl Into<String>) -> Self {
@@ -223,11 +231,12 @@ impl MatroError {
         }
     }
 
-    pub fn identifier(&self) -> &'static str {
+    pub fn identifier(&self) -> &str {
         match self {
             Self::Syntax { .. } => "Matro:SyntaxError",
             Self::Compile { .. } => "Matro:CompileError",
             Self::Runtime { .. } => "Matro:RuntimeError",
+            Self::Custom { identifier, .. } => identifier.as_str(),
             Self::Dimension { .. } => "Matro:DimensionMismatch",
             Self::Index { .. } => "Matro:IndexOutOfBounds",
             Self::Undefined { .. } => "Matro:UndefinedIdentifier",
@@ -241,6 +250,7 @@ impl MatroError {
     pub fn bare_message(&self) -> String {
         match self {
             Self::WithLine { inner, .. } => inner.bare_message(),
+            Self::Custom { message, .. } => message.clone(),
             other => other.to_string(),
         }
     }
@@ -252,6 +262,7 @@ impl fmt::Display for MatroError {
             Self::Syntax { span, message } => write!(f, "Syntax error at {span}: {message}"),
             Self::Compile { span, message } => write!(f, "Compile error at {span}: {message}"),
             Self::Runtime { message } => write!(f, "Runtime error: {message}"),
+            Self::Custom { identifier, message } => write!(f, "{identifier}: {message}"),
             Self::Dimension { message } => write!(f, "Dimension mismatch: {message}"),
             Self::Index { message } => write!(f, "Index error: {message}"),
             Self::Undefined { name } => write!(f, "Undefined variable or function '{name}'"),

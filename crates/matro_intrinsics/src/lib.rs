@@ -12,6 +12,7 @@ mod extras;
 pub mod fs_media;
 mod image_proc;
 pub mod interp;
+mod linalg_ext;
 pub mod modern_types;
 mod opt_ctrl;
 mod opt_ext;
@@ -102,12 +103,17 @@ pub fn call_intrinsic(
         }),
         "ischar" => fn_val_pred("ischar", args, |v| matches!(v, Value::String(_))),
         "iscell" => fn_val_pred("iscell", args, |v| matches!(v, Value::Cell(_))),
+        "iscellstr" => linalg_ext::fn_iscellstr(args),
         "isstruct" => fn_val_pred("isstruct", args, |v| {
             matches!(v, Value::Struct(_) | Value::StructArray(_))
         }),
+        "ishandle" => linalg_ext::fn_ishandle(args),
+        "isobject" => linalg_ext::fn_isobject(args),
+        "istimetable" => linalg_ext::fn_istimetable(args),
         "bitand" => fn_bit_bin("bitand", args, |a, b| a & b),
         "bitor" => fn_bit_bin("bitor", args, |a, b| a | b),
         "bitxor" => fn_bit_bin("bitxor", args, |a, b| a ^ b),
+        "bitcmp" => linalg_ext::fn_bitcmp(args),
         "bitshift" => fn_bitshift(args),
         "bitget" => fn_bitget(args),
         "bitset" => fn_bitset(args),
@@ -134,6 +140,14 @@ pub fn call_intrinsic(
         "ndgrid" => fn_ndgrid(args, nargout),
         "diag" => fn_diag(args),
         "magic" => fn_magic(args),
+        "toeplitz" => linalg_ext::fn_toeplitz(args),
+        "hankel" => linalg_ext::fn_hankel(args),
+        "vander" => linalg_ext::fn_vander(args),
+        "compan" => linalg_ext::fn_compan(args),
+        "hilb" => linalg_ext::fn_hilb(args),
+        "invhilb" => linalg_ext::fn_invhilb(args),
+        "pascal" => linalg_ext::fn_pascal(args),
+        "gallery" => linalg_ext::fn_gallery(args),
         "cell" => fn_cell(args),
         "struct" => fn_struct(args),
         "sparse" => fn_sparse(args),
@@ -144,6 +158,7 @@ pub fn call_intrinsic(
         "full" => fn_full(args),
         "issparse" => fn_issparse(args),
         "nnz" => fn_nnz(args),
+        "nzmax" => linalg_ext::fn_nzmax(args),
         "pcg" => fn_pcg(args),
 
         // Struct / object / string / type helpers
@@ -199,14 +214,22 @@ pub fn call_intrinsic(
         "logm" => fn_unary_mat(name, args, |m| m.logm()),
         "sqrtm" => fn_unary_mat(name, args, |m| m.sqrtm()),
         "lu" => fn_lu(args, nargout),
+        "ilu" => linalg_ext::fn_ilu(args, nargout),
         "qr" => fn_qr(args, nargout),
         "svd" => fn_svd(args, nargout),
         "eig" => fn_eig(args, nargout),
         "eigs" => sparse_eig::fn_eigs(args, nargout, ctx.rng),
         "svds" => sparse_eig::fn_svds(args, nargout, ctx.rng),
         "chol" => fn_chol(args, nargout),
+        "ichol" => linalg_ext::fn_ichol(args),
+        "hess" => linalg_ext::fn_hess(args, nargout),
+        "schur" => linalg_ext::fn_schur(args, nargout),
+        "balance" => linalg_ext::fn_balance(args, nargout),
         "rank" => fn_rank(args),
         "cond" => fn_cond(args),
+        "rcond" => linalg_ext::fn_rcond(args),
+        "bandwidth" => linalg_ext::fn_bandwidth(args, nargout),
+        "del2" => linalg_ext::fn_del2(args),
         "trace" => fn_trace(args),
         "dot" => fn_dot(args),
         "norm" => fn_norm(args),
@@ -296,9 +319,12 @@ pub fn call_intrinsic(
         }),
         "rem" => fn_elem2(name, args, |a, b| a % b),
 
-        // Output
+        // Output & session commands
         "disp" => fn_disp(args, ctx.stdout),
         "fprintf" | "printf" => fn_fprintf(args, nargout, ctx.stdout),
+        "format" => Ok(vec![]),
+        "clc" => Ok(vec![]),
+        "pause" => Ok(vec![]),
 
         // Statistics toolbox
         "std" => stats::fn_std_var("std", args, nargout, true),
@@ -538,6 +564,32 @@ pub fn call_intrinsic(
         "acosd" => base_ext::fn_elem_real(name, args, |x| x.acos().to_degrees()),
         "atand" => base_ext::fn_elem_real(name, args, |x| x.atan().to_degrees()),
         "atan2d" => base_ext::fn_elem_real2(name, args, |y, x| y.atan2(x).to_degrees()),
+        "sec" => base_ext::fn_unary_c(name, args, |z| Complex::ONE / z.cos()),
+        "csc" => base_ext::fn_unary_c(name, args, |z| Complex::ONE / z.sin()),
+        "cot" => base_ext::fn_unary_c(name, args, |z| z.cos() / z.sin()),
+        "secd" => base_ext::fn_elem_real(name, args, |x| 1.0 / base_ext::cosd_f(x)),
+        "cscd" => base_ext::fn_elem_real(name, args, |x| 1.0 / base_ext::sind_f(x)),
+        "cotd" => base_ext::fn_elem_real(name, args, |x| base_ext::cosd_f(x) / base_ext::sind_f(x)),
+        "asec" => base_ext::fn_unary_c(name, args, |z| (Complex::ONE / z).acos()),
+        "acsc" => base_ext::fn_unary_c(name, args, |z| (Complex::ONE / z).asin()),
+        "acot" => base_ext::fn_unary_c(name, args, |z| {
+            if z.re == 0.0 && z.im == 0.0 {
+                Complex::from_real(std::f64::consts::FRAC_PI_2)
+            } else {
+                (Complex::ONE / z).atan()
+            }
+        }),
+        "asecd" => base_ext::fn_elem_real(name, args, |x| (1.0 / x).acos().to_degrees()),
+        "acscd" => base_ext::fn_elem_real(name, args, |x| (1.0 / x).asin().to_degrees()),
+        "acotd" => base_ext::fn_elem_real(name, args, |x| {
+            if x == 0.0 { 90.0 } else { (1.0 / x).atan().to_degrees() }
+        }),
+        "sech" => base_ext::fn_unary_c(name, args, |z| Complex::ONE / base_ext::c_cosh(z)),
+        "csch" => base_ext::fn_unary_c(name, args, |z| Complex::ONE / base_ext::c_sinh(z)),
+        "coth" => base_ext::fn_unary_c(name, args, |z| base_ext::c_cosh(z) / base_ext::c_sinh(z)),
+        "asech" => base_ext::fn_unary_c(name, args, |z| base_ext::c_acosh(Complex::ONE / z)),
+        "acsch" => base_ext::fn_unary_c(name, args, |z| base_ext::c_asinh(Complex::ONE / z)),
+        "acoth" => base_ext::fn_unary_c(name, args, |z| base_ext::c_atanh(Complex::ONE / z)),
         "deg2rad" => base_ext::fn_elem_real(name, args, f64::to_radians),
         "rad2deg" => base_ext::fn_elem_real(name, args, f64::to_degrees),
         "cart2pol" => base_ext::fn_cart2pol(args, nargout),
@@ -608,6 +660,7 @@ pub fn call_intrinsic(
         "lcm" => base_ext::fn_gcd_lcm(args, true),
         "isprime" => base_ext::fn_isprime(args),
         "primes" => base_ext::fn_primes(args),
+        "factor" => linalg_ext::fn_factor(args),
         "isscalar" | "isvector" | "isrow" | "iscolumn" | "ismatrix" => {
             base_ext::fn_shape_pred(name, args)
         }
@@ -656,6 +709,7 @@ pub fn call_intrinsic(
         "rdivide" => tables::fn_binop_c("rdivide", args, |a, b| a / b),
         "ldivide" => tables::fn_binop_c("ldivide", args, |a, b| b / a),
         "power" => tables::fn_binop_c("power", args, Complex::powc),
+        "mtimes" | "mrdivide" | "mldivide" | "mpower" => linalg_ext::fn_matrix_op(name, args),
         "eq" => tables::fn_binop_cmp("eq", args, |a, b| a == b),
         "ne" => tables::fn_binop_cmp("ne", args, |a, b| a != b),
         "lt" => tables::fn_binop_cmp("lt", args, |a, b| a < b),
@@ -675,6 +729,10 @@ pub fn call_intrinsic(
         "scatter" => fn_plot(PlotKind::Scatter, args, nargout, ctx.figure, false, false),
         "bar" => fn_plot(PlotKind::Bar, args, nargout, ctx.figure, false, false),
         "stem" => fn_plot(PlotKind::Stem, args, nargout, ctx.figure, false, false),
+        "errorbar" => fn_errorbar(args, nargout, ctx.figure),
+        "fill" | "patch" => fn_fill_plot(name, args, nargout, ctx.figure),
+        "hist" => fn_hist(args, nargout, ctx.figure),
+        "spy" => fn_spy(args, ctx.figure),
         "histogram" => extras::fn_histogram(args, ctx.figure),
         "contour" => extras::fn_contour(args, ctx.figure),
         "imagesc" => fn_imagesc(args, ctx.figure),
@@ -688,6 +746,12 @@ pub fn call_intrinsic(
         "xlim" => fn_axis_lim("xlim", args, &mut ctx.figure.panel_mut().xlim),
         "ylim" => fn_axis_lim("ylim", args, &mut ctx.figure.panel_mut().ylim),
         "zlim" => fn_axis_lim("zlim", args, &mut ctx.figure.panel_mut().zlim),
+        "axis" => fn_axis(args, nargout, ctx.figure),
+        "colorbar" => fn_colorbar(args, ctx.figure),
+        "colormap" => fn_colormap(args, nargout, ctx.figure),
+        "parula" | "viridis" | "jet" | "turbo" | "gray" | "hot" | "cool" | "bone" => {
+            fn_colormap_palette(name, args)
+        }
         "gcf" => fs_media::fn_gcf(args),
         "gca" => fs_media::fn_gca(args, ctx.figure),
         "set" => fs_media::fn_set(args, ctx.figure),
@@ -761,9 +825,29 @@ fn as_usize(v: &Value, ctx: &str) -> Result<usize> {
     Ok(s.round() as usize)
 }
 
+fn is_matlab_err_id(s: &str) -> bool {
+    s.contains(':')
+        && !s.contains('%')
+        && !s.contains(char::is_whitespace)
+        && s.split(':').all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
 fn fn_error(args: &[Value]) -> Result<Vec<Value>> {
     if args.is_empty() {
         return Err(MatroError::runtime("Error raised"));
+    }
+    if args.len() >= 2 {
+        if let Ok(id) = args[0].as_str() {
+            if is_matlab_err_id(id) {
+                let msg = format_printf(&args[1..])?;
+                return Err(MatroError::custom(id, msg));
+            }
+        }
     }
     let msg = format_printf(args)?;
     Err(MatroError::runtime(msg))
@@ -789,7 +873,7 @@ pub fn is_intrinsic(name: &str) -> bool {
     matches!(
         name,
         "pi" | "eps" | "inf" | "Inf" | "nan" | "NaN" | "realmax" | "realmin" | "intmax" | "intmin"
-            | "true" | "false" | "disp" | "clc" | "format" | "tic" | "toc" | "error" | "assert"
+            | "true" | "false" | "disp" | "clc" | "format" | "pause" | "tic" | "toc" | "error" | "assert"
             | "warning" | "isreal" | "isempty" | "isnan" | "isinf" | "isfinite" | "issparse"
             | "isscalar" | "isvector" | "isrow" | "iscolumn" | "ismatrix" | "isnumeric"
             | "islogical" | "ischar" | "isstring" | "iscell" | "iscellstr" | "isstruct"
@@ -811,11 +895,11 @@ pub fn is_intrinsic(name: &str) -> bool {
             | "log2" | "log10" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2"
             | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "sind" | "cosd" | "tand"
             | "asind" | "acosd" | "atand" | "atan2d" | "sec" | "csc" | "cot" | "secd" | "cscd"
-            | "cotd" | "asec" | "acsc" | "acot" | "sech" | "csch" | "coth" | "asech" | "acsch"
+            | "cotd" | "asec" | "acsc" | "acot" | "asecd" | "acscd" | "acotd" | "sech" | "csch" | "coth" | "asech" | "acsch"
             | "acoth" | "floor" | "ceil" | "round" | "fix" | "sign" | "mod" | "rem" | "hypot"
             | "nthroot" | "pow2" | "nextpow2" | "sinc" | "deg2rad" | "rad2deg" | "wrapToPi"
-            | "wrapTo2Pi" | "wrapTo180" | "wrapTo360" | "unwrap" | "inv" | "det" | "lu" | "qr"
-            | "svd" | "eig" | "eigs" | "svds" | "chol" | "pinv" | "rank" | "cond" | "rcond"
+            | "wrapTo2Pi" | "wrapTo180" | "wrapTo360" | "unwrap" | "inv" | "det" | "lu" | "ilu" | "qr"
+            | "svd" | "eig" | "eigs" | "svds" | "chol" | "ichol" | "pinv" | "rank" | "cond" | "rcond"
             | "null" | "orth" | "rref" | "trace" | "dot" | "cross" | "norm" | "vecnorm"
             | "expm" | "logm" | "sqrtm" | "schur" | "hess" | "balance" | "issymmetric"
             | "ishermitian" | "bandwidth" | "fft" | "ifft" | "fft2" | "ifft2" | "fftn" | "ifftn"
@@ -873,10 +957,11 @@ pub fn is_intrinsic(name: &str) -> bool {
             | "bwlabel" | "regionprops" | "fspecial" | "imerode" | "imdilate" | "imopen"
             | "imclose" | "mat2gray" | "imcomplement" | "imbinarize" | "imadjust" | "graythresh"
             | "imhist" | "im2double" | "im2uint8" | "imread" | "imwrite" | "audioread"
-            | "audiowrite" | "plot" | "plot3" | "scatter" | "bar" | "hist" | "histogram"
+            | "audiowrite" | "plot" | "plot3" | "scatter" | "bar" | "stem" | "errorbar" | "fill" | "patch" | "hist" | "histogram"
             | "contour" | "surf" | "mesh" | "quiver" | "imagesc" | "figure" | "subplot"
             | "hold" | "grid" | "title" | "xlabel" | "ylabel" | "zlabel" | "legend" | "xlim"
             | "ylim" | "zlim" | "colorbar" | "colormap" | "axis" | "clf" | "gca" | "gcf"
+            | "parula" | "viridis" | "jet" | "turbo" | "gray" | "hot" | "cool" | "bone"
             | "get" | "set" | "dir" | "pwd" | "cd" | "mkdir" | "rmdir" | "delete" | "copyfile"
             | "movefile" | "isfile" | "isfolder" | "fullfile" | "fileparts" | "plus" | "minus"
             | "times" | "rdivide" | "ldivide" | "power" | "mtimes" | "mrdivide" | "mldivide"
@@ -2562,6 +2647,32 @@ fn fn_lu(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
         .get(1)
         .and_then(value_as_text)
         .is_some_and(|s| s.eq_ignore_ascii_case("vector"));
+    if let Value::Sparse(sp) = &args[0] {
+        if sp.rows() == sp.cols() {
+            let (l, u, perm) = sp.lu_sparse()?;
+            let n = perm.len();
+            if nargout >= 3 {
+                let p_val = if vec_perm {
+                    Value::matrix(Matrix::col_vec(
+                        perm.iter().map(|&idx| (idx + 1) as f64).collect(),
+                    ))
+                } else {
+                    let p_trips: Vec<(usize, usize, f64)> =
+                        perm.iter().enumerate().map(|(i, &j)| (i, j, 1.0)).collect();
+                    Value::sparse(SparseMatrix::from_triplets(n, n, &p_trips)?)
+                };
+                return Ok(vec![Value::sparse(l), Value::sparse(u), p_val]);
+            } else if nargout == 2 {
+                let pt_trips: Vec<(usize, usize, f64)> =
+                    perm.iter().enumerate().map(|(i, &j)| (j, i, 1.0)).collect();
+                let pt = SparseMatrix::from_triplets(n, n, &pt_trips)?;
+                let pl = pt.matmul_sparse(&l)?;
+                return Ok(vec![Value::sparse(pl), Value::sparse(u)]);
+            } else {
+                return ok1(Value::sparse(u));
+            }
+        }
+    }
     let (l, u, p) = args[0].to_dense_matrix()?.lu()?;
     if nargout >= 3 {
         let p_out = if vec_perm {
@@ -4679,10 +4790,431 @@ fn fn_plot(
 }
 
 fn fn_imagesc(args: &[Value], figure: &mut PlotFigure) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("imagesc", "1", args.len()));
+    match args.len() {
+        1 => {
+            figure.panel_mut().set_heatmap(&args[0].to_dense_matrix()?);
+        }
+        2 => {
+            figure.panel_mut().set_heatmap(&args[0].to_dense_matrix()?);
+        }
+        3 | 4 => {
+            let xm = args[0].to_dense_matrix()?;
+            let ym = args[1].to_dense_matrix()?;
+            let cm = args[2].to_dense_matrix()?;
+            let x_ext = if !xm.is_empty() {
+                let x0 = xm.data().first().copied().unwrap_or(1.0);
+                let x1 = xm.data().last().copied().unwrap_or(cm.cols() as f64);
+                Some((x0.min(x1), x0.max(x1)))
+            } else {
+                None
+            };
+            let y_ext = if !ym.is_empty() {
+                let y0 = ym.data().first().copied().unwrap_or(1.0);
+                let y1 = ym.data().last().copied().unwrap_or(cm.rows() as f64);
+                Some((y0.min(y1), y0.max(y1)))
+            } else {
+                None
+            };
+            figure
+                .panel_mut()
+                .set_heatmap_with_extents(&cm, x_ext, y_ext);
+        }
+        n => return Err(MatroError::arity("imagesc", "1 to 4", n)),
     }
-    figure.panel_mut().set_heatmap(args[0].as_matrix()?);
+    Ok(vec![])
+}
+
+fn fn_axis(args: &[Value], nargout: usize, figure: &mut PlotFigure) -> Result<Vec<Value>> {
+    let panel = figure.panel_mut();
+    if args.is_empty() {
+        if nargout >= 1 {
+            let (x0, x1) = panel.xlim.unwrap_or_else(|| {
+                let mut lo = f64::INFINITY;
+                let mut hi = f64::NEG_INFINITY;
+                for s in &panel.series {
+                    for &x in &s.x {
+                        if x.is_finite() {
+                            lo = lo.min(x);
+                            hi = hi.max(x);
+                        }
+                    }
+                }
+                if lo.is_finite() && hi.is_finite() { (lo, hi) } else { (0.0, 1.0) }
+            });
+            let (y0, y1) = panel.ylim.unwrap_or_else(|| {
+                let mut lo = f64::INFINITY;
+                let mut hi = f64::NEG_INFINITY;
+                for s in &panel.series {
+                    for &y in &s.y {
+                        if y.is_finite() {
+                            lo = lo.min(y);
+                            hi = hi.max(y);
+                        }
+                    }
+                }
+                if lo.is_finite() && hi.is_finite() { (lo, hi) } else { (0.0, 1.0) }
+            });
+            return ok1(Value::matrix(Matrix::row_vec(vec![x0, x1, y0, y1])));
+        }
+        return Ok(vec![]);
+    }
+    for a in args {
+        match a {
+            Value::String(s) => match s.to_ascii_lowercase().as_str() {
+                "equal" | "square" => panel.axis_equal = true,
+                "tight" => {
+                    panel.axis_tight = true;
+                    panel.xlim = None;
+                    panel.ylim = None;
+                }
+                "image" => {
+                    panel.axis_equal = true;
+                    panel.axis_tight = true;
+                }
+                "normal" | "auto" => {
+                    panel.axis_equal = false;
+                    panel.axis_tight = false;
+                    panel.xlim = None;
+                    panel.ylim = None;
+                }
+                "off" => panel.axis_off = true,
+                "on" => panel.axis_off = false,
+                "xy" | "ij" | "vis3d" | "fill" | "manual" | "padded" => {}
+                other => {
+                    return Err(MatroError::runtime(format!("axis: unknown option '{other}'")));
+                }
+            },
+            other => {
+                let m = other.to_dense_matrix()?;
+                if m.len() == 4 || m.len() == 6 {
+                    panel.xlim = Some((m.data()[0], m.data()[1]));
+                    panel.ylim = Some((m.data()[2], m.data()[3]));
+                    if m.len() == 6 {
+                        panel.zlim = Some((m.data()[4], m.data()[5]));
+                    }
+                } else {
+                    return Err(MatroError::dimension(
+                        "axis: limits vector must have 4 or 6 elements",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(vec![])
+}
+
+fn fn_colorbar(args: &[Value], figure: &mut PlotFigure) -> Result<Vec<Value>> {
+    let panel = figure.panel_mut();
+    if let Some(first) = args.first() {
+        if let Ok(s) = first.as_str() {
+            let low = s.to_ascii_lowercase();
+            if low == "off" || low == "hide" {
+                panel.show_colorbar = false;
+                return Ok(vec![]);
+            }
+        }
+    }
+    panel.show_colorbar = true;
+    Ok(vec![])
+}
+
+fn colormap_matrix(name: &str, n: usize) -> Matrix {
+    let n = n.max(1);
+    let mut m = Matrix::zeros(n, 3);
+    for i in 0..n {
+        let t = if n == 1 { 0.5 } else { i as f64 / (n - 1) as f64 };
+        let (r, g, b) = match name.to_ascii_lowercase().as_str() {
+            "gray" | "grey" => (t, t, t),
+            "hot" => ((3.0 * t).clamp(0.0, 1.0), (3.0 * t - 1.0).clamp(0.0, 1.0), (3.0 * t - 2.0).clamp(0.0, 1.0)),
+            "cool" => (t, 1.0 - t, 1.0),
+            "bone" => (
+                (7.0 * t + (3.0 * t - 2.0).clamp(0.0, 1.0)) / 8.0,
+                (7.0 * t + (3.0 * t - 1.0).clamp(0.0, 1.0)) / 8.0,
+                (7.0 * t + (3.0 * t).clamp(0.0, 1.0)) / 8.0,
+            ),
+            "jet" | "turbo" => (
+                (1.5 - (4.0 * t - 3.0).abs()).clamp(0.0, 1.0),
+                (1.5 - (4.0 * t - 2.0).abs()).clamp(0.0, 1.0),
+                (1.5 - (4.0 * t - 1.0).abs()).clamp(0.0, 1.0),
+            ),
+            "parula" => (
+                (0.24 + 0.74 * t.powf(1.4)).clamp(0.0, 1.0),
+                (0.15 + 0.80 * (t * 1.15).min(1.0)).clamp(0.0, 1.0),
+                (0.66 * (1.0 - t).powf(0.8) + 0.14 * t).clamp(0.0, 1.0),
+            ),
+            _ => {
+                // viridis
+                let r = (0.267 + t * (0.005 + t * 0.721)).clamp(0.0, 1.0);
+                let g = (0.005 + t * (0.873 - t * 0.03)).clamp(0.0, 1.0);
+                let b = (0.329 + t * (0.8 - t * 0.985)).clamp(0.0, 1.0);
+                (r, g, b)
+            }
+        };
+        m.set(i, 0, r);
+        m.set(i, 1, g);
+        m.set(i, 2, b);
+    }
+    m
+}
+
+fn fn_colormap_palette(name: &str, args: &[Value]) -> Result<Vec<Value>> {
+    let n = if args.is_empty() {
+        64
+    } else if args.len() == 1 {
+        as_usize(&args[0], name)?.max(1)
+    } else {
+        return Err(MatroError::arity(name, "0 or 1", args.len()));
+    };
+    ok1(Value::matrix(colormap_matrix(name, n)))
+}
+
+fn fn_colormap(args: &[Value], nargout: usize, figure: &mut PlotFigure) -> Result<Vec<Value>> {
+    let panel = figure.panel_mut();
+    if let Some(first) = args.first() {
+        if let Ok(s) = first.as_str() {
+            let low = s.to_ascii_lowercase();
+            panel.colormap = if low == "default" {
+                "parula".to_string()
+            } else {
+                low
+            };
+        }
+    }
+    if nargout >= 1 {
+        return ok1(Value::matrix(colormap_matrix(&panel.colormap, 64)));
+    }
+    Ok(vec![])
+}
+
+fn fn_hist(args: &[Value], nargout: usize, figure: &mut PlotFigure) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity("hist", "1 or 2", args.len()));
+    }
+    let ym = args[0].to_dense_matrix()?;
+    let vals: Vec<f64> = ym.data().iter().copied().filter(|x| x.is_finite()).collect();
+    if vals.is_empty() {
+        if nargout >= 2 {
+            return Ok(vec![
+                Value::matrix(Matrix::zeros(1, 0)),
+                Value::matrix(Matrix::zeros(1, 0)),
+            ]);
+        }
+        return ok1(Value::matrix(Matrix::zeros(1, 0)));
+    }
+
+    let centers: Vec<f64> = if let Some(b) = args.get(1) {
+        let bm = b.to_dense_matrix()?;
+        if bm.len() == 1 {
+            let m = (bm.data()[0].round() as usize).max(1);
+            let lo = vals.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            if (hi - lo).abs() < 1e-15 {
+                let start = lo - (m as f64 - 1.0) * 0.5;
+                (0..m).map(|i| start + i as f64).collect()
+            } else {
+                let step = (hi - lo) / m as f64;
+                (0..m).map(|i| lo + (i as f64 + 0.5) * step).collect()
+            }
+        } else {
+            bm.data().to_vec()
+        }
+    } else {
+        let m = 10usize;
+        let lo = vals.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if (hi - lo).abs() < 1e-15 {
+            (0..m).map(|i| lo - 4.5 + i as f64).collect()
+        } else {
+            let step = (hi - lo) / m as f64;
+            (0..m).map(|i| lo + (i as f64 + 0.5) * step).collect()
+        }
+    };
+
+    let nb = centers.len().max(1);
+    let mut counts = vec![0.0; nb];
+    for &v in &vals {
+        // Assign to nearest bin center (MATLAB hist semantics)
+        let mut best_idx = 0usize;
+        let mut best_dist = (v - centers[0]).abs();
+        for (i, &c) in centers.iter().enumerate().skip(1) {
+            let d = (v - c).abs();
+            if d < best_dist {
+                best_dist = d;
+                best_idx = i;
+            }
+        }
+        counts[best_idx] += 1.0;
+    }
+
+    if nargout == 0 {
+        figure
+            .panel_mut()
+            .add_series(PlotKind::Bar, centers, counts, None);
+        return Ok(vec![]);
+    }
+    if nargout == 1 {
+        return ok1(Value::matrix(Matrix::row_vec(counts)));
+    }
+    Ok(vec![
+        Value::matrix(Matrix::row_vec(counts)),
+        Value::matrix(Matrix::row_vec(centers)),
+    ])
+}
+
+fn fn_spy(args: &[Value], figure: &mut PlotFigure) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity("spy", "1 or 2", args.len()));
+    }
+    let style = args.get(1).and_then(|v| v.as_str().ok());
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    let (nrows, ncols) = match &args[0] {
+        Value::Sparse(sp) => {
+            for (r, c, v) in sp.triplets() {
+                if v != 0.0 {
+                    xs.push((c + 1) as f64);
+                    ys.push(-((r + 1) as f64));
+                }
+            }
+            (sp.rows(), sp.cols())
+        }
+        other => {
+            let m = other.to_dense_matrix()?;
+            for c in 0..m.cols() {
+                for r in 0..m.rows() {
+                    if !m.get_c(r, c).is_zero() {
+                        xs.push((c + 1) as f64);
+                        ys.push(-((r + 1) as f64));
+                    }
+                }
+            }
+            (m.rows(), m.cols())
+        }
+    };
+    let nnz = xs.len();
+    let panel = figure.panel_mut();
+    panel.add_series(PlotKind::Scatter, xs, ys, style);
+    panel.xlim = Some((0.0, (ncols + 1) as f64));
+    panel.ylim = Some((-((nrows + 1) as f64), 0.0));
+    panel.xlabel = format!("nz = {nnz}");
+    Ok(vec![])
+}
+
+fn fn_errorbar(args: &[Value], nargout: usize, figure: &mut PlotFigure) -> Result<Vec<Value>> {
+    if args.len() < 2 {
+        return Err(MatroError::arity("errorbar", ">= 2", args.len()));
+    }
+    let panel_idx = figure.active;
+    let mut num_args = Vec::new();
+    let mut style: Option<&str> = None;
+    let mut props: Vec<(&str, &Value)> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if let Ok(k) = args[i].as_str() {
+            if is_plot_prop_key(k) && i + 1 < args.len() {
+                props.push((k, &args[i + 1]));
+                i += 2;
+                continue;
+            }
+            style = Some(k);
+            i += 1;
+            continue;
+        }
+        num_args.push(args[i].to_dense_matrix()?.data().to_vec());
+        i += 1;
+    }
+    let (x, y, err) = match num_args.len() {
+        2 => {
+            let y = num_args.remove(0);
+            let e = num_args.remove(0);
+            let x: Vec<f64> = (1..=y.len()).map(|k| k as f64).collect();
+            (x, y, e)
+        }
+        3 => {
+            let x = num_args.remove(0);
+            let y = num_args.remove(0);
+            let e = num_args.remove(0);
+            (x, y, e)
+        }
+        4 => {
+            let x = num_args.remove(0);
+            let y = num_args.remove(0);
+            let neg = num_args.remove(0);
+            let pos = num_args.remove(0);
+            let e: Vec<f64> = neg
+                .iter()
+                .zip(pos.iter())
+                .map(|(a, b)| 0.5 * (a.abs() + b.abs()))
+                .collect();
+            (x, y, e)
+        }
+        n => return Err(MatroError::arity("errorbar", "2, 3, or 4 numeric arrays", n)),
+    };
+    let panel = figure.panel_mut();
+    panel.add_errorbar(x, y, err, style);
+    let si = panel.series.len() - 1;
+    for (k, val) in props {
+        if let Some(ser) = panel.series.get_mut(si) {
+            match k.to_ascii_lowercase().as_str() {
+                "color" => ser.color = fs_media::parse_color_val(val)?,
+                "linewidth" => ser.line_width = val.as_scalar()?.max(0.2),
+                "displayname" => ser.label = Some(val.as_str()?.to_string()),
+                _ => {}
+            }
+        }
+    }
+    if nargout >= 1 {
+        return Ok(vec![fs_media::make_line_handle(panel_idx, si)]);
+    }
+    Ok(vec![])
+}
+
+fn fn_fill_plot(
+    name: &str,
+    args: &[Value],
+    nargout: usize,
+    figure: &mut PlotFigure,
+) -> Result<Vec<Value>> {
+    if args.len() < 3 {
+        return Err(MatroError::arity(name, ">= 3 (x, y, c)", args.len()));
+    }
+    let panel_idx = figure.active;
+    let panel = figure.panel_mut();
+    let orig_hold = panel.hold;
+    let mut i = 0;
+    let mut first = true;
+    let mut last_si = None;
+    while i + 2 < args.len() {
+        if let Ok(k) = args[i].as_str() {
+            if is_plot_prop_key(k) || k.eq_ignore_ascii_case("facecolor") || k.eq_ignore_ascii_case("edgecolor") {
+                i += 2;
+                continue;
+            }
+        }
+        let x = args[i].to_dense_matrix()?.data().to_vec();
+        let y = args[i + 1].to_dense_matrix()?.data().to_vec();
+        let color_val = &args[i + 2];
+        i += 3;
+        if !first {
+            panel.hold = true;
+        }
+        let style_str = color_val.as_str().ok();
+        panel.add_series(PlotKind::Fill, x, y, style_str);
+        let si = panel.series.len() - 1;
+        if style_str.is_none() {
+            if let Ok(col) = fs_media::parse_color_val(color_val) {
+                panel.series[si].color = col;
+            }
+        }
+        last_si = Some(si);
+        first = false;
+    }
+    panel.hold = orig_hold;
+    if nargout >= 1 {
+        if let Some(si) = last_si {
+            return Ok(vec![fs_media::make_line_handle(panel_idx, si)]);
+        }
+    }
     Ok(vec![])
 }
 

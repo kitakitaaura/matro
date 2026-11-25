@@ -348,6 +348,20 @@ pub(crate) fn try_object_unop(
             )));
         }
     }
+    if op == "transpose" || op == "ctranspose" {
+        if let Some(du) = is_obj_of(v, "duration") {
+            let su = secs_of(du)?.transpose();
+            let mut fields = du.fields.clone();
+            fields.insert("Seconds".to_string(), Value::matrix(su));
+            return Ok(Some(make_obj("duration", fields)));
+        }
+        if let Some(dt) = is_obj_of(v, "datetime") {
+            let se = secs_of(dt)?.transpose();
+            let mut fields = dt.fields.clone();
+            fields.insert("EpochSec".to_string(), Value::matrix(se));
+            return Ok(Some(make_obj("datetime", fields)));
+        }
+    }
     let cname = match v {
         Value::Object(o) => Some(o.class_name.clone()),
         Value::Handle(h) => Some(h.class_name.clone()),

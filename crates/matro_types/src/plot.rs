@@ -9,6 +9,8 @@ pub enum PlotKind {
     Scatter,
     Bar,
     Stem,
+    ErrorBar,
+    Fill,
 }
 
 impl PlotKind {
@@ -18,6 +20,8 @@ impl PlotKind {
             Self::Scatter => "scatter",
             Self::Bar => "bar",
             Self::Stem => "stem",
+            Self::ErrorBar => "errorbar",
+            Self::Fill => "fill",
         }
     }
 }
@@ -35,6 +39,7 @@ pub struct PlotSeries {
     pub kind: PlotKind,
     pub x: Vec<f64>,
     pub y: Vec<f64>,
+    pub err: Vec<f64>,
     pub color: String,
     pub dashed: bool,
     pub line_width: f64,
@@ -46,6 +51,8 @@ pub struct HeatmapData {
     pub rows: usize,
     pub cols: usize,
     pub data: Vec<f64>, // row-major
+    pub x_extent: Option<(f64, f64)>,
+    pub y_extent: Option<(f64, f64)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +96,11 @@ pub struct PlotPanel {
     pub xlim: Option<(f64, f64)>,
     pub ylim: Option<(f64, f64)>,
     pub zlim: Option<(f64, f64)>,
+    pub colormap: String,
+    pub show_colorbar: bool,
+    pub axis_equal: bool,
+    pub axis_tight: bool,
+    pub axis_off: bool,
     pub view_az: f64,
     pub view_el: f64,
     pub series: Vec<PlotSeries>,
@@ -113,6 +125,11 @@ impl Default for PlotPanel {
             xlim: None,
             ylim: None,
             zlim: None,
+            colormap: "viridis".to_string(),
+            show_colorbar: true,
+            axis_equal: false,
+            axis_tight: false,
+            axis_off: false,
             view_az: -37.5,
             view_el: 30.0,
             series: Vec::new(),
@@ -163,6 +180,7 @@ impl PlotPanel {
             kind,
             x,
             y,
+            err: Vec::new(),
             color,
             dashed,
             line_width: 1.8,
@@ -170,7 +188,40 @@ impl PlotPanel {
         });
     }
 
+    pub fn add_errorbar(
+        &mut self,
+        x: Vec<f64>,
+        y: Vec<f64>,
+        err: Vec<f64>,
+        style: Option<&str>,
+    ) {
+        if !self.hold {
+            self.series.clear();
+            self.heatmap = None;
+        }
+        let (color, dashed) = parse_style(style, &self.next_color());
+        self.series.push(PlotSeries {
+            kind: PlotKind::ErrorBar,
+            x,
+            y,
+            err,
+            color,
+            dashed,
+            line_width: 1.6,
+            label: None,
+        });
+    }
+
     pub fn set_heatmap(&mut self, m: &Matrix) {
+        self.set_heatmap_with_extents(m, None, None);
+    }
+
+    pub fn set_heatmap_with_extents(
+        &mut self,
+        m: &Matrix,
+        x_extent: Option<(f64, f64)>,
+        y_extent: Option<(f64, f64)>,
+    ) {
         let mut row_major = Vec::with_capacity(m.len());
         for r in 0..m.rows() {
             for c in 0..m.cols() {
@@ -183,6 +234,8 @@ impl PlotPanel {
             rows: m.rows(),
             cols: m.cols(),
             data: row_major,
+            x_extent,
+            y_extent,
         });
     }
 
@@ -461,7 +514,7 @@ fn render_panel(svg: &mut String, panel: &PlotPanel, width: f64, height: f64) {
             for c in 0..hm.cols {
                 let v = hm.data[r * hm.cols + c];
                 let t = ((v - vmin) / span).clamp(0.0, 1.0);
-                let col = viridis_hex(t);
+                let col = colormap_hex(&panel.colormap, t);
                 svg.push_str(&format!(
                     "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" fill=\"{col}\"/>",
                     pad_l + c as f64 * cw,
@@ -474,36 +527,60 @@ fn render_panel(svg: &mut String, panel: &PlotPanel, width: f64, height: f64) {
         svg.push_str(&format!(
             "<rect x=\"{pad_l}\" y=\"{pad_t}\" width=\"{pw}\" height=\"{ph}\" fill=\"none\" stroke=\"#333333\" stroke-width=\"1\"/>"
         ));
+        // Axis extent tick labels on heatmap when provided
+        let (x0, x1) = hm.x_extent.unwrap_or((1.0, hm.cols as f64));
+        let (y0, y1) = hm.y_extent.unwrap_or((1.0, hm.rows as f64));
+        if !panel.axis_off {
+            for ti in 0..=4 {
+                let frac = ti as f64 / 4.0;
+                let tx = pad_l + frac * pw;
+                let xv = x0 + frac * (x1 - x0);
+                svg.push_str(&format!(
+                    "<text x=\"{tx:.1}\" y=\"{:.1}\" text-anchor=\"middle\" fill=\"#4b5563\" font-size=\"10\">{}</text>",
+                    pad_t + ph + 14.0,
+                    fmt_tick(xv)
+                ));
+                let ty = pad_t + frac * ph;
+                let yv = y0 + frac * (y1 - y0);
+                svg.push_str(&format!(
+                    "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"end\" fill=\"#4b5563\" font-size=\"10\">{}</text>",
+                    pad_l - 6.0,
+                    ty + 3.5,
+                    fmt_tick(yv)
+                ));
+            }
+        }
 
-        // Colorbar
-        let cb_x = pad_l + pw + 10.0;
-        let cb_w = 10.0;
-        let steps = 20usize;
-        let sh = ph / steps as f64;
-        for i in 0..steps {
-            let t = 1.0 - (i as f64 / (steps - 1) as f64);
-            let col = viridis_hex(t);
+        if panel.show_colorbar {
+            let cb_x = pad_l + pw + 10.0;
+            let cb_w = 10.0;
+            let steps = 20usize;
+            let sh = ph / steps as f64;
+            for i in 0..steps {
+                let t = 1.0 - (i as f64 / (steps - 1) as f64);
+                let col = colormap_hex(&panel.colormap, t);
+                svg.push_str(&format!(
+                    "<rect x=\"{cb_x:.1}\" y=\"{:.2}\" width=\"{cb_w}\" height=\"{:.2}\" fill=\"{col}\"/>",
+                    pad_t + i as f64 * sh,
+                    sh + 0.5
+                ));
+            }
             svg.push_str(&format!(
-                "<rect x=\"{cb_x:.1}\" y=\"{:.2}\" width=\"{cb_w}\" height=\"{:.2}\" fill=\"{col}\"/>",
-                pad_t + i as f64 * sh,
-                sh + 0.5
+                "<rect x=\"{cb_x:.1}\" y=\"{pad_t}\" width=\"{cb_w}\" height=\"{ph}\" fill=\"none\" stroke=\"#333333\" stroke-width=\"0.8\"/>"
+            ));
+            svg.push_str(&format!(
+                "<text x=\"{:.1}\" y=\"{:.1}\" fill=\"#4b5563\" font-size=\"10\">{}</text>",
+                cb_x + cb_w + 4.0,
+                pad_t + 8.0,
+                fmt_tick(vmax)
+            ));
+            svg.push_str(&format!(
+                "<text x=\"{:.1}\" y=\"{:.1}\" fill=\"#4b5563\" font-size=\"10\">{}</text>",
+                cb_x + cb_w + 4.0,
+                pad_t + ph,
+                fmt_tick(vmin)
             ));
         }
-        svg.push_str(&format!(
-            "<rect x=\"{cb_x:.1}\" y=\"{pad_t}\" width=\"{cb_w}\" height=\"{ph}\" fill=\"none\" stroke=\"#333333\" stroke-width=\"0.8\"/>"
-        ));
-        svg.push_str(&format!(
-            "<text x=\"{:.1}\" y=\"{:.1}\" fill=\"#4b5563\" font-size=\"10\">{}</text>",
-            cb_x + cb_w + 4.0,
-            pad_t + 8.0,
-            fmt_tick(vmax)
-        ));
-        svg.push_str(&format!(
-            "<text x=\"{:.1}\" y=\"{:.1}\" fill=\"#4b5563\" font-size=\"10\">{}</text>",
-            cb_x + cb_w + 4.0,
-            pad_t + ph,
-            fmt_tick(vmin)
-        ));
         render_labels(svg, panel, pad_l, pw, pad_t, ph, height);
         return;
     }
@@ -592,11 +669,26 @@ fn render_panel(svg: &mut String, panel: &PlotPanel, width: f64, height: f64) {
                 xmax = xmax.max(xv);
             }
         }
-        for &y in &ser.y {
+        for (i, &y) in ser.y.iter().enumerate() {
             let yv = ty(y);
             if yv.is_finite() {
                 ymin = ymin.min(yv);
                 ymax = ymax.max(yv);
+            }
+            if ser.kind == PlotKind::ErrorBar {
+                if let Some(&e) = ser.err.get(i) {
+                    let e = e.abs();
+                    if e.is_finite() {
+                        let ylo = ty(y - e);
+                        let yhi = ty(y + e);
+                        if ylo.is_finite() {
+                            ymin = ymin.min(ylo);
+                        }
+                        if yhi.is_finite() {
+                            ymax = ymax.max(yhi);
+                        }
+                    }
+                }
             }
         }
         if ser.kind == PlotKind::Bar && !panel.log_y {
@@ -636,7 +728,7 @@ fn render_panel(svg: &mut String, panel: &PlotPanel, width: f64, height: f64) {
     if let Some((lo, hi)) = panel.ylim {
         ymin = ty(lo);
         ymax = ty(hi);
-    } else if ymin.is_finite() && ymax.is_finite() && (ymax - ymin).abs() > 1e-12 {
+    } else if !panel.axis_tight && ymin.is_finite() && ymax.is_finite() && (ymax - ymin).abs() > 1e-12 {
         let margin = (ymax - ymin) * 0.06;
         ymin -= margin;
         ymax += margin;
@@ -653,47 +745,63 @@ fn render_panel(svg: &mut String, panel: &PlotPanel, width: f64, height: f64) {
         ymin -= 1.0;
         ymax += 1.0;
     }
+    if panel.axis_equal && pw > 0.0 && ph > 0.0 {
+        let rx = (xmax - xmin) / pw;
+        let ry = (ymax - ymin) / ph;
+        if rx > ry {
+            let cy = 0.5 * (ymin + ymax);
+            let half = 0.5 * rx * ph;
+            ymin = cy - half;
+            ymax = cy + half;
+        } else if ry > rx {
+            let cx = 0.5 * (xmin + xmax);
+            let half = 0.5 * ry * pw;
+            xmin = cx - half;
+            xmax = cx + half;
+        }
+    }
 
     let sx = |x: f64| pad_l + ((tx(x) - xmin) / (xmax - xmin)) * pw;
     let sy = |y: f64| pad_t + ph - ((ty(y) - ymin) / (ymax - ymin)) * ph;
 
-    // Frame
-    svg.push_str(&format!(
-        "<rect x=\"{pad_l}\" y=\"{pad_t}\" width=\"{pw}\" height=\"{ph}\" fill=\"#ffffff\" stroke=\"#333333\" stroke-width=\"1\"/>"
-    ));
+    // Frame, grid & ticks (hidden when axis_off is true)
+    if !panel.axis_off {
+        svg.push_str(&format!(
+            "<rect x=\"{pad_l}\" y=\"{pad_t}\" width=\"{pw}\" height=\"{ph}\" fill=\"#ffffff\" stroke=\"#333333\" stroke-width=\"1\"/>"
+        ));
 
-    // Grid & ticks
-    let ticks = 5usize;
-    for i in 0..=ticks {
-        let frac = i as f64 / ticks as f64;
-        let xv_raw = xmin + frac * (xmax - xmin);
-        let yv_raw = ymin + frac * (ymax - ymin);
-        let xv = if panel.log_x { 10f64.powf(xv_raw) } else { xv_raw };
-        let yv = if panel.log_y { 10f64.powf(yv_raw) } else { yv_raw };
-        let px = pad_l + frac * pw;
-        let py = pad_t + ph - frac * ph;
+        let ticks = 5usize;
+        for i in 0..=ticks {
+            let frac = i as f64 / ticks as f64;
+            let xv_raw = xmin + frac * (xmax - xmin);
+            let yv_raw = ymin + frac * (ymax - ymin);
+            let xv = if panel.log_x { 10f64.powf(xv_raw) } else { xv_raw };
+            let yv = if panel.log_y { 10f64.powf(yv_raw) } else { yv_raw };
+            let px = pad_l + frac * pw;
+            let py = pad_t + ph - frac * ph;
 
-        if panel.grid && i > 0 && i < ticks {
+            if panel.grid && i > 0 && i < ticks {
+                svg.push_str(&format!(
+                    "<line x1=\"{px:.1}\" y1=\"{pad_t}\" x2=\"{px:.1}\" y2=\"{:.1}\" stroke=\"#e5e7eb\" stroke-width=\"1\"/>",
+                    pad_t + ph
+                ));
+                svg.push_str(&format!(
+                    "<line x1=\"{pad_l}\" y1=\"{py:.1}\" x2=\"{:.1}\" y2=\"{py:.1}\" stroke=\"#e5e7eb\" stroke-width=\"1\"/>",
+                    pad_l + pw
+                ));
+            }
             svg.push_str(&format!(
-                "<line x1=\"{px:.1}\" y1=\"{pad_t}\" x2=\"{px:.1}\" y2=\"{:.1}\" stroke=\"#e5e7eb\" stroke-width=\"1\"/>",
-                pad_t + ph
+                "<text x=\"{px:.1}\" y=\"{:.1}\" fill=\"#4b5563\" font-size=\"10.5\" text-anchor=\"middle\">{}</text>",
+                pad_t + ph + 15.0,
+                fmt_tick(xv)
             ));
             svg.push_str(&format!(
-                "<line x1=\"{pad_l}\" y1=\"{py:.1}\" x2=\"{:.1}\" y2=\"{py:.1}\" stroke=\"#e5e7eb\" stroke-width=\"1\"/>",
-                pad_l + pw
+                "<text x=\"{:.1}\" y=\"{:.1}\" fill=\"#4b5563\" font-size=\"10.5\" text-anchor=\"end\">{}</text>",
+                pad_l - 7.0,
+                py + 3.5,
+                fmt_tick(yv)
             ));
         }
-        svg.push_str(&format!(
-            "<text x=\"{px:.1}\" y=\"{:.1}\" fill=\"#4b5563\" font-size=\"10.5\" text-anchor=\"middle\">{}</text>",
-            pad_t + ph + 15.0,
-            fmt_tick(xv)
-        ));
-        svg.push_str(&format!(
-            "<text x=\"{:.1}\" y=\"{:.1}\" fill=\"#4b5563\" font-size=\"10.5\" text-anchor=\"end\">{}</text>",
-            pad_l - 7.0,
-            py + 3.5,
-            fmt_tick(yv)
-        ));
     }
 
     // Series
@@ -770,10 +878,65 @@ fn render_panel(svg: &mut String, panel: &PlotPanel, width: f64, height: f64) {
                     }
                 }
             }
+            PlotKind::ErrorBar => {
+                let mut pts = String::new();
+                for i in 0..n {
+                    if ser.x[i].is_finite() && ser.y[i].is_finite() {
+                        let cx = sx(ser.x[i]);
+                        let cy = sy(ser.y[i]).clamp(pad_t, pad_t + ph);
+                        if !pts.is_empty() {
+                            pts.push(' ');
+                        }
+                        pts.push_str(&format!("{cx:.2},{cy:.2}"));
+                        let e = ser.err.get(i).copied().unwrap_or(0.0).abs();
+                        if e > 0.0 && e.is_finite() {
+                            let y_hi = sy(ser.y[i] + e).clamp(pad_t, pad_t + ph);
+                            let y_lo = sy(ser.y[i] - e).clamp(pad_t, pad_t + ph);
+                            svg.push_str(&format!(
+                                "<line x1=\"{cx:.2}\" y1=\"{y_lo:.2}\" x2=\"{cx:.2}\" y2=\"{y_hi:.2}\" stroke=\"{}\" stroke-width=\"1.2\"/>",
+                                ser.color
+                            ));
+                            svg.push_str(&format!(
+                                "<line x1=\"{:.2}\" y1=\"{y_lo:.2}\" x2=\"{:.2}\" y2=\"{y_lo:.2}\" stroke=\"{}\" stroke-width=\"1.2\"/>",
+                                cx - 3.5, cx + 3.5, ser.color
+                            ));
+                            svg.push_str(&format!(
+                                "<line x1=\"{:.2}\" y1=\"{y_hi:.2}\" x2=\"{:.2}\" y2=\"{y_hi:.2}\" stroke=\"{}\" stroke-width=\"1.2\"/>",
+                                cx - 3.5, cx + 3.5, ser.color
+                            ));
+                        }
+                    }
+                }
+                if !pts.is_empty() {
+                    svg.push_str(&format!(
+                        "<polyline fill=\"none\" stroke=\"{}\" stroke-width=\"{:.2}\" points=\"{pts}\"/>",
+                        ser.color, ser.line_width
+                    ));
+                }
+            }
+            PlotKind::Fill => {
+                let mut pts = String::new();
+                for i in 0..n {
+                    if ser.x[i].is_finite() && ser.y[i].is_finite() {
+                        if !pts.is_empty() {
+                            pts.push(' ');
+                        }
+                        pts.push_str(&format!(
+                            "{:.2},{:.2}",
+                            sx(ser.x[i]),
+                            sy(ser.y[i]).clamp(pad_t, pad_t + ph)
+                        ));
+                    }
+                }
+                if !pts.is_empty() {
+                    svg.push_str(&format!(
+                        "<polygon points=\"{pts}\" fill=\"{}\" fill-opacity=\"0.38\" stroke=\"{}\" stroke-width=\"{:.2}\"/>",
+                        ser.color, ser.color, ser.line_width
+                    ));
+                }
+            }
         }
     }
-
-    // Quiver vector field overlay
     if let Some(q) = &panel.quiver {
         let n = q.x.len().min(q.y.len()).min(q.u.len()).min(q.v.len());
         let max_mag = (0..n)
@@ -1153,6 +1316,46 @@ fn viridis_hex(t: f64) -> String {
     let g = (g0 as f64 + (g1 as f64 - g0 as f64) * frac).round() as u8;
     let b = (b0 as f64 + (b1 as f64 - b0 as f64) * frac).round() as u8;
     format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+fn colormap_hex(name: &str, t: f64) -> String {
+    let t = t.clamp(0.0, 1.0);
+    let interp = |stops: &[(u8, u8, u8)]| -> String {
+        let scaled = t * (stops.len() - 1) as f64;
+        let idx = (scaled.floor() as usize).min(stops.len() - 2);
+        let frac = scaled - idx as f64;
+        let (r0, g0, b0) = stops[idx];
+        let (r1, g1, b1) = stops[idx + 1];
+        let r = (r0 as f64 + (r1 as f64 - r0 as f64) * frac).round() as u8;
+        let g = (g0 as f64 + (g1 as f64 - g0 as f64) * frac).round() as u8;
+        let b = (b0 as f64 + (b1 as f64 - b0 as f64) * frac).round() as u8;
+        format!("#{r:02x}{g:02x}{b:02x}")
+    };
+    match name.to_ascii_lowercase().as_str() {
+        "gray" | "grey" => {
+            let v = (t * 255.0).round() as u8;
+            format!("#{v:02x}{v:02x}{v:02x}")
+        }
+        "hot" => interp(&[(11, 0, 0), (190, 0, 0), (255, 110, 0), (255, 235, 0), (255, 255, 255)]),
+        "cool" => interp(&[(0, 255, 255), (128, 128, 255), (255, 0, 255)]),
+        "jet" | "turbo" => interp(&[
+            (0, 0, 143),
+            (0, 128, 255),
+            (0, 255, 128),
+            (255, 255, 0),
+            (255, 96, 0),
+            (128, 0, 0),
+        ]),
+        "parula" => interp(&[
+            (62, 38, 168),
+            (46, 135, 247),
+            (31, 188, 195),
+            (196, 193, 47),
+            (249, 251, 20),
+        ]),
+        "bone" => interp(&[(0, 0, 0), (84, 84, 116), (167, 199, 199), (255, 255, 255)]),
+        _ => viridis_hex(t),
+    }
 }
 
 fn parse_style(style: Option<&str>, default_color: &str) -> (String, bool) {

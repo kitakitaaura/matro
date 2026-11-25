@@ -239,7 +239,11 @@ impl Parser {
     }
 
     fn parse_for(&mut self) -> Result<StmtKind> {
-        self.bump(); // `for`
+        self.bump(); // `for` or `parfor`
+        let has_parens = *self.peek_kind() == TokenKind::LParen;
+        if has_parens {
+            self.bump();
+        }
         let var = match self.bump() {
             Token {
                 kind: TokenKind::Ident(name),
@@ -254,6 +258,14 @@ impl Parser {
         };
         self.expect(TokenKind::Assign, "'='")?;
         let iter = self.parse_expr()?;
+        if has_parens {
+            // Optional worker-count argument in `parfor (i = 1:N, M)`
+            if *self.peek_kind() == TokenKind::Comma {
+                self.bump();
+                let _workers = self.parse_expr()?;
+            }
+            self.expect(TokenKind::RParen, "')'")?;
+        }
         let body = self.parse_block(&[TokenKind::End])?;
         self.expect(TokenKind::End, "'end'")?;
         Ok(StmtKind::For { var, iter, body })
@@ -1267,14 +1279,32 @@ impl Parser {
                 }
                 TokenKind::Dot => {
                     let span = self.bump().span;
-                    let field = match self.bump() {
-                        Token {
-                            kind: TokenKind::Ident(f),
-                            ..
-                        } => f,
-                        other => {
+                    let tok = self.bump();
+                    let field = match tok.kind {
+                        TokenKind::Ident(f) => f,
+                        TokenKind::Function => "function".to_string(),
+                        TokenKind::If => "if".to_string(),
+                        TokenKind::Else => "else".to_string(),
+                        TokenKind::ElseIf => "elseif".to_string(),
+                        TokenKind::Switch => "switch".to_string(),
+                        TokenKind::Case => "case".to_string(),
+                        TokenKind::Otherwise => "otherwise".to_string(),
+                        TokenKind::Try => "try".to_string(),
+                        TokenKind::Catch => "catch".to_string(),
+                        TokenKind::End => "end".to_string(),
+                        TokenKind::While => "while".to_string(),
+                        TokenKind::For => "for".to_string(),
+                        TokenKind::ClassDef => "classdef".to_string(),
+                        TokenKind::Global => "global".to_string(),
+                        TokenKind::Persistent => "persistent".to_string(),
+                        TokenKind::Break => "break".to_string(),
+                        TokenKind::Continue => "continue".to_string(),
+                        TokenKind::Return => "return".to_string(),
+                        TokenKind::True => "true".to_string(),
+                        TokenKind::False => "false".to_string(),
+                        _ => {
                             return Err(MatroError::syntax(
-                                other.span,
+                                tok.span,
                                 "Expected field name after '.'",
                             ));
                         }

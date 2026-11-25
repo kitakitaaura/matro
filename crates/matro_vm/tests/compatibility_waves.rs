@@ -512,3 +512,280 @@ fn wave6_toolboxes_stats_signal_image_control_regex_tables() {
     )
     .unwrap();
 }
+
+#[test]
+fn wave7_complete_builtins_and_plotting() {
+    let mut vm = Vm::new();
+    vm.eval(
+        r#"
+        % 7A. Reciprocal & hyperbolic trig (real & complex)
+        assert(abs(sec(0) - 1) < 1e-12);
+        assert(abs(csc(pi/2) - 1) < 1e-12);
+        assert(abs(cot(pi/4) - 1) < 1e-12);
+        assert(abs(secd(60) - 2) < 1e-12);
+        assert(abs(cscd(30) - 2) < 1e-12);
+        assert(abs(cotd(45) - 1) < 1e-12);
+        assert(abs(asec(2) - pi/3) < 1e-12);
+        assert(abs(acsc(2) - pi/6) < 1e-12);
+        assert(abs(acot(1) - pi/4) < 1e-12 && abs(acot(0) - pi/2) < 1e-12);
+        assert(abs(asecd(2) - 60) < 1e-12 && abs(acscd(2) - 30) < 1e-12 && abs(acotd(1) - 45) < 1e-12);
+        assert(abs(sech(0) - 1) < 1e-12);
+        assert(abs(csch(1) - 1/sinh(1)) < 1e-12);
+        assert(abs(coth(1) - cosh(1)/sinh(1)) < 1e-12);
+        assert(abs(asech(sech(0.7)) - 0.7) < 1e-12);
+        assert(abs(acsch(csch(0.7)) - 0.7) < 1e-12);
+        assert(abs(acoth(coth(0.7)) - 0.7) < 1e-12);
+        % Complex inverse reciprocal trig
+        assert(abs(sec(asec(0.5)) - 0.5) < 1e-10);
+        assert(abs(csc(acsc(0.5)) - 0.5) < 1e-10);
+
+        % 7B. Special matrices & linear algebra
+        T1 = toeplitz([1, 2, 3]);
+        assert(isequal(T1, [1 2 3; 2 1 2; 3 2 1]));
+        T2 = toeplitz([1, 2, 3], [1, 4, 5, 6]);
+        assert(isequal(size(T2), [3, 4]) && T2(1, 3) == 5 && T2(3, 1) == 3);
+        H1 = hankel([1, 2, 3], [3, 4, 5]);
+        assert(isequal(H1, [1 2 3; 2 3 4; 3 4 5]));
+        V = vander([1; 2; 3]);
+        assert(isequal(V, [1 1 1; 4 2 1; 9 3 1]));
+        C = compan([1, -6, 11, -6]);
+        r_comp = sort(real(eig(C)));
+        assert(norm(r_comp - [1; 2; 3]) < 1e-10);
+        H = hilb(4);
+        IH = invhilb(4);
+        assert(norm(H * IH - eye(4)) < 1e-9);
+        P0 = pascal(4);
+        assert(P0(4, 4) == 20 && norm(P0 - P0') == 0);
+        P1 = pascal(4, 1);
+        assert(norm(P1 * P1' - P0) < 1e-10);
+        P2 = pascal(4, 2);
+        assert(norm(P2^3 - eye(4)) < 1e-10);
+
+        % gallery families
+        Gt = gallery('tridiag', 5, -1, 2, -1);
+        assert(issparse(Gt) && isequal(size(Gt), [5, 5]) && full(Gt(1,1)) == 2);
+        Gp = gallery('poisson', 4);
+        assert(issparse(Gp) && isequal(size(Gp), [16, 16]));
+        Gl = gallery('lehmer', 4);
+        assert(abs(Gl(2, 4) - 0.5) < 1e-12);
+        Gm = gallery('minij', 4);
+        assert(Gm(2, 4) == 2 && Gm(4, 3) == 3);
+        Gc = gallery('circul', [1, 2, 3]);
+        assert(isequal(Gc, [1 2 3; 3 1 2; 2 3 1]));
+
+        % hess, schur, balance, rcond, bandwidth, del2
+        A = [4, 1, -2, 2; 1, 2, 0, 1; -2, 0, 3, -2; 2, 1, -2, -1];
+        [Ph, Hh] = hess(A);
+        assert(norm(Ph' * Ph - eye(4)) < 1e-11);
+        assert(norm(Ph * Hh * Ph' - A) < 1e-11);
+        assert(abs(Hh(3, 1)) < 1e-11 && abs(Hh(4, 1)) < 1e-11 && abs(Hh(4, 2)) < 1e-11);
+
+        [Us, Ts] = schur(A);
+        assert(norm(Us' * Us - eye(4)) < 1e-11);
+        assert(norm(Us * Ts * Us' - A) < 1e-11);
+        % Non-symmetric real Schur form
+        An = [0, -2, 1; 2, 0, 3; 0, 0, 5];
+        [Un, Tn] = schur(An);
+        assert(norm(Un' * Un - eye(3)) < 1e-11);
+        assert(norm(Un * Tn * Un' - An) < 1e-11);
+
+        Ab = [1, 1e4; 1e-4, 1];
+        [Db, Bb] = balance(Ab);
+        assert(norm(Db \ Ab * Db - Bb) < 1e-10);
+        rc = rcond(eye(4));
+        assert(abs(rc - 1) < 1e-12);
+        assert(rcond(hilb(5)) < 1e-4);
+
+        [kl, ku] = bandwidth(Gt);
+        assert(kl == 1 && ku == 1);
+        assert(bandwidth(Gt, 'lower') == 1 && bandwidth(Gt, 'upper') == 1);
+
+        % del2 of quadratic f(x,y) = x^2 + y^2 has constant discrete Laplacian = 1 (MATLAB's 1/4 * laplacian)
+        [X, Y] = meshgrid(1:5, 1:5);
+        L2 = del2(X.^2 + Y.^2);
+        assert(norm(L2 - ones(5, 5)) < 1e-10);
+
+        % 7C. Number theory, bitwise, predicates, spfun, functional matrix ops, session commands
+        assert(isequal(factor(360), [2, 2, 2, 3, 3, 5]));
+        assert(isequal(factor(1), [1]));
+        assert(bitcmp(uint8(5)) == 250);
+        assert(iscellstr({'a', 'b', 'c'}) && ~iscellstr({'a', 1}));
+        assert(isobject(datetime(2026, 1, 1)));
+        assert(~isobject([1, 2]));
+        tt = timetable(datetime(2026, 1, 1) + hours(0:2)', [10; 20; 30]);
+        assert(istimetable(tt) && ~istimetable(table([1; 2])));
+
+        S = sparse([1, 2, 3], [1, 2, 3], [1, 4, 9], 3, 3);
+        assert(nzmax(S) >= 3);
+        S2 = spfun(@sqrt, S);
+        assert(issparse(S2) && norm(full(S2) - diag([1, 2, 3])) < 1e-12);
+
+        M1 = [1, 2; 3, 4];
+        M2 = [5, 6; 7, 8];
+        assert(norm(mtimes(M1, M2) - M1 * M2) < 1e-12);
+        assert(norm(mldivide(M1, [5; 11]) - [1; 2]) < 1e-11);
+        assert(norm(mrdivide([19, 22; 43, 50], M2) - M1) < 1e-11);
+        assert(norm(mpower(M1, 3) - M1^3) < 1e-10);
+        format long;
+        clc;
+        pause(0);
+
+        % 7D. Plotting: hist, spy, errorbar, fill/patch, imagesc(x,y,C), axis, colorbar, colormap
+        [hc, hx] = hist([1, 1, 2, 3, 3, 3, 4], 4);
+        assert(sum(hc) == 7 && length(hx) == 4);
+        cm = parula(16);
+        assert(isequal(size(cm), [16, 3]));
+        cm2 = viridis(8);
+        assert(isequal(size(cm2), [8, 3]));
+
+        figure;
+        subplot(2, 2, 1);
+        h_eb = errorbar([1, 2, 3], [2, 4, 3], [0.5, 0.4, 0.6], 'b');
+        assert(ishandle(h_eb));
+        hold on;
+        fill([1, 2, 3, 1], [1, 3, 2, 1], 'r');
+        axis tight;
+        axis equal;
+
+        subplot(2, 2, 2);
+        imagesc([-1, 1], [0, 10], magic(5));
+        colormap('jet');
+        colorbar;
+        title('Heatmap');
+
+        subplot(2, 2, 3);
+        spy(gallery('poisson', 5));
+
+        subplot(2, 2, 4);
+        hist([1, 2, 2, 3, 3, 3, 4], 4);
+        axis([0, 5, 0, 4]);
+        ax_lim = axis();
+        assert(isequal(ax_lim, [0, 5, 0, 4]));
+        "#,
+    )
+    .unwrap();
+    let svg = vm.figure().to_svg(800.0, 600.0);
+    assert!(svg.contains("<svg"), "expected valid SVG output");
+    assert!(svg.contains("<polygon"), "expected fill() polygon in SVG");
+    assert!(svg.contains("Heatmap"), "expected heatmap panel title in SVG");
+}
+
+#[test]
+fn wave8_parfor_mexception_functions_and_sparse_solvers() {
+    let mut vm = Vm::new();
+    vm.eval(
+        r#"
+        % 8A. parfor loops (both standard and parenthesized with worker count)
+        y1 = zeros(1, 10);
+        parfor i = 1:10
+            y1(i) = i^2;
+        end
+        assert(isequal(y1, (1:10).^2));
+
+        y2 = zeros(1, 6);
+        parfor (k = 1:6, 4)
+            y2(k) = k * 3;
+        end
+        assert(isequal(y2, [3, 6, 9, 12, 15, 18]));
+
+        % 8B. MException, throw/rethrow, error(id, fmt), lasterror
+        ME = MException('MyPkg:InvalidArg', 'Bad value %d', 42);
+        assert(isa(ME, 'MException'));
+        assert(strcmp(ME.identifier, 'MyPkg:InvalidArg'));
+        assert(strcmp(ME.message, 'Bad value 42'));
+        assert(contains(ME.getReport(), 'MyPkg:InvalidArg'));
+
+        caught_id = '';
+        caught_msg = '';
+        try
+            ME.throw();
+        catch e
+            assert(isa(e, 'MException'));
+            caught_id = e.identifier;
+            caught_msg = e.message;
+        end
+        assert(strcmp(caught_id, 'MyPkg:InvalidArg'));
+        assert(strcmp(caught_msg, 'Bad value 42'));
+
+        le = lasterror();
+        assert(strcmp(le.identifier, 'MyPkg:InvalidArg'));
+        lasterror('reset');
+        le2 = lasterror();
+        assert(isempty(le2.identifier));
+
+        % error(id, msg) + rethrow(e)
+        caught_rethrow = 0;
+        try
+            try
+                error('App:DivZero', 'denom=%d', 0);
+            catch inner_e
+                rethrow(inner_e);
+            end
+        catch outer_e
+            caught_rethrow = strcmp(outer_e.identifier, 'App:DivZero') && strcmp(outer_e.message, 'denom=0');
+        end
+        assert(caught_rethrow == 1);
+
+        % 8C. functions(fh), func2str, str2func
+        fh_sin = @sin;
+        info_sin = functions(fh_sin);
+        assert(strcmp(info_sin.function, 'sin') && strcmp(info_sin.type, 'simple'));
+        assert(strcmp(func2str(fh_sin), 'sin'));
+
+        offset = 5;
+        fh_anon = @(x) x + offset;
+        info_anon = functions(fh_anon);
+        assert(strcmp(info_anon.type, 'anonymous'));
+        assert(info_anon.workspace{1}.offset == 5);
+
+        fh_dyn = str2func('cos');
+        assert(abs(fh_dyn(0) - 1) < 1e-12);
+        fh_dyn2 = str2func('@(t) 2*t + 1');
+        assert(abs(fh_dyn2(3) - 7) < 1e-12);
+
+        % 8D. Native Sparse LU with partial pivoting (non-banded, non-symmetric)
+        n = 40;
+        S = gallery('tridiag', n, -1, 3.5, -0.5);
+        % Add far-off-diagonal loop-closure coupling so matrix is wide-band & non-symmetric
+        S(1, n) = 0.7;
+        S(n, 1) = -0.9;
+        S(5, n - 3) = 1.2;
+        S(n - 2, 4) = -0.8;
+        [Ls, Us, Ps] = lu(S);
+        assert(issparse(Ls) && issparse(Us) && issparse(Ps));
+        assert(norm(full(Ps * S - Ls * Us), 'fro') < 1e-11);
+
+        % Direct sparse solve S \ b on wide-band non-symmetric matrix
+        x_true = sin((1:n)');
+        b = S * x_true;
+        x_sol = S \ b;
+        assert(norm(x_sol - x_true) < 1e-11);
+
+        % 8E. ichol(A) + preconditioned pcg on 2D Poisson SPD sparse matrix
+        Ap = gallery('poisson', 10); % 100 x 100 SPD
+        bp = ones(100, 1);
+        L_ic = ichol(Ap);
+        assert(issparse(L_ic));
+        [x_pcg, flag_pcg, relres_pcg, iter_pcg] = pcg(Ap, bp, 1e-10, 100, L_ic, L_ic');
+        assert(flag_pcg == 0 && relres_pcg < 1e-9 && iter_pcg < 40);
+        assert(norm(Ap * x_pcg - bp) / norm(bp) < 1e-9);
+
+        % ichol with opts.shape = 'upper' and diagcomp
+        R_ic = ichol(Ap, struct('shape', 'upper', 'diagcomp', 0.01));
+        assert(issparse(R_ic));
+
+        % 8F. ilu(A) + preconditioned gmres on non-symmetric advection-diffusion matrix
+        Anonsym = gallery('poisson', 8); % 64 x 64
+        % Add strong skew-symmetric advection term
+        Adv = spdiags([0.6 * ones(64, 1), -0.6 * ones(64, 1)], [-1, 1], 64, 64);
+        M_adv = Anonsym + Adv;
+        b_adv = (1:64)' / 64;
+        [Li, Ui] = ilu(M_adv);
+        assert(issparse(Li) && issparse(Ui));
+        [x_gm, flag_gm, relres_gm] = gmres(M_adv, b_adv, 15, 1e-10, 30, Li, Ui);
+        assert(flag_gm == 0 && relres_gm < 1e-9);
+        assert(norm(M_adv * x_gm - b_adv) / norm(b_adv) < 1e-9);
+        "#,
+    )
+    .unwrap();
+}
