@@ -218,16 +218,72 @@
     }
     .file-list {
       margin: 0;
-      padding-left: 18px;
+      padding: 0;
+      list-style: none;
       font: 12.5px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .file-list li {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 3px 6px;
+      border-bottom: 1px solid #f0f2f5;
+    }
+    .file-list li.clickable { cursor: pointer; }
+    .file-list li.clickable:hover { background: #f6f8fa; }
+    .file-meta { color: #656d76; font-size: 11.5px; margin-left: 8px; }
+    .drop-hint {
+      border: 1px dashed #d0d7de;
+      border-radius: 4px;
+      padding: 10px 12px;
+      font-size: 12.5px;
+      color: #57606a;
+      background: #f6f8fa;
+      text-align: center;
+      cursor: pointer;
+    }
+    .drop-hint:hover { border-color: #8c959f; color: #1f2328; }
+    #drop-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(255, 255, 255, 0.88);
+      border: 2px dashed #1f2328;
+      margin: 8px;
+      border-radius: 6px;
+      pointer-events: none;
+    }
+    #drop-overlay.active { display: flex; }
+    #drop-overlay div {
+      font: 600 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: #1f2328;
+      text-align: center;
+    }
+    #drop-overlay small {
+      display: block;
+      font-weight: 400;
+      font-size: 12.5px;
+      color: #57606a;
+      margin-top: 4px;
     }
   </style>
 </head>
 <body>
+  <div id="drop-overlay">
+    <div>
+      Drop files or folders into Matro
+      <small>.m scripts &amp; functions, +packages, .csv, .mat, .png, .bmp, .wav, .txt</small>
+    </div>
+  </div>
+  <input id="file-picker" type="file" multiple hidden />
   <header>
     <span class="title">matro</span>
     <button id="btn-run" class="run" title="Ctrl/Cmd + Enter">Run</button>
     <button id="btn-reset">Reset</button>
+    <button id="btn-open" title="Open or mount .m, .csv, .mat, .png, .bmp, .wav files">Open…</button>
     <select id="preset" aria-label="Examples">
       <option value="trig">Example: Damped Sine Plot</option>
       <option value="ode">Example: ODE45 Oscillator + Subplots</option>
@@ -278,7 +334,8 @@
 
       <div id="tab-files" class="panel">
         <div class="files-pane">
-          <div class="muted" style="font-size:12.5px">In-memory VFS files available to <code>addpath</code>, <code>run</code>, <code>csvread</code>, and auto-loaded <code>.m</code> functions:</div>
+          <div id="files-drop-hint" class="drop-hint">Drop <code>.m</code>, folders (<code>+pkg</code>/<code>lib</code>), <code>.csv</code>, <code>.mat</code>, <code>.png</code>, <code>.bmp</code>, or <code>.wav</code> files anywhere — or click to browse</div>
+          <div class="muted" style="font-size:12.5px">Mounted VFS files (click a text file to open in editor):</div>
           <ul id="file-list" class="file-list"></ul>
           <form id="file-form" class="files-form">
             <div class="files-row">
@@ -766,11 +823,38 @@ end
     const statusEl = document.getElementById("status");
     const replForm = document.getElementById("repl-form");
     const replInput = document.getElementById("repl-input");
+    const btnOpen = document.getElementById("btn-open");
+    const filePicker = document.getElementById("file-picker");
+    const filesDropHint = document.getElementById("files-drop-hint");
+    const dropOverlay = document.getElementById("drop-overlay");
 
     let worker = null;
     let running = false;
+    // path -> { kind: "text", data: string } | { kind: "bytes", data: Uint8Array }
     let mountedFiles = {};
     let msgId = 0;
+
+    function isTextFile(path) {
+      return /\.(m|csv|tsv|txt|json|md|xml|dat|log)$/i.test(path);
+    }
+
+    function isScriptSource(src) {
+      for (const raw of src.split(/\r?\n/)) {
+        const line = raw.trim();
+        if (!line || line.startsWith("%")) continue;
+        return !/^(function|classdef)\b/.test(line);
+      }
+      return true;
+    }
+
+    function postMount(path, entry) {
+      if (!worker) return;
+      if (entry.kind === "bytes") {
+        worker.postMessage({ id: ++msgId, type: "mount_bytes", path, bytes: entry.data });
+      } else {
+        worker.postMessage({ id: ++msgId, type: "mount_file", path, content: entry.data });
+      }
+    }
 
     function setRunning(flag) {
       running = flag;
@@ -801,7 +885,24 @@ end
       } else {
         for (const f of files) {
           const li = document.createElement("li");
-          li.textContent = f;
+          const entry = mountedFiles[f];
+          const nameSpan = document.createElement("span");
+          nameSpan.textContent = f;
+          li.appendChild(nameSpan);
+          const meta = document.createElement("span");
+          meta.className = "file-meta";
+          if (entry && entry.kind === "bytes") {
+            meta.textContent = `${(entry.data.length / 1024).toFixed(1)} KB`;
+          } else if (entry && entry.kind === "text") {
+            meta.textContent = `${entry.data.length} B`;
+            li.className = "clickable";
+            li.title = "Click to open in editor";
+            li.addEventListener("click", () => {
+              editor.value = entry.data;
+              statusEl.textContent = `Opened ${f}`;
+            });
+          }
+          li.appendChild(meta);
           fileList.appendChild(li);
         }
       }
@@ -830,8 +931,8 @@ end
         const msg = e.data;
         if (msg.type === "ready") {
           statusEl.textContent = "Ready";
-          for (const [p, c] of Object.entries(mountedFiles)) {
-            worker.postMessage({ id: ++msgId, type: "mount_file", path: p, content: c });
+          for (const [p, entry] of Object.entries(mountedFiles)) {
+            postMount(p, entry);
           }
           if (onReady) onReady();
         } else if (msg.type === "init_error") {
@@ -877,15 +978,134 @@ end
     function loadPreset(key) {
       const p = PRESETS[key];
       editor.value = p.code;
-      mountedFiles = { ...p.files };
+      mountedFiles = {};
+      for (const [path, content] of Object.entries(p.files)) {
+        mountedFiles[path] = { kind: "text", data: content };
+      }
       if (worker) {
         worker.postMessage({ id: ++msgId, type: "clear_files" });
-        for (const [path, content] of Object.entries(mountedFiles)) {
-          worker.postMessage({ id: ++msgId, type: "mount_file", path, content });
+        for (const [path, entry] of Object.entries(mountedFiles)) {
+          postMount(path, entry);
         }
         runEditor();
       }
     }
+
+    async function ingestFiles(fileItems) {
+      if (!fileItems.length) return;
+      const mFiles = [];
+      for (const { path, file } of fileItems) {
+        const cleanPath = path.replace(/^\/+/, "");
+        if (isTextFile(cleanPath)) {
+          const text = await file.text();
+          const entry = { kind: "text", data: text };
+          mountedFiles[cleanPath] = entry;
+          postMount(cleanPath, entry);
+          if (/\.m$/i.test(cleanPath)) {
+            mFiles.push({ path: cleanPath, text });
+          }
+        } else {
+          const buf = await file.arrayBuffer();
+          const entry = { kind: "bytes", data: new Uint8Array(buf) };
+          mountedFiles[cleanPath] = entry;
+          postMount(cleanPath, entry);
+        }
+      }
+
+      if (mFiles.length > 0) {
+        // Choose main script to load into editor: prefer main.m, else first script (non-function/classdef), else first .m if single
+        const chosen =
+          mFiles.find((f) => /(^|\/)main\.m$/i.test(f.path)) ||
+          mFiles.find((f) => isScriptSource(f.text)) ||
+          (mFiles.length === 1 ? mFiles[0] : null);
+        if (chosen) {
+          editor.value = chosen.text;
+          statusEl.textContent = `Loaded ${chosen.path}`;
+          if (isScriptSource(chosen.text)) {
+            runEditor();
+          }
+          return;
+        }
+      }
+      statusEl.textContent =
+        fileItems.length === 1
+          ? `Mounted ${fileItems[0].path}`
+          : `Mounted ${fileItems.length} files`;
+    }
+
+    async function collectEntry(entry, prefix = "") {
+      if (entry.isFile) {
+        const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+        return [{ path: prefix ? `${prefix}/${entry.name}` : entry.name, file }];
+      }
+      if (entry.isDirectory) {
+        const reader = entry.createReader();
+        const children = [];
+        while (true) {
+          const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+          if (!batch.length) break;
+          children.push(...batch);
+        }
+        const subPrefix = prefix ? `${prefix}/${entry.name}` : entry.name;
+        const out = [];
+        for (const child of children) {
+          out.push(...(await collectEntry(child, subPrefix)));
+        }
+        return out;
+      }
+      return [];
+    }
+
+    let dragDepth = 0;
+    window.addEventListener("dragenter", (e) => {
+      if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes("Files")) return;
+      e.preventDefault();
+      dragDepth += 1;
+      dropOverlay.classList.add("active");
+    });
+    window.addEventListener("dragover", (e) => {
+      if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes("Files")) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+    });
+    window.addEventListener("dragleave", () => {
+      if (dragDepth > 0) dragDepth -= 1;
+      if (dragDepth === 0) dropOverlay.classList.remove("active");
+    });
+    window.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      dragDepth = 0;
+      dropOverlay.classList.remove("active");
+      const dt = e.dataTransfer;
+      if (!dt) return;
+      const collected = [];
+      if (dt.items && dt.items.length > 0 && typeof dt.items[0].webkitGetAsEntry === "function") {
+        const entries = [];
+        for (const item of dt.items) {
+          const ent = item.webkitGetAsEntry();
+          if (ent) entries.push(ent);
+        }
+        for (const ent of entries) {
+          collected.push(...(await collectEntry(ent)));
+        }
+      } else if (dt.files && dt.files.length > 0) {
+        for (const file of dt.files) {
+          collected.push({ path: file.webkitRelativePath || file.name, file });
+        }
+      }
+      await ingestFiles(collected);
+    });
+
+    btnOpen.addEventListener("click", () => filePicker.click());
+    filesDropHint.addEventListener("click", () => filePicker.click());
+    filePicker.addEventListener("change", async () => {
+      const items = Array.from(filePicker.files || []).map((file) => ({
+        path: file.webkitRelativePath || file.name,
+        file,
+      }));
+      filePicker.value = "";
+      await ingestFiles(items);
+    });
 
     btnRun.addEventListener("click", runEditor);
     document.getElementById("btn-reset").addEventListener("click", () => {
@@ -914,8 +1134,9 @@ end
       if (!worker) return;
       const p = filePath.value.trim();
       if (!p) return;
-      mountedFiles[p] = fileContent.value;
-      worker.postMessage({ id: ++msgId, type: "mount_file", path: p, content: fileContent.value });
+      const entry = { kind: "text", data: fileContent.value };
+      mountedFiles[p] = entry;
+      postMount(p, entry);
       filePath.value = "";
       fileContent.value = "";
     });

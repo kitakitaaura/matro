@@ -57,6 +57,17 @@ export class MatroRuntime {
     return { ok: status === 0, output: this._readOutput() };
   }
 
+  mountBytes(path, bytes) {
+    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    const p = this._allocStr(path);
+    const ptr = this.exports.matro_alloc(u8.length);
+    new Uint8Array(this.exports.memory.buffer, ptr, u8.length).set(u8);
+    const status = this.exports.matro_mount_bytes(p.ptr, p.len, ptr, u8.length);
+    this.exports.matro_free(p.ptr, p.len);
+    this.exports.matro_free(ptr, u8.length);
+    return { ok: status === 0, output: this._readOutput() };
+  }
+
   files() {
     this.exports.matro_files_json();
     const raw = this._readOutput();

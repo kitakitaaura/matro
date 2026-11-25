@@ -46,6 +46,9 @@ self.onmessage = async (e) => {
     } else if (msg.type === "mount_file") {
       rt.mountFile(msg.path, msg.content);
       self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: rt.plotSvg(600, 280) });
+    } else if (msg.type === "mount_bytes") {
+      rt.mountBytes(msg.path, new Uint8Array(msg.bytes));
+      self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: rt.plotSvg(600, 280) });
     } else if (msg.type === "clear_files") {
       rt.clearFiles();
       self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: rt.plotSvg(600, 280) });
