@@ -1141,3 +1141,150 @@ fn core_sparse_fem_kron_reshape_and_2d_index() {
     )
     .unwrap();
 }
+
+#[test]
+fn core_base_matlab_extended_stdlib() {
+    let mut vm = Vm::new();
+    vm.eval(
+        r#"
+        % 1. Hyperbolic & degree trig, coordinate transforms, phase, rounding, DSP helpers
+        assert(abs(sinh(0) - 0) < 1e-12 && abs(cosh(0) - 1) < 1e-12 && abs(tanh(1) - sinh(1)/cosh(1)) < 1e-12);
+        assert(abs(asinh(sinh(1.5)) - 1.5) < 1e-12 && abs(acosh(cosh(2.0)) - 2.0) < 1e-12 && abs(atanh(tanh(0.4)) - 0.4) < 1e-12);
+        assert(sind(90) == 1 && sind(180) == 0 && cosd(90) == 0 && cosd(180) == -1 && abs(tand(45) - 1) < 1e-12);
+        assert(abs(asind(0.5) - 30) < 1e-12 && abs(acosd(0.5) - 60) < 1e-12 && abs(atand(1) - 45) < 1e-12 && abs(atan2d(1, 1) - 45) < 1e-12);
+        assert(abs(deg2rad(180) - pi) < 1e-12 && abs(rad2deg(pi/2) - 90) < 1e-12);
+
+        [th, rh] = cart2pol(3, 4);
+        assert(abs(rh - 5) < 1e-12 && abs(th - atan2(4, 3)) < 1e-12);
+        [px, py] = pol2cart(th, rh);
+        assert(abs(px - 3) < 1e-12 && abs(py - 4) < 1e-12);
+
+        [az, el, rr] = cart2sph(1, 2, 2);
+        [sx, sy, sz] = sph2cart(az, el, rr);
+        assert(abs(sx - 1) < 1e-12 && abs(sy - 2) < 1e-12 && abs(sz - 2) < 1e-12);
+
+        assert(abs(hypot(3, 4) - 5) < 1e-12);
+        assert(isequal(fix([-2.9, -0.5, 0.5, 2.9]), [-2, 0, 0, 2]));
+        assert(nextpow2(100) == 7 && nextpow2(128) == 7 && nextpow2(129) == 8);
+        assert(abs(log1p(1e-8) - 1e-8) < 1e-14 && abs(expm1(1e-8) - 1e-8) < 1e-14);
+        assert(abs(nthroot(-27, 3) - (-3)) < 1e-12 && pow2(3) == 8 && pow2(1.5, 3) == 12);
+        assert(eps(1) == eps && eps(2) == 2 * eps && realmax > 1e300 && realmin > 0 && flintmax == 2^53);
+
+        ph = [0, 2.0, 4.0 - 2*pi, 6.0 - 2*pi];
+        uw = unwrap(ph);
+        assert(norm(uw - [0, 2, 4, 6]) < 1e-12);
+        assert(abs(wrapToPi(3*pi) - pi) < 1e-12 && abs(wrapTo2Pi(-pi/2) - 1.5*pi) < 1e-12);
+        assert(abs(wrapTo180(270) - (-90)) < 1e-12 && abs(wrapTo360(-90) - 270) < 1e-12);
+        assert(sinc(0) == 1 && abs(sinc(1)) < 1e-12 && abs(sinc(0.5) - 2/pi) < 1e-12);
+        assert(abs(db2mag(20) - 10) < 1e-12 && abs(mag2db(10) - 20) < 1e-12);
+        assert(abs(db2pow(10) - 10) < 1e-12 && abs(pow2db(100) - 20) < 1e-12);
+
+        % 2. randi & randperm
+        rng(7, 'twister');
+        ri = randi([5, 10], 3, 4);
+        assert(size(ri, 1) == 3 && size(ri, 2) == 4 && all(ri(:) >= 5) && all(ri(:) <= 10));
+        rp = randperm(10, 6);
+        assert(length(rp) == 6 && length(unique(rp)) == 6 && all(rp >= 1) && all(rp <= 10));
+
+        % 3. Array, indexing & sparse helpers
+        BD = blkdiag([1, 2; 3, 4], [5]);
+        assert(isequal(BD, [1, 2, 0; 3, 4, 0; 0, 0, 5]));
+        assert(isequal(circshift([1, 2, 3, 4, 5], 2), [4, 5, 1, 2, 3]));
+        assert(isequal(circshift([1, 2; 3, 4], [1, 1]), [4, 3; 2, 1]));
+        assert(isequal(flip([1, 2, 3]), [3, 2, 1]));
+        assert(isequal(flip([1, 2; 3, 4], 1), [3, 4; 1, 2]));
+        assert(isequal(repelem([10, 20], [2, 3]), [10, 10, 20, 20, 20]));
+        assert(isequal(accumarray([1; 3; 1; 2], [10; 20; 5; 7]), [15; 7; 20]));
+        [cnt, ed, bin] = histcounts([0.5, 1.2, 1.8, 2.5], [0, 1, 2, 3]);
+        assert(isequal(cnt, [1, 2, 1]) && isequal(bin, [1, 2, 2, 3]));
+        assert(isequal(discretize([0.5, 1.5, 2.5], [0, 1, 2, 3]), [1, 2, 3]));
+        assert(isequal(horzcat([1; 2], [3; 4]), [1, 3; 2, 4]));
+        assert(isequal(vertcat([1, 2], [3, 4]), [1, 2; 3, 4]));
+
+        % spdiags, spones, spalloc, nonzeros, sparse & k/'last' find
+        e = ones(5, 1);
+        T = spdiags([-e, 2*e, -e], [-1, 0, 1], 5, 5);
+        assert(issparse(T) && T(1, 1) == 2 && T(1, 2) == -1 && T(2, 1) == -1 && T(1, 3) == 0);
+        assert(nnz(spones(T)) == 13 && sum(nonzeros(spones(T))) == 13);
+        Zsp = spalloc(4, 4, 8);
+        assert(issparse(Zsp) && nnz(Zsp) == 0);
+        [fi, fj, fv] = find(T, 3, 'last');
+        assert(length(fi) == 3 && length(fj) == 3 && length(fv) == 3 && fi(end) == 5 && fj(end) == 5 && fv(end) == 2);
+
+        % 4. Linear algebra & numerical calculus
+        A = [1, 2; 3, 4; 5, 6];
+        Ap = pinv(A);
+        assert(norm(A * Ap * A - A) < 1e-10 && norm(Ap * A * Ap - Ap) < 1e-10);
+        R_mat = [1, 2, 3; 2, 4, 6];
+        N = null(R_mat);
+        O = orth(R_mat);
+        assert(size(N, 2) == 2 && norm(R_mat * N) < 1e-10);
+        assert(size(O, 2) == 1 && abs(norm(O) - 1) < 1e-10);
+        [Rr, pivs] = rref([1, 2, -1; 2, 4, -2; 0, 1, 3]);
+        assert(isequal(pivs, [1, 2]) && abs(Rr(1, 1) - 1) < 1e-12 && abs(Rr(2, 2) - 1) < 1e-12);
+        assert(isequal(cross([1, 0, 0], [0, 1, 0]), [0, 0, 1]));
+        assert(isequal(vecnorm([3, 0; 4, 5], 2, 1), [5, 5]));
+        assert(abs(rms([3, 4]) - sqrt(12.5)) < 1e-12);
+        assert(norm(normalize([3, 4], 'norm') - [0.6, 0.8]) < 1e-12);
+        assert(isequal(rescale([10, 20, 30], 0, 100), [0, 50, 100]));
+        assert(isequal(clip([-5, 0, 3, 12], 0, 10), [0, 0, 3, 10]));
+
+        t = linspace(0, 1, 101);
+        assert(abs(trapz(t, t.^2) - 1/3) < 1e-4);
+        ct = cumtrapz(t, 2*t);
+        assert(abs(ct(end) - 1.0) < 1e-4);
+        g = gradient([0, 1, 4, 9, 16]);
+        assert(abs(g(3) - 4) < 1e-12);
+        [q, r] = deconv([1, 3, 3, 2], [1, 1]);
+        assert(norm(conv(q, [1, 1]) + r - [1, 3, 3, 2]) < 1e-12);
+        assert(isequal(polyder([3, 2, 1]), [6, 2]));
+        assert(isequal(polyint([6, 2], 5), [3, 2, 5]));
+
+        % 5. Combinatorics & number theory
+        assert(factorial(5) == 120 && nchoosek(6, 2) == 15);
+        assert(size(nchoosek([10, 20, 30, 40], 2), 1) == 6);
+        assert(gcd(48, 18) == 6 && lcm(12, 18) == 36);
+        assert(isequal(isprime([1, 2, 3, 4, 17, 18]), logical([0, 1, 1, 0, 1, 0])));
+        assert(isequal(primes(15), [2, 3, 5, 7, 11, 13]));
+
+        % 6. Predicates, moving windows, reductions ('all' & 'omitnan')
+        assert(isscalar(5) && isvector([1, 2, 3]) && isrow([1, 2]) && iscolumn([1; 2]) && ismatrix([1, 2; 3, 4]));
+        assert(issymmetric([1, 2; 2, 3]) && ishermitian([1, 1i; -1i, 2]) && isdiag(eye(3)) && isdiag(diag([1, 2])));
+        assert(istril([1, 0; 2, 3]) && istriu([1, 2; 0, 3]) && issorted([1, 2, 5, 5]) && issorted([5, 3, 1], 'descend'));
+        assert(isequal(movsum([1, 2, 3, 4], 3), [3, 6, 9, 7]));
+        assert(isequal(movmean([1, 2, 3, 4], [1, 0]), [1, 1.5, 2.5, 3.5]));
+        assert(isequal(cummin([4, 2, 5, 1]), [4, 2, 2, 1]));
+        assert(isequal(cummax([1, 5, 2, 7]), [1, 5, 5, 7]));
+        [bmin, bmax] = bounds([3, 1; 9, 2], 'all');
+        assert(bmin == 1 && bmax == 9);
+        [mv, mi] = max([3, 1; 9, 2], [], 'all');
+        assert(mv == 9 && mi == 2);
+        assert(sum([1, 2; 3, 4], 'all') == 10);
+        assert(sum([1, NaN, 3], 'omitnan') == 4 && mean([2, NaN, 4], 'omitnan') == 3);
+
+        % 7. Strings, structs, cells & utilities
+        assert(strcmpi('Hello', 'hElLo') && strncmp('abcdef', 'abcXYZ', 3) && strncmpi('ABCdef', 'abcXYZ', 3));
+        assert(strcmp(strtrim('  hi  '), 'hi') && strcmp(deblank('  hi  '), '  hi'));
+        assert(strcmp(int2str(42), '42') && strcmp(mat2str([1, 2; 3, 4]), '[1 2;3 4]'));
+        assert(strcmp(dec2bin(13, 6), '001101') && bin2dec('1101') == 13);
+        assert(strcmp(dec2hex(255, 4), '00FF') && hex2dec('FF') == 255);
+        assert(length(blanks(5)) == 5 && length(newline) == 1 && strcmp(filesep, '/') && strcmp(pathsep, ':'));
+        warning('off', 'all');
+
+        s.a = 1; s.b = 2; s.c = 3;
+        s2 = rmfield(s, 'b');
+        assert(isfield(s2, 'a') && ~isfield(s2, 'b') && isfield(s2, 'c'));
+        sc = struct2cell(orderfields(s2));
+        assert(length(sc) == 2 && sc{1} == 1 && sc{2} == 3);
+        cm = cell2mat({[1, 2], [3]; [4, 5], [6]});
+        assert(isequal(cm, [1, 2, 3; 4, 5, 6]));
+        nc = num2cell([10, 20; 30, 40]);
+        assert(nc{1, 2} == 20 && nc{2, 1} == 30);
+        [d1, d2, d3] = deal(7, 8, 9);
+        assert(d1 == 7 && d2 == 8 && d3 == 9);
+        [e1, e2] = deal(42);
+        assert(e1 == 42 && e2 == 42);
+        "#,
+    )
+    .unwrap();
+}

@@ -6,6 +6,7 @@ use matro_types::{
     SparseMatrix, Value,
 };
 
+mod base_ext;
 mod control_ext;
 mod extras;
 pub mod fs_media;
@@ -45,10 +46,17 @@ pub fn call_intrinsic(
         "i" | "j" => ok1(Value::complex(0.0, 1.0)),
         "inf" | "Inf" => ok1(Value::scalar(f64::INFINITY)),
         "nan" | "NaN" => ok1(Value::scalar(f64::NAN)),
-        "eps" => ok1(Value::scalar(f64::EPSILON)),
+        "eps" => fn_eps(args),
+        "realmax" => ok1(Value::scalar(f64::MAX)),
+        "realmin" => ok1(Value::scalar(f64::MIN_POSITIVE)),
+        "flintmax" => ok1(Value::scalar((1u64 << 53) as f64)),
+        "newline" => ok1(Value::String("\n".to_string())),
+        "filesep" => ok1(Value::String("/".to_string())),
+        "pathsep" => ok1(Value::String(":".to_string())),
 
-        // Errors & assertions
+        // Errors, warnings & assertions
         "error" => fn_error(args),
+        "warning" => base_ext::fn_warning(args, ctx.stdout),
         "assert" => fn_assert(args),
 
         // Complex utilities
@@ -443,6 +451,108 @@ pub fn call_intrinsic(
         "strip" => modern_types::fn_strip(args),
         "replace" => extras::fn_strrep(args),
 
+        // Base MATLAB extended stdlib (hyperbolic/degree trig, coords, sparse/array/linalg/calculus/moving/strings/structs)
+        "sinh" => base_ext::fn_unary_c(name, args, base_ext::c_sinh),
+        "cosh" => base_ext::fn_unary_c(name, args, base_ext::c_cosh),
+        "tanh" => base_ext::fn_unary_c(name, args, base_ext::c_tanh),
+        "asinh" => base_ext::fn_unary_c(name, args, base_ext::c_asinh),
+        "acosh" => base_ext::fn_unary_c(name, args, base_ext::c_acosh),
+        "atanh" => base_ext::fn_unary_c(name, args, base_ext::c_atanh),
+        "sind" => base_ext::fn_elem_real(name, args, base_ext::sind_f),
+        "cosd" => base_ext::fn_elem_real(name, args, base_ext::cosd_f),
+        "tand" => base_ext::fn_elem_real(name, args, base_ext::tand_f),
+        "asind" => base_ext::fn_elem_real(name, args, |x| x.asin().to_degrees()),
+        "acosd" => base_ext::fn_elem_real(name, args, |x| x.acos().to_degrees()),
+        "atand" => base_ext::fn_elem_real(name, args, |x| x.atan().to_degrees()),
+        "atan2d" => base_ext::fn_elem_real2(name, args, |y, x| y.atan2(x).to_degrees()),
+        "deg2rad" => base_ext::fn_elem_real(name, args, f64::to_radians),
+        "rad2deg" => base_ext::fn_elem_real(name, args, f64::to_degrees),
+        "cart2pol" => base_ext::fn_cart2pol(args, nargout),
+        "pol2cart" => base_ext::fn_pol2cart(args, nargout),
+        "cart2sph" => base_ext::fn_cart2sph(args, nargout),
+        "sph2cart" => base_ext::fn_sph2cart(args, nargout),
+        "hypot" => base_ext::fn_elem_real2(name, args, f64::hypot),
+        "fix" => base_ext::fn_elem_real(name, args, f64::trunc),
+        "nextpow2" => base_ext::fn_elem_real(name, args, base_ext::nextpow2_f),
+        "log1p" => base_ext::fn_elem_real(name, args, f64::ln_1p),
+        "expm1" => base_ext::fn_elem_real(name, args, f64::exp_m1),
+        "nthroot" => base_ext::fn_elem_real2(name, args, base_ext::nthroot_f),
+        "pow2" => base_ext::fn_pow2(args),
+        "unwrap" => base_ext::fn_unwrap(args),
+        "wrapToPi" => base_ext::fn_elem_real(name, args, base_ext::wrap_to_pi),
+        "wrapTo2Pi" => base_ext::fn_elem_real(name, args, base_ext::wrap_to_2pi),
+        "wrapTo180" => base_ext::fn_elem_real(name, args, base_ext::wrap_to_180),
+        "wrapTo360" => base_ext::fn_elem_real(name, args, base_ext::wrap_to_360),
+        "sinc" => base_ext::fn_elem_real(name, args, base_ext::sinc_f),
+        "db2mag" => base_ext::fn_elem_real(name, args, |db| 10.0f64.powf(db / 20.0)),
+        "mag2db" => base_ext::fn_elem_real(name, args, |m| 20.0 * m.log10()),
+        "db2pow" => base_ext::fn_elem_real(name, args, |db| 10.0f64.powf(db / 10.0)),
+        "pow2db" => base_ext::fn_elem_real(name, args, |p| 10.0 * p.log10()),
+        "randi" => base_ext::fn_randi(args, ctx.rng),
+        "randperm" => base_ext::fn_randperm(args, ctx.rng),
+        "blkdiag" => base_ext::fn_blkdiag(args),
+        "circshift" => base_ext::fn_circshift(args),
+        "flip" => base_ext::fn_flip(args),
+        "repelem" => base_ext::fn_repelem(args),
+        "accumarray" => base_ext::fn_accumarray(args),
+        "histcounts" => base_ext::fn_histcounts(args, nargout),
+        "discretize" => base_ext::fn_discretize(args),
+        "ipermute" => base_ext::fn_ipermute(args),
+        "horzcat" => base_ext::fn_horzcat(args),
+        "vertcat" => base_ext::fn_vertcat(args),
+        "spdiags" => base_ext::fn_spdiags(args, nargout),
+        "spones" => base_ext::fn_spones(args),
+        "spalloc" => base_ext::fn_spalloc(args),
+        "nonzeros" => base_ext::fn_nonzeros(args),
+        "pinv" => base_ext::fn_pinv(args),
+        "null" => base_ext::fn_null_orth(args, true),
+        "orth" => base_ext::fn_null_orth(args, false),
+        "rref" => base_ext::fn_rref(args, nargout),
+        "cross" => base_ext::fn_cross(args),
+        "vecnorm" => base_ext::fn_vecnorm(args),
+        "rms" => base_ext::fn_rms(args),
+        "normalize" => base_ext::fn_normalize(args),
+        "rescale" => base_ext::fn_rescale(args),
+        "clip" => base_ext::fn_clip(args),
+        "trapz" => base_ext::fn_trapz(args, false),
+        "cumtrapz" => base_ext::fn_trapz(args, true),
+        "gradient" => base_ext::fn_gradient(args, nargout),
+        "deconv" => base_ext::fn_deconv(args, nargout),
+        "polyder" => base_ext::fn_polyder(args),
+        "polyint" => base_ext::fn_polyint(args),
+        "factorial" => base_ext::fn_factorial(args),
+        "nchoosek" => base_ext::fn_nchoosek(args),
+        "gcd" => base_ext::fn_gcd_lcm(args, false),
+        "lcm" => base_ext::fn_gcd_lcm(args, true),
+        "isprime" => base_ext::fn_isprime(args),
+        "primes" => base_ext::fn_primes(args),
+        "isscalar" | "isvector" | "isrow" | "iscolumn" | "ismatrix" => {
+            base_ext::fn_shape_pred(name, args)
+        }
+        "issymmetric" | "ishermitian" | "isdiag" | "istril" | "istriu" | "issorted" => {
+            base_ext::fn_struct_pred(name, args)
+        }
+        "movmean" | "movsum" | "movstd" | "movvar" | "movmedian" | "movmin" | "movmax" => {
+            base_ext::fn_mov_window(name, args)
+        }
+        "cummin" => base_ext::fn_cum_extrema(args, false),
+        "cummax" => base_ext::fn_cum_extrema(args, true),
+        "bounds" => base_ext::fn_bounds(args, nargout),
+        "strcmpi" | "strncmp" | "strncmpi" => base_ext::fn_str_cmp_ext(name, args),
+        "strtrim" | "deblank" => base_ext::fn_strtrim_deblank(name, args),
+        "str2num" => fn_str2double(args),
+        "int2str" => base_ext::fn_int2str(args),
+        "mat2str" => base_ext::fn_mat2str(args),
+        "dec2bin" | "dec2hex" | "bin2dec" | "hex2dec" | "blanks" => {
+            base_ext::fn_base_conv(name, args)
+        }
+        "rmfield" => base_ext::fn_rmfield(args),
+        "orderfields" => base_ext::fn_orderfields(args),
+        "struct2cell" => base_ext::fn_struct2cell(args),
+        "cell2mat" => base_ext::fn_cell2mat(args),
+        "num2cell" => base_ext::fn_num2cell(args),
+        "deal" => base_ext::fn_deal(args, nargout),
+
         // Functional operator builtins (useful with bsxfun / @plus / etc.)
         "plus" => tables::fn_binop_c("plus", args, |a, b| a + b),
         "minus" => tables::fn_binop_c("minus", args, |a, b| a - b),
@@ -602,34 +712,101 @@ fn fn_pred_mat(name: &str, args: &[Value], pred: impl Fn(Complex) -> bool) -> Re
     ok1(Value::matrix(out))
 }
 
-fn fn_find(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("find", "1", args.len()));
+fn fn_eps(args: &[Value]) -> Result<Vec<Value>> {
+    if args.is_empty() {
+        return ok1(Value::scalar(f64::EPSILON));
     }
-    let m = args[0].as_matrix()?;
-    if nargout >= 2 {
-        let mut rows = Vec::new();
-        let mut cols = Vec::new();
-        for c in 0..m.cols() {
-            for r in 0..m.rows() {
-                if !m.get_c(r, c).is_zero() {
-                    rows.push((r + 1) as f64);
-                    cols.push((c + 1) as f64);
+    if let Some(s) = value_as_text(&args[0]) {
+        if s.eq_ignore_ascii_case("single") {
+            return ok1(Value::scalar(f32::EPSILON as f64));
+        }
+        return ok1(Value::scalar(f64::EPSILON));
+    }
+    let m = args[0].to_dense_matrix()?;
+    let out = m.map(|x| {
+        let ax = x.abs();
+        if !ax.is_finite() {
+            f64::NAN
+        } else if ax <= f64::MIN_POSITIVE {
+            f64::from_bits(1)
+        } else {
+            let bits = ax.to_bits();
+            f64::from_bits(bits + 1) - ax
+        }
+    });
+    ok1(Value::matrix(out))
+}
+
+fn fn_find(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity("find", "1 to 3 (X [, k [, 'first'|'last']])", args.len()));
+    }
+    let k_limit = if args.len() >= 2 {
+        Some(as_usize(&args[1], "find")?)
+    } else {
+        None
+    };
+    let take_last = if args.len() == 3 {
+        value_as_text(&args[2]).is_some_and(|s| s.eq_ignore_ascii_case("last"))
+    } else {
+        false
+    };
+
+    let (nrows, is_row_vec, mut entries): (usize, bool, Vec<(usize, usize, Complex)>) =
+        match &args[0] {
+            Value::Sparse(s) => {
+                let trips = s
+                    .triplets()
+                    .into_iter()
+                    .map(|(r, c, v)| (r, c, Complex::from_real(v)))
+                    .collect();
+                (s.rows(), s.rows() == 1 && s.cols() > 1, trips)
+            }
+            other => {
+                let m = other.as_matrix()?;
+                let mut e = Vec::new();
+                for c in 0..m.cols() {
+                    for r in 0..m.rows() {
+                        let v = m.get_c(r, c);
+                        if !v.is_zero() {
+                            e.push((r, c, v));
+                        }
+                    }
                 }
+                (m.rows(), m.rows() == 1 && m.cols() > 1, e)
+            }
+        };
+
+    if let Some(k) = k_limit {
+        if entries.len() > k {
+            if take_last {
+                let start = entries.len() - k;
+                entries = entries.split_off(start);
+            } else {
+                entries.truncate(k);
             }
         }
-        return Ok(vec![
+    }
+
+    if nargout >= 2 {
+        let rows: Vec<f64> = entries.iter().map(|&(r, _, _)| (r + 1) as f64).collect();
+        let cols: Vec<f64> = entries.iter().map(|&(_, c, _)| (c + 1) as f64).collect();
+        let mut out = vec![
             Value::matrix(Matrix::col_vec(rows)),
             Value::matrix(Matrix::col_vec(cols)),
-        ]);
-    }
-    let mut idxs = Vec::new();
-    for i in 0..m.len() {
-        if !m.get_linear_c(i).is_zero() {
-            idxs.push((i + 1) as f64);
+        ];
+        if nargout >= 3 {
+            let vals: Vec<Complex> = entries.iter().map(|&(_, _, v)| v).collect();
+            out.push(Value::matrix(Matrix::complex_col_vec(vals).normalize()));
         }
+        return Ok(out);
     }
-    let out = if m.rows() == 1 {
+
+    let idxs: Vec<f64> = entries
+        .iter()
+        .map(|&(r, c, _)| (c * nrows + r + 1) as f64)
+        .collect();
+    let out = if is_row_vec {
         Matrix::row_vec(idxs)
     } else {
         Matrix::col_vec(idxs)
@@ -1451,17 +1628,33 @@ fn fn_kron(args: &[Value]) -> Result<Vec<Value>> {
 }
 
 fn fn_sum(args: &[Value]) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 2 {
-        return Err(MatroError::arity("sum", "1 or 2", args.len()));
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity("sum", "1 to 3", args.len()));
     }
     if let Value::Sparse(s) = &args[0] {
-        let dim = if args.len() == 2 {
-            as_usize(&args[1], "sum")?
-        } else if s.rows() == 1 {
-            2
-        } else {
-            1
-        };
+        let mut all_mode = false;
+        let mut omit_nan = false;
+        let mut dim_opt: Option<usize> = None;
+        for a in &args[1..] {
+            if let Some(txt) = value_as_text(a) {
+                match txt.trim().to_ascii_lowercase().as_str() {
+                    "all" => all_mode = true,
+                    "omitnan" | "omitmissing" => omit_nan = true,
+                    _ => {}
+                }
+            } else {
+                dim_opt = Some(as_usize(a, "sum")?);
+            }
+        }
+        if all_mode {
+            let total: f64 = s
+                .nonzeros()
+                .into_iter()
+                .filter(|v| !omit_nan || !v.is_nan())
+                .sum();
+            return ok1(Value::scalar(total));
+        }
+        let dim = dim_opt.unwrap_or(if s.rows() == 1 { 2 } else { 1 });
         if dim != 1 && dim != 2 {
             return Err(MatroError::runtime(format!("sum: unsupported dimension {dim}")));
         }
@@ -2028,14 +2221,14 @@ fn fn_norm(args: &[Value]) -> Result<Vec<Value>> {
 }
 
 fn fn_minmax(name: &str, args: &[Value], nargout: usize, is_max: bool) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 3 {
-        return Err(MatroError::arity(name, "1 to 3", args.len()));
+    if args.is_empty() || args.len() > 4 {
+        return Err(MatroError::arity(name, "1 to 4", args.len()));
     }
-    let m = args[0].as_matrix()?;
-    // Element-wise min(A, B) / max(A, B) when 2nd arg is non-empty and args.len() == 2
-    if args.len() == 2 && !args[1].as_matrix()?.is_empty() {
-        let b = args[1].as_matrix()?;
-        let out = m.elementwise(b, |x, y| if is_max { x.max(y) } else { x.min(y) })?;
+    let m = args[0].to_dense_matrix()?;
+    // Element-wise min(A, B) / max(A, B) when 2nd arg is non-empty numeric and args.len() == 2
+    if args.len() == 2 && value_as_text(&args[1]).is_none() && !args[1].to_dense_matrix()?.is_empty() {
+        let b = args[1].to_dense_matrix()?;
+        let out = m.elementwise(&b, |x, y| if is_max { x.max(y) } else { x.min(y) })?;
         return ok1(Value::matrix(out));
     }
     if m.is_empty() {
@@ -2045,18 +2238,43 @@ fn fn_minmax(name: &str, args: &[Value], nargout: usize, is_max: bool) -> Result
             ok1(Value::empty())
         };
     }
+
+    let mut all_mode = false;
+    let mut omit_nan = true; // MATLAB default for min/max is 'omitnan'
+    let mut dim_opt: Option<usize> = None;
+    for (idx, a) in args.iter().enumerate().skip(1) {
+        if let Some(s) = value_as_text(a) {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "all" => all_mode = true,
+                "omitnan" | "omitmissing" => omit_nan = true,
+                "includenan" | "includemissing" => omit_nan = false,
+                _ => {}
+            }
+        } else if idx >= 2 && !a.as_matrix()?.is_empty() {
+            dim_opt = Some(as_usize(a, name)?);
+        }
+    }
+
     let best_in_slice = |xs: &[f64]| -> (f64, f64) {
-        let mut best_v = xs[0];
+        if !omit_nan && xs.iter().any(|v| v.is_nan()) {
+            let nan_i = xs.iter().position(|v| v.is_nan()).unwrap_or(0);
+            return (f64::NAN, (nan_i + 1) as f64);
+        }
+        let mut best_v = f64::NAN;
         let mut best_i = 0usize;
-        for (i, &v) in xs.iter().enumerate().skip(1) {
-            if (is_max && v > best_v) || (!is_max && v < best_v) {
+        for (i, &v) in xs.iter().enumerate() {
+            if v.is_nan() {
+                continue;
+            }
+            if best_v.is_nan() || (is_max && v > best_v) || (!is_max && v < best_v) {
                 best_v = v;
                 best_i = i;
             }
         }
         (best_v, (best_i + 1) as f64)
     };
-    if args.len() == 1 && (m.rows() == 1 || m.cols() == 1) {
+
+    if all_mode || (dim_opt.is_none() && (m.rows() == 1 || m.cols() == 1)) {
         let (v, idx) = best_in_slice(m.data());
         return if nargout >= 2 {
             Ok(vec![Value::scalar(v), Value::scalar(idx)])
@@ -2064,11 +2282,7 @@ fn fn_minmax(name: &str, args: &[Value], nargout: usize, is_max: bool) -> Result
             ok1(Value::scalar(v))
         };
     }
-    let dim = if args.len() == 3 {
-        as_usize(&args[2], name)?
-    } else {
-        1
-    };
+    let dim = dim_opt.unwrap_or(1);
     if dim == 1 {
         let mut vals = Vec::with_capacity(m.cols());
         let mut idxs = Vec::with_capacity(m.cols());
@@ -2109,34 +2323,55 @@ fn fn_minmax(name: &str, args: &[Value], nargout: usize, is_max: bool) -> Result
 }
 
 fn fn_reduce_c(name: &str, args: &[Value], op: impl Fn(&[Complex]) -> Complex) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 2 {
-        return Err(MatroError::arity(name, "1 or 2", args.len()));
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity(name, "1 to 3", args.len()));
     }
-    let m = args[0].as_matrix()?;
+    let m = args[0].to_dense_matrix()?;
     if m.is_empty() {
         return ok1(Value::scalar(0.0));
     }
-    if args.len() == 1 && (m.rows() == 1 || m.cols() == 1) {
-        let vals: Vec<Complex> = (0..m.len()).map(|i| m.get_linear_c(i)).collect();
-        return ok1(Value::matrix(Matrix::complex_scalar(op(&vals)).normalize()));
+    let mut all_mode = false;
+    let mut omit_nan = false;
+    let mut dim_opt: Option<usize> = None;
+    for a in &args[1..] {
+        if let Some(s) = value_as_text(a) {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "all" => all_mode = true,
+                "omitnan" | "omitmissing" => omit_nan = true,
+                _ => {}
+            }
+        } else {
+            dim_opt = Some(as_usize(a, name)?);
+        }
     }
-    let dim = if args.len() == 2 {
-        as_usize(&args[1], name)?
-    } else {
-        1
+    let apply = |vals: Vec<Complex>| -> Complex {
+        if omit_nan {
+            let filtered: Vec<Complex> = vals
+                .into_iter()
+                .filter(|c| !c.re.is_nan() && !c.im.is_nan())
+                .collect();
+            op(&filtered)
+        } else {
+            op(&vals)
+        }
     };
+    if all_mode || (dim_opt.is_none() && (m.rows() == 1 || m.cols() == 1)) {
+        let vals: Vec<Complex> = (0..m.len()).map(|i| m.get_linear_c(i)).collect();
+        return ok1(Value::matrix(Matrix::complex_scalar(apply(vals)).normalize()));
+    }
+    let dim = dim_opt.unwrap_or(1);
     if dim == 1 {
         let mut out = Vec::with_capacity(m.cols());
         for c in 0..m.cols() {
             let col: Vec<Complex> = (0..m.rows()).map(|r| m.get_c(r, c)).collect();
-            out.push(op(&col));
+            out.push(apply(col));
         }
         ok1(Value::matrix(Matrix::complex_row_vec(out).normalize()))
     } else if dim == 2 {
         let mut out = Vec::with_capacity(m.rows());
         for r in 0..m.rows() {
             let row: Vec<Complex> = (0..m.cols()).map(|c| m.get_c(r, c)).collect();
-            out.push(op(&row));
+            out.push(apply(row));
         }
         ok1(Value::matrix(Matrix::complex_col_vec(out).normalize()))
     } else {

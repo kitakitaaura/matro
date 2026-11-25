@@ -143,6 +143,33 @@ impl SparseMatrix {
         self.values.len()
     }
 
+    /// Return all stored non-zero entries as 0-based `(row, col, value)` triplets in column-major order.
+    pub fn triplets(&self) -> Vec<(usize, usize, f64)> {
+        let mut out = Vec::with_capacity(self.values.len());
+        for c in 0..self.cols {
+            for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
+                out.push((self.row_idx[idx], c, self.values[idx]));
+            }
+        }
+        out
+    }
+
+    /// Column vector of all non-zero values in column-major order.
+    pub fn nonzeros(&self) -> Vec<f64> {
+        self.values.clone()
+    }
+
+    /// Return sparse matrix with same sparsity pattern and all non-zeros replaced by `1.0`.
+    pub fn spones(&self) -> Self {
+        Self {
+            rows: self.rows,
+            cols: self.cols,
+            col_ptr: self.col_ptr.clone(),
+            row_idx: self.row_idx.clone(),
+            values: vec![1.0; self.values.len()],
+        }
+    }
+
     pub fn get(&self, r: usize, c: usize) -> f64 {
         let start = self.col_ptr[c];
         let end = self.col_ptr[c + 1];
