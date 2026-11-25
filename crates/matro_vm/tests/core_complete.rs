@@ -1079,6 +1079,35 @@ fn core_sparse_fem_kron_reshape_and_2d_index() {
         rng('default');
         sd = rng();
         assert(strcmp(sd.Type, 'twister') && sd.Seed == 0);
+
+        % 7. conv() orientation (col/row/mixed), shape ('full'/'same'/'valid'), complex, and 1D-slice assignment
+        u_col = [1; 2; 3; 4];
+        v_col = [1; -1];
+        c_cc = conv(u_col, v_col);
+        assert(size(c_cc, 1) == 5 && size(c_cc, 2) == 1 && isequal(c_cc, [1; 1; 1; 1; -4]));
+        c_rr = conv([1, 2, 3, 4], [1, -1]);
+        assert(size(c_rr, 1) == 1 && size(c_rr, 2) == 5 && isequal(c_rr, [1, 1, 1, 1, -4]));
+        c_same = conv(u_col, [1; 2; 1], 'same');
+        assert(size(c_same, 1) == 4 && size(c_same, 2) == 1 && isequal(c_same, [4; 8; 12; 11]));
+        c_valid = conv(u_col, [1; 2; 1], 'valid');
+        assert(size(c_valid, 1) == 2 && size(c_valid, 2) == 1 && isequal(c_valid, [8; 12]));
+
+        % Complex pulse compression into column slice (sar_backprojection pattern)
+        raw = [1+1i, 2; 3, 4-1i; 5+2i, 6];
+        mf = [1-1i; 2i];
+        compressed = zeros(size(raw, 1) + length(mf) - 1, size(raw, 2));
+        for p = 1:size(raw, 2)
+            compressed(:, p) = conv(raw(:, p), mf);
+        end
+        assert(size(compressed, 1) == 4 && size(compressed, 2) == 2);
+        assert(abs(compressed(1, 1) - (1+1i)*(1-1i)) < 1e-12);
+
+        % Row-vector assigned into column slice and col-vector into row slice (MATLAB vector slice rule)
+        G = zeros(3, 3);
+        G(:, 2) = [10, 20, 30];
+        G(3, :) = [7; 8; 9];
+        assert(isequal(G(:, 2), [10; 20; 8]));
+        assert(isequal(G(3, :), [7, 8, 9]));
         "#,
     )
     .unwrap();

@@ -4932,6 +4932,17 @@ fn assign_sparse_index(s: &mut SparseMatrix, args: &[StackItem], rhs: &Matrix) -
                         s.set(r, c, rhs.get(ri, ci));
                     }
                 }
+            } else if (rows.len() == 1 || cols.len() == 1)
+                && (rhs.rows() == 1 || rhs.cols() == 1)
+                && rhs.len() == rows.len() * cols.len()
+            {
+                let mut k = 0usize;
+                for &c in &cols {
+                    for &r in &rows {
+                        s.set(r, c, rhs.data()[k]);
+                        k += 1;
+                    }
+                }
             } else {
                 return Err(MatroError::dimension("Sparse indexed assignment size mismatch"));
             }
@@ -5334,6 +5345,17 @@ fn assign_matrix_index(m: &mut Matrix, args: &[StackItem], rhs: &Matrix) -> Resu
                 for (ci, &c) in cols.iter().enumerate() {
                     for (ri, &r) in rows.iter().enumerate() {
                         m.set_c(r, c, rhs.get_c(ri, ci));
+                    }
+                }
+            } else if (rows.len() == 1 || cols.len() == 1)
+                && (rhs.rows() == 1 || rhs.cols() == 1)
+                && rhs.len() == rows.len() * cols.len()
+            {
+                let mut k = 0usize;
+                for &c in &cols {
+                    for &r in &rows {
+                        m.set_c(r, c, rhs.get_linear_c(k));
+                        k += 1;
                     }
                 }
             } else {

@@ -1674,23 +1674,70 @@ fn fn_polyval(args: &[Value]) -> Result<Vec<Value>> {
 }
 
 fn fn_conv(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 2 {
-        return Err(MatroError::arity("conv", "2", args.len()));
+    if args.len() < 2 || args.len() > 3 {
+        return Err(MatroError::arity("conv", "2 or 3 (u, v [, shape])", args.len()));
     }
     let a = args[0].as_matrix()?;
     let b = args[1].as_matrix()?;
+    let shape = if args.len() == 3 {
+        value_as_text(&args[2])
+            .ok_or_else(|| MatroError::runtime("conv: shape must be 'full', 'same', or 'valid'"))?
+            .trim()
+            .to_ascii_lowercase()
+    } else {
+        "full".to_string()
+    };
+    if !matches!(shape.as_str(), "full" | "same" | "valid") {
+        return Err(MatroError::runtime(format!(
+            "conv: unknown shape '{shape}' (expected 'full', 'same', or 'valid')"
+        )));
+    }
+    let a_is_col = a.cols() == 1 && a.rows() > 1;
+    let b_is_col = b.cols() == 1 && b.rows() > 1;
+    let is_col = match shape.as_str() {
+        "same" => a_is_col,
+        _ => {
+            if a.len() >= b.len() {
+                a_is_col
+            } else {
+                b_is_col
+            }
+        }
+    };
     if a.is_empty() || b.is_empty() {
         return ok1(Value::empty());
     }
-    let n = a.len() + b.len() - 1;
-    let mut out = vec![Complex::ZERO; n];
+    let full_n = a.len() + b.len() - 1;
+    let mut full = vec![Complex::ZERO; full_n];
     for i in 0..a.len() {
         let ai = a.get_linear_c(i);
         for j in 0..b.len() {
-            out[i + j] = out[i + j] + ai * b.get_linear_c(j);
+            full[i + j] = full[i + j] + ai * b.get_linear_c(j);
         }
     }
-    ok1(Value::matrix(Matrix::complex_row_vec(out).normalize()))
+    let out: Vec<Complex> = match shape.as_str() {
+        "full" => full,
+        "same" => {
+            // MATLAB central slice of length a.len(): start = ceil((b.len() - 1) / 2) = b.len() / 2
+            let start = b.len() / 2;
+            full[start..start + a.len()].to_vec()
+        }
+        "valid" => {
+            if a.len() < b.len() {
+                return ok1(Value::empty());
+            }
+            let start = b.len() - 1;
+            let len = a.len() - b.len() + 1;
+            full[start..start + len].to_vec()
+        }
+        _ => unreachable!(),
+    };
+    let mat = if is_col {
+        Matrix::complex_col_vec(out)
+    } else {
+        Matrix::complex_row_vec(out)
+    };
+    ok1(Value::matrix(mat.normalize()))
 }
 
 fn fn_ndgrid(args: &[Value]) -> Result<Vec<Value>> {
