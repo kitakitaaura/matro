@@ -1057,31 +1057,55 @@ pub fn fn_conv2(args: &[Value]) -> Result<Vec<Value>> {
 
 /// Cumulative product: `cumprod(x)`.
 pub fn fn_cumprod(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("cumprod", "1", args.len()));
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity("cumprod", "1 to 3 (A [, dim [, direction]])", args.len()));
     }
-    let m = args[0].as_matrix()?;
-    if m.rows() <= 1 || m.cols() <= 1 {
-        let mut prod = Complex::ONE;
-        let mut vals = Vec::with_capacity(m.len());
-        for i in 0..m.len() {
-            prod = prod * m.get_linear_c(i);
-            vals.push(prod);
-        }
-        let res = if m.rows() == 1 {
-            Matrix::complex_row_vec(vals)
+    let m = args[0].to_dense_matrix()?;
+    let mut reverse = false;
+    let mut dim_opt: Option<usize> = None;
+    for a in &args[1..] {
+        if let Some(s) = crate::value_as_text(a) {
+            if s.eq_ignore_ascii_case("reverse") {
+                reverse = true;
+            }
         } else {
-            Matrix::complex_col_vec(vals)
-        };
-        return ok1(Value::matrix(res.normalize()));
-    }
-    let mut out = Matrix::zeros(m.rows(), m.cols());
-    for c in 0..m.cols() {
-        let mut prod = Complex::ONE;
-        for r in 0..m.rows() {
-            prod = prod * m.get_c(r, c);
-            out.set_c(r, c, prod);
+            dim_opt = Some(as_usize(a, "cumprod")?);
         }
+    }
+    let dim = dim_opt.unwrap_or(if m.rows() == 1 && m.cols() > 1 { 2 } else { 1 });
+    let mut out = Matrix::zeros(m.rows(), m.cols());
+    if dim == 1 {
+        for c in 0..m.cols() {
+            let mut prod = Complex::ONE;
+            if reverse {
+                for r in (0..m.rows()).rev() {
+                    prod = prod * m.get_c(r, c);
+                    out.set_c(r, c, prod);
+                }
+            } else {
+                for r in 0..m.rows() {
+                    prod = prod * m.get_c(r, c);
+                    out.set_c(r, c, prod);
+                }
+            }
+        }
+    } else if dim == 2 {
+        for r in 0..m.rows() {
+            let mut prod = Complex::ONE;
+            if reverse {
+                for c in (0..m.cols()).rev() {
+                    prod = prod * m.get_c(r, c);
+                    out.set_c(r, c, prod);
+                }
+            } else {
+                for c in 0..m.cols() {
+                    prod = prod * m.get_c(r, c);
+                    out.set_c(r, c, prod);
+                }
+            }
+        }
+    } else {
+        return Err(MatroError::runtime(format!("cumprod: unsupported dimension {dim}")));
     }
     ok1(Value::matrix(out.normalize()))
 }

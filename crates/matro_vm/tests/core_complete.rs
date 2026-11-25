@@ -1284,6 +1284,33 @@ fn core_base_matlab_extended_stdlib() {
         assert(d1 == 7 && d2 == 8 && d3 == 9);
         [e1, e2] = deal(42);
         assert(e1 == 42 && e2 == 42);
+
+        % 8. Multi-dimensional diff(X, n, dim), cumsum/cumprod/sort/any/all along dims
+        D = reshape(1:12, 3, 4);
+        assert(isequal(diff(D), ones(2, 4)));
+        assert(isequal(diff(D, 1, 1), ones(2, 4)));
+        assert(isequal(diff(D, 1, 2), 3 * ones(3, 3)));
+        assert(isequal(diff(D, 2, 1), zeros(1, 4)));
+        assert(size(diff(D, 3, 1), 1) == 0 && size(diff(D, 3, 1), 2) == 4);
+        assert(isequal(diff(D, 0, 1), D));
+        assert(isequal(diff(D, [], 2), 3 * ones(3, 3)));
+        D_fd = diff(eye(5), 1, 1);
+        assert(size(D_fd, 1) == 4 && size(D_fd, 2) == 5 && D_fd(1, 1) == -1 && D_fd(1, 2) == 1);
+        % 3D diff along dim 3
+        T3 = reshape(1:24, 2, 3, 4);
+        T3d = diff(T3, 1, 3);
+        assert(isequal(size(T3d), [2, 3, 3]) && all(T3d == 6, 'all'));
+        % Row vector diff
+        assert(isequal(diff([1, 4, 9, 16], 2), [2, 2]));
+
+        % cumsum, cumprod, sort, any, all with dim & direction
+        assert(isequal(cumsum([1, 2; 3, 4], 2), [1, 3; 3, 7]));
+        assert(isequal(cumsum([1, 2, 3], 'reverse'), [6, 5, 3]));
+        assert(isequal(cumprod([1, 2; 3, 4], 2), [1, 2; 3, 12]));
+        [Sb, Si] = sort([3, 1; 2, 4], 2, 'descend');
+        assert(isequal(Sb, [3, 1; 4, 2]) && isequal(Si, [1, 2; 2, 1]));
+        assert(isequal(any([0, 0; 1, 0], 2), logical([0; 1])));
+        assert(isequal(all([1, 1; 1, 0], 2), logical([1; 0])));
         "#,
     )
     .unwrap();

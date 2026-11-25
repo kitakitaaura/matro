@@ -815,12 +815,16 @@ fn fn_find(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
 }
 
 fn fn_any_all(name: &str, args: &[Value], is_all: bool) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity(name, "1", args.len()));
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity(name, "1 or 2 (A [, dim | 'all'])", args.len()));
     }
-    let m = args[0].as_matrix()?;
+    let m = args[0].to_dense_matrix()?;
     let pred = |c: Complex| !c.is_zero() && !c.re.is_nan() && !c.im.is_nan();
-    if m.rows() <= 1 || m.cols() <= 1 {
+    let all_mode = args
+        .get(1)
+        .and_then(value_as_text)
+        .is_some_and(|s| s.eq_ignore_ascii_case("all"));
+    if all_mode || (args.len() == 1 && (m.rows() <= 1 || m.cols() <= 1)) {
         let b = if is_all {
             (0..m.len()).all(|i| pred(m.get_linear_c(i)))
         } else {
@@ -828,16 +832,36 @@ fn fn_any_all(name: &str, args: &[Value], is_all: bool) -> Result<Vec<Value>> {
         };
         return ok1(Value::bool(b));
     }
-    let mut out = Vec::with_capacity(m.cols());
-    for c in 0..m.cols() {
-        let b = if is_all {
-            (0..m.rows()).all(|r| pred(m.get_c(r, c)))
-        } else {
-            (0..m.rows()).any(|r| pred(m.get_c(r, c)))
-        };
-        out.push(if b { 1.0 } else { 0.0 });
+    let dim = if let Some(a) = args.get(1) {
+        as_usize(a, name)?
+    } else {
+        1
+    };
+    if dim == 1 {
+        let mut out = Vec::with_capacity(m.cols());
+        for c in 0..m.cols() {
+            let b = if is_all {
+                (0..m.rows()).all(|r| pred(m.get_c(r, c)))
+            } else {
+                (0..m.rows()).any(|r| pred(m.get_c(r, c)))
+            };
+            out.push(if b { 1.0 } else { 0.0 });
+        }
+        ok1(Value::matrix(Matrix::row_vec(out).with_logical(true)))
+    } else if dim == 2 {
+        let mut out = Vec::with_capacity(m.rows());
+        for r in 0..m.rows() {
+            let b = if is_all {
+                (0..m.cols()).all(|c| pred(m.get_c(r, c)))
+            } else {
+                (0..m.cols()).any(|c| pred(m.get_c(r, c)))
+            };
+            out.push(if b { 1.0 } else { 0.0 });
+        }
+        ok1(Value::matrix(Matrix::col_vec(out).with_logical(true)))
+    } else {
+        Err(MatroError::runtime(format!("{name}: unsupported dimension {dim}")))
     }
-    ok1(Value::matrix(Matrix::row_vec(out).with_logical(true)))
 }
 
 fn fn_complex(args: &[Value]) -> Result<Vec<Value>> {
@@ -2103,40 +2127,154 @@ fn fn_ndgrid(args: &[Value]) -> Result<Vec<Value>> {
     Ok(vec![Value::matrix(x_out), Value::matrix(y_out)])
 }
 
-fn fn_sort(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 2 {
-        return Err(MatroError::arity("sort", "1 or 2", args.len()));
+fn matlab_f64_cmp(a: f64, b: f64, desc: bool) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => {
+            if desc {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        }
+        (false, true) => {
+            if desc {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            }
+        }
+        (false, false) => {
+            let ord = a.total_cmp(&b);
+            if desc { ord.reverse() } else { ord }
+        }
     }
-    let m = args[0].as_matrix()?;
-    let desc = args
-        .get(1)
-        .and_then(|v| v.as_str().ok())
-        .is_some_and(|s| s == "descend");
-    let mut pairs: Vec<(f64, usize)> = m
-        .data()
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(i, v)| (v, i + 1))
-        .collect();
-    pairs.sort_by(|a, b| {
-        let ord = a.0.total_cmp(&b.0);
-        if desc { ord.reverse() } else { ord }
-    });
-    let vals: Vec<f64> = pairs.iter().map(|p| p.0).collect();
-    let idxs: Vec<f64> = pairs.iter().map(|p| p.1 as f64).collect();
-    let is_row = m.rows() == 1;
-    let v_mat = if is_row {
-        Matrix::row_vec(vals)
+}
+
+fn fn_sort(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity(
+            "sort",
+            "1 to 3 (A [, dim [, direction]])",
+            args.len(),
+        ));
+    }
+    let m = args[0].to_dense_matrix()?;
+    let mut desc = false;
+    let mut dim_opt: Option<usize> = None;
+    for a in &args[1..] {
+        if let Some(s) = value_as_text(a) {
+            if s.eq_ignore_ascii_case("descend") {
+                desc = true;
+            } else if s.eq_ignore_ascii_case("ascend") {
+                desc = false;
+            } else {
+                return Err(MatroError::runtime(format!(
+                    "sort: unknown direction '{s}' (expected 'ascend' or 'descend')"
+                )));
+            }
+        } else {
+            let d = as_usize(a, "sort")?;
+            if d == 0 {
+                return Err(MatroError::runtime("sort: dimension must be >= 1"));
+            }
+            dim_opt = Some(d);
+        }
+    }
+    let dims = m.dims();
+    let dim = dim_opt.unwrap_or_else(|| dims.iter().position(|&d| d != 1).map_or(1, |i| i + 1));
+    let ax = dim - 1;
+    let total = m.len();
+    if ax >= dims.len() || dims[ax] <= 1 || total == 0 {
+        let i_mat = Matrix::ones_nd(dims);
+        return if nargout >= 2 {
+            Ok(vec![Value::matrix(m), Value::matrix(i_mat)])
+        } else {
+            ok1(Value::matrix(m))
+        };
+    }
+
+    let inner: usize = dims[..ax].iter().product();
+    let axis_len = dims[ax];
+    let outer: usize = dims[ax + 1..].iter().product();
+    let is_complex = m.is_complex();
+    let mut out_re = vec![0.0; total];
+    let mut out_im = if is_complex { vec![0.0; total] } else { Vec::new() };
+    let mut out_idx = vec![0.0; total];
+
+    if is_complex {
+        let mut pairs: Vec<(Complex, usize)> = Vec::with_capacity(axis_len);
+        for o in 0..outer {
+            let block = o * axis_len * inner;
+            for i in 0..inner {
+                pairs.clear();
+                for k in 0..axis_len {
+                    pairs.push((m.get_linear_c(block + k * inner + i), k + 1));
+                }
+                pairs.sort_by(|a, b| {
+                    let a_nan = a.0.re.is_nan() || a.0.im.is_nan();
+                    let b_nan = b.0.re.is_nan() || b.0.im.is_nan();
+                    match (a_nan, b_nan) {
+                        (true, true) => std::cmp::Ordering::Equal,
+                        (true, false) => {
+                            if desc {
+                                std::cmp::Ordering::Less
+                            } else {
+                                std::cmp::Ordering::Greater
+                            }
+                        }
+                        (false, true) => {
+                            if desc {
+                                std::cmp::Ordering::Greater
+                            } else {
+                                std::cmp::Ordering::Less
+                            }
+                        }
+                        (false, false) => {
+                            let ord = a
+                                .0
+                                .norm_sq()
+                                .total_cmp(&b.0.norm_sq())
+                                .then_with(|| a.0.im.atan2(a.0.re).total_cmp(&b.0.im.atan2(b.0.re)));
+                            if desc { ord.reverse() } else { ord }
+                        }
+                    }
+                });
+                for (k, &(val, idx)) in pairs.iter().enumerate() {
+                    let pos = block + k * inner + i;
+                    out_re[pos] = val.re;
+                    out_im[pos] = val.im;
+                    out_idx[pos] = idx as f64;
+                }
+            }
+        }
     } else {
-        Matrix::col_vec(vals)
+        let src = m.data();
+        let mut pairs: Vec<(f64, usize)> = Vec::with_capacity(axis_len);
+        for o in 0..outer {
+            let block = o * axis_len * inner;
+            for i in 0..inner {
+                pairs.clear();
+                for k in 0..axis_len {
+                    pairs.push((src[block + k * inner + i], k + 1));
+                }
+                pairs.sort_by(|a, b| matlab_f64_cmp(a.0, b.0, desc));
+                for (k, &(val, idx)) in pairs.iter().enumerate() {
+                    let pos = block + k * inner + i;
+                    out_re[pos] = val;
+                    out_idx[pos] = idx as f64;
+                }
+            }
+        }
+    }
+
+    let v_mat = if is_complex {
+        Matrix::from_nd_complex_col_major(dims.clone(), out_re, out_im)?
+    } else {
+        Matrix::from_nd_col_major(dims.clone(), out_re)?
     };
     if nargout >= 2 {
-        let i_mat = if is_row {
-            Matrix::row_vec(idxs)
-        } else {
-            Matrix::col_vec(idxs)
-        };
+        let i_mat = Matrix::from_nd_col_major(dims, out_idx)?;
         Ok(vec![Value::matrix(v_mat), Value::matrix(i_mat)])
     } else {
         ok1(Value::matrix(v_mat))
@@ -2144,40 +2282,219 @@ fn fn_sort(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
 }
 
 fn fn_cumsum(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("cumsum", "1", args.len()));
+    if args.is_empty() || args.len() > 4 {
+        return Err(MatroError::arity(
+            "cumsum",
+            "1 to 4 (A [, dim [, direction [, nanflag]]])",
+            args.len(),
+        ));
     }
-    let m = args[0].as_matrix()?;
-    let mut acc = 0.0;
-    let out: Vec<f64> = m
-        .data()
-        .iter()
-        .map(|&v| {
-            acc += v;
-            acc
-        })
-        .collect();
-    let res = if m.rows() == 1 {
-        Matrix::row_vec(out)
+    let m = args[0].to_dense_matrix()?;
+    let mut reverse = false;
+    let mut omitnan = false;
+    let mut dim_opt: Option<usize> = None;
+    for a in &args[1..] {
+        if let Some(s) = value_as_text(a) {
+            if s.eq_ignore_ascii_case("reverse") {
+                reverse = true;
+            } else if s.eq_ignore_ascii_case("forward") {
+                reverse = false;
+            } else if s.eq_ignore_ascii_case("omitnan") || s.eq_ignore_ascii_case("omitmissing") {
+                omitnan = true;
+            } else if s.eq_ignore_ascii_case("includenan")
+                || s.eq_ignore_ascii_case("includemissing")
+            {
+                omitnan = false;
+            } else {
+                return Err(MatroError::runtime(format!("cumsum: unknown option '{s}'")));
+            }
+        } else {
+            let d = as_usize(a, "cumsum")?;
+            if d == 0 {
+                return Err(MatroError::runtime("cumsum: dimension must be >= 1"));
+            }
+            dim_opt = Some(d);
+        }
+    }
+    let dims = m.dims();
+    let dim = dim_opt.unwrap_or_else(|| dims.iter().position(|&d| d != 1).map_or(1, |i| i + 1));
+    let ax = dim - 1;
+    let total = m.len();
+    if total == 0 {
+        return ok1(Value::matrix(m));
+    }
+    if ax >= dims.len() || dims[ax] <= 1 {
+        if !omitnan {
+            return ok1(Value::matrix(m));
+        }
+    }
+
+    let inner: usize = if ax < dims.len() {
+        dims[..ax].iter().product()
     } else {
-        Matrix::col_vec(out)
+        total
+    };
+    let axis_len = if ax < dims.len() { dims[ax] } else { 1 };
+    let outer: usize = if ax < dims.len() {
+        dims[ax + 1..].iter().product()
+    } else {
+        1
+    };
+    let is_complex = m.is_complex();
+    let mut out_re = vec![0.0; total];
+    let mut out_im = if is_complex { vec![0.0; total] } else { Vec::new() };
+
+    for o in 0..outer {
+        let block = o * axis_len * inner;
+        for i in 0..inner {
+            let mut acc = Complex::ZERO;
+            if reverse {
+                for k in (0..axis_len).rev() {
+                    let pos = block + k * inner + i;
+                    let v = m.get_linear_c(pos);
+                    if !(omitnan && (v.re.is_nan() || v.im.is_nan())) {
+                        acc = acc + v;
+                    }
+                    out_re[pos] = acc.re;
+                    if is_complex {
+                        out_im[pos] = acc.im;
+                    }
+                }
+            } else {
+                for k in 0..axis_len {
+                    let pos = block + k * inner + i;
+                    let v = m.get_linear_c(pos);
+                    if !(omitnan && (v.re.is_nan() || v.im.is_nan())) {
+                        acc = acc + v;
+                    }
+                    out_re[pos] = acc.re;
+                    if is_complex {
+                        out_im[pos] = acc.im;
+                    }
+                }
+            }
+        }
+    }
+
+    let res = if is_complex {
+        Matrix::from_nd_complex_col_major(dims, out_re, out_im)?
+    } else {
+        Matrix::from_nd_col_major(dims, out_re)?
     };
     ok1(Value::matrix(res))
 }
 
 fn fn_diff(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("diff", "1", args.len()));
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity(
+            "diff",
+            "1 to 3 (X [, n [, dim]])",
+            args.len(),
+        ));
     }
-    let m = args[0].as_matrix()?;
-    if m.len() < 2 {
-        return ok1(Value::empty());
-    }
-    let out: Vec<f64> = m.data().windows(2).map(|w| w[1] - w[0]).collect();
-    let res = if m.rows() == 1 {
-        Matrix::row_vec(out)
+    let m = args[0].to_dense_matrix()?;
+    let order = if let Some(n_val) = args.get(1) {
+        if n_val.to_dense_matrix().is_ok_and(|nm| nm.is_empty()) {
+            1
+        } else {
+            as_usize(n_val, "diff")?
+        }
     } else {
-        Matrix::col_vec(out)
+        1
+    };
+    let dim_opt = if let Some(d_val) = args.get(2) {
+        let d = as_usize(d_val, "diff")?;
+        if d == 0 {
+            return Err(MatroError::runtime("diff: dimension must be >= 1"));
+        }
+        Some(d)
+    } else {
+        None
+    };
+
+    if order == 0 {
+        return ok1(Value::matrix(m));
+    }
+
+    let mut cur_dims = m.dims();
+    let mut cur_re = m.data().to_vec();
+    let mut cur_im = m.imag_data().map(|s| s.to_vec());
+
+    for _ in 0..order {
+        let ax = if let Some(d) = dim_opt {
+            d - 1
+        } else if let Some(i) = cur_dims.iter().position(|&sz| sz != 1) {
+            i
+        } else {
+            return ok1(Value::empty());
+        };
+
+        if ax >= cur_dims.len() {
+            while cur_dims.len() <= ax {
+                cur_dims.push(1);
+            }
+            cur_dims[ax] = 0;
+            cur_re.clear();
+            if let Some(im) = &mut cur_im {
+                im.clear();
+            }
+            break;
+        }
+
+        let axis_len = cur_dims[ax];
+        if axis_len <= 1 {
+            cur_dims[ax] = 0;
+            cur_re.clear();
+            if let Some(im) = &mut cur_im {
+                im.clear();
+            }
+            break;
+        }
+
+        let inner: usize = cur_dims[..ax].iter().product();
+        let outer: usize = cur_dims[ax + 1..].iter().product();
+        let new_axis_len = axis_len - 1;
+        let new_total = inner * new_axis_len * outer;
+
+        let mut next_re = vec![0.0; new_total];
+        if let Some(im) = &cur_im {
+            let mut next_im = vec![0.0; new_total];
+            for o in 0..outer {
+                let src_o = o * axis_len * inner;
+                let dst_o = o * new_axis_len * inner;
+                for k in 0..new_axis_len {
+                    let s0 = src_o + k * inner;
+                    let s1 = s0 + inner;
+                    let d0 = dst_o + k * inner;
+                    for i in 0..inner {
+                        next_re[d0 + i] = cur_re[s1 + i] - cur_re[s0 + i];
+                        next_im[d0 + i] = im[s1 + i] - im[s0 + i];
+                    }
+                }
+            }
+            cur_im = Some(next_im);
+        } else {
+            for o in 0..outer {
+                let src_o = o * axis_len * inner;
+                let dst_o = o * new_axis_len * inner;
+                for k in 0..new_axis_len {
+                    let s0 = src_o + k * inner;
+                    let s1 = s0 + inner;
+                    let d0 = dst_o + k * inner;
+                    for i in 0..inner {
+                        next_re[d0 + i] = cur_re[s1 + i] - cur_re[s0 + i];
+                    }
+                }
+            }
+        }
+        cur_re = next_re;
+        cur_dims[ax] = new_axis_len;
+    }
+
+    let res = if let Some(im) = cur_im {
+        Matrix::from_nd_complex_col_major(cur_dims, cur_re, im)?
+    } else {
+        Matrix::from_nd_col_major(cur_dims, cur_re)?
     };
     ok1(Value::matrix(res))
 }
