@@ -1187,6 +1187,7 @@ impl Parser {
                 TokenKind::Slash => BinaryOp::Div,
                 TokenKind::DotSlash => BinaryOp::ElemDiv,
                 TokenKind::Backslash => BinaryOp::LeftDiv,
+                TokenKind::DotBackslash => BinaryOp::ElemLeftDiv,
                 _ => break,
             };
             let span = self.bump().span;
@@ -1387,17 +1388,31 @@ impl Parser {
             }
             TokenKind::True => {
                 self.bump();
-                Ok(Expr {
-                    kind: ExprKind::Bool(true),
-                    span: tok.span,
-                })
+                if matches!(self.peek_kind(), TokenKind::LParen) {
+                    Ok(Expr {
+                        kind: ExprKind::Ident("true".to_string()),
+                        span: tok.span,
+                    })
+                } else {
+                    Ok(Expr {
+                        kind: ExprKind::Bool(true),
+                        span: tok.span,
+                    })
+                }
             }
             TokenKind::False => {
                 self.bump();
-                Ok(Expr {
-                    kind: ExprKind::Bool(false),
-                    span: tok.span,
-                })
+                if matches!(self.peek_kind(), TokenKind::LParen) {
+                    Ok(Expr {
+                        kind: ExprKind::Ident("false".to_string()),
+                        span: tok.span,
+                    })
+                } else {
+                    Ok(Expr {
+                        kind: ExprKind::Bool(false),
+                        span: tok.span,
+                    })
+                }
             }
             TokenKind::String(s) => {
                 self.bump();

@@ -78,25 +78,74 @@ pub fn fn_erfc(args: &[Value]) -> Result<Vec<Value>> {
     ok1(Value::matrix(args[0].as_matrix()?.map(erfc_f64)))
 }
 
-fn slice_var(xs: &[f64], pop: bool) -> f64 {
-    let n = xs.len();
+fn slice_var_c(xs: &[(f64, f64)], w: Option<&[f64]>, pop: bool, omit_nan: bool) -> (f64, (f64, f64)) {
+    let mut vals: Vec<(f64, f64)> = Vec::with_capacity(xs.len());
+    let mut wts: Vec<f64> = Vec::new();
+    for (i, &(re, im)) in xs.iter().enumerate() {
+        let is_nan = re.is_nan() || im.is_nan();
+        if is_nan {
+            if omit_nan {
+                continue;
+            } else {
+                return (f64::NAN, (f64::NAN, f64::NAN));
+            }
+        }
+        vals.push((re, im));
+        if let Some(wv) = w {
+            wts.push(wv[i]);
+        }
+    }
+    let n = vals.len();
     if n == 0 {
-        return f64::NAN;
+        return (f64::NAN, (f64::NAN, 0.0));
     }
+    if let Some(_) = w {
+        let wsum: f64 = wts.iter().sum();
+        if wsum <= 0.0 {
+            return (f64::NAN, (f64::NAN, 0.0));
+        }
+        let mr: f64 = vals.iter().zip(wts.iter()).map(|(v, &wi)| v.0 * wi).sum::<f64>() / wsum;
+        let mi: f64 = vals.iter().zip(wts.iter()).map(|(v, &wi)| v.1 * wi).sum::<f64>() / wsum;
+        let ss: f64 = vals
+            .iter()
+            .zip(wts.iter())
+            .map(|(v, &wi)| wi * ((v.0 - mr) * (v.0 - mr) + (v.1 - mi) * (v.1 - mi)))
+            .sum();
+        return (ss / wsum, (mr, mi));
+    }
+    let mr = vals.iter().map(|v| v.0).sum::<f64>() / n as f64;
+    let mi = vals.iter().map(|v| v.1).sum::<f64>() / n as f64;
     if n == 1 {
-        return 0.0;
+        return (0.0, (mr, mi));
     }
-    let mean = xs.iter().sum::<f64>() / n as f64;
-    let ss: f64 = xs.iter().map(|&x| (x - mean) * (x - mean)).sum();
+    let ss: f64 = vals
+        .iter()
+        .map(|v| (v.0 - mr) * (v.0 - mr) + (v.1 - mi) * (v.1 - mi))
+        .sum();
     let denom = if pop { n as f64 } else { (n - 1) as f64 };
-    ss / denom
+    (ss / denom, (mr, mi))
 }
 
-fn slice_median(xs: &[f64]) -> f64 {
-    if xs.is_empty() {
+fn slice_var(xs: &[f64], pop: bool) -> f64 {
+    let pairs: Vec<(f64, f64)> = xs.iter().map(|&x| (x, 0.0)).collect();
+    slice_var_c(&pairs, None, pop, false).0
+}
+
+fn slice_median_opt(xs: &[f64], omit_nan: bool) -> f64 {
+    let mut v = Vec::with_capacity(xs.len());
+    for &x in xs {
+        if x.is_nan() {
+            if omit_nan {
+                continue;
+            } else {
+                return f64::NAN;
+            }
+        }
+        v.push(x);
+    }
+    if v.is_empty() {
         return f64::NAN;
     }
-    let mut v = xs.to_vec();
     v.sort_by(f64::total_cmp);
     let n = v.len();
     if n % 2 == 1 {
@@ -106,11 +155,15 @@ fn slice_median(xs: &[f64]) -> f64 {
     }
 }
 
-fn slice_quantile(xs: &[f64], q: f64) -> f64 {
-    if xs.is_empty() || !(0.0..=1.0).contains(&q) {
+pub fn slice_quantile(xs: &[f64], q: f64) -> f64 {
+    if !(0.0..=1.0).contains(&q) {
         return f64::NAN;
     }
-    let mut v = xs.to_vec();
+    // MATLAB quantile/prctile omit NaNs by default
+    let mut v: Vec<f64> = xs.iter().copied().filter(|x| !x.is_nan()).collect();
+    if v.is_empty() {
+        return f64::NAN;
+    }
     v.sort_by(f64::total_cmp);
     let n = v.len();
     if n == 1 {
@@ -130,104 +183,301 @@ fn slice_quantile(xs: &[f64], q: f64) -> f64 {
     v[lo] * (1.0 - frac) + v[hi] * frac
 }
 
-fn reduce_stats(
-    name: &str,
+/// N-D reduction along one or more dimensions (0-based `reduce_dims`) or `'all'`.
+pub fn reduce_nd_real(
     m: &Matrix,
-    dim_opt: Option<usize>,
+    all: bool,
+    dims_1based: Option<&[usize]>,
     f: impl Fn(&[f64]) -> f64,
-) -> Result<Vec<Value>> {
-    if m.is_empty() {
-        return ok1(Value::scalar(f64::NAN));
+) -> Result<Matrix> {
+    if all {
+        return Ok(Matrix::scalar(f(m.data())));
     }
-    if dim_opt.is_none() && (m.rows() == 1 || m.cols() == 1) {
-        return ok1(Value::scalar(f(m.data())));
+    let dims = m.dims();
+    let target_dims: Vec<usize> = match dims_1based {
+        Some(ds) => ds.iter().map(|&d| d.saturating_sub(1)).collect(),
+        None => {
+            let first = dims.iter().position(|&d| d != 1).unwrap_or(0);
+            vec![first]
+        }
+    };
+    let max_d = target_dims.iter().copied().max().unwrap_or(0) + 1;
+    let nd = dims.len().max(max_d);
+    let mut ext_dims = dims.clone();
+    ext_dims.resize(nd, 1);
+
+    let mut out_dims = ext_dims.clone();
+    for &td in &target_dims {
+        out_dims[td] = 1;
     }
+    while out_dims.len() > 2 && *out_dims.last().unwrap() == 1 {
+        out_dims.pop();
+    }
+    let out_total: usize = out_dims.iter().product();
+    if out_total == 0 {
+        return Ok(Matrix::zeros_nd(out_dims));
+    }
+
+    let mut in_strides = vec![1usize; nd];
+    for d in 1..nd {
+        in_strides[d] = in_strides[d - 1] * ext_dims[d - 1];
+    }
+    let mut out_ext = ext_dims.clone();
+    for &td in &target_dims {
+        out_ext[td] = 1;
+    }
+    let mut out_strides = vec![1usize; nd];
+    for d in 1..nd {
+        out_strides[d] = out_strides[d - 1] * out_ext[d - 1];
+    }
+
+    let mut buckets: Vec<Vec<f64>> = vec![Vec::new(); out_total];
+    for lin in 0..m.len() {
+        let mut rem = lin;
+        let mut out_lin = 0usize;
+        for d in 0..nd {
+            let coord = rem % ext_dims[d];
+            rem /= ext_dims[d];
+            if out_ext[d] > 1 {
+                out_lin += coord * out_strides[d];
+            }
+        }
+        buckets[out_lin].push(m.data()[lin]);
+    }
+    let out_data: Vec<f64> = buckets.iter().map(|b| f(b)).collect();
+    Matrix::from_nd_col_major(out_dims, out_data)
+}
+
+/// `std(x [, w [, dim [, nanflag]]])` and `var(x [, w [, dim [, nanflag]]])` with `[S, M]` outputs.
+pub fn fn_std_var(name: &str, args: &[Value], nargout: usize, take_sqrt: bool) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 4 {
+        return Err(MatroError::arity(name, "1 to 4", args.len()));
+    }
+    let m = args[0].to_dense_matrix()?;
+    let mut omit_nan = false;
+    let mut all_flag = false;
+    let mut pos_args: Vec<&Value> = Vec::new();
+    for a in &args[1..] {
+        if let Some(s) = crate::value_as_text(a) {
+            match s.to_ascii_lowercase().as_str() {
+                "omitnan" | "omitmissing" => omit_nan = true,
+                "includenan" | "includemissing" => omit_nan = false,
+                "all" => all_flag = true,
+                other => return Err(MatroError::runtime(format!("{name}: unknown option '{other}'"))),
+            }
+        } else {
+            pos_args.push(a);
+        }
+    }
+
+    let mut pop = false;
+    let mut weight_vec: Option<Vec<f64>> = None;
+    if let Some(w_val) = pos_args.first() {
+        let wm = w_val.to_dense_matrix()?;
+        if !wm.is_empty() {
+            if wm.len() == 1 {
+                pop = wm.data()[0] != 0.0;
+            } else {
+                weight_vec = Some(wm.data().to_vec());
+            }
+        }
+    }
+
+    let dims_opt: Option<Vec<usize>> = if let Some(d_val) = pos_args.get(1) {
+        let dm = d_val.to_dense_matrix()?;
+        Some(dm.data().iter().map(|&v| v.max(1.0).round() as usize).collect())
+    } else {
+        None
+    };
+
+    if all_flag {
+        let pairs: Vec<(f64, f64)> = (0..m.len())
+            .map(|i| {
+                let z = m.get_linear_c(i);
+                (z.re, z.im)
+            })
+            .collect();
+        let (v, mu) = slice_var_c(&pairs, weight_vec.as_deref(), pop, omit_nan);
+        let s = if take_sqrt { v.sqrt() } else { v };
+        if nargout >= 2 {
+            let mu_m = Matrix::complex_scalar(matro_types::Complex::new(mu.0, mu.1)).normalize();
+            return Ok(vec![Value::scalar(s), Value::matrix(mu_m)]);
+        }
+        return ok1(Value::scalar(s));
+    }
+
+    let dims = m.dims();
+    let target_dims: Vec<usize> = match dims_opt {
+        Some(ds) => ds.into_iter().map(|d| d.saturating_sub(1)).collect(),
+        None => {
+            let first = dims.iter().position(|&d| d != 1).unwrap_or(0);
+            vec![first]
+        }
+    };
+    let max_d = target_dims.iter().copied().max().unwrap_or(0) + 1;
+    let nd = dims.len().max(max_d);
+    let mut ext_dims = dims.clone();
+    ext_dims.resize(nd, 1);
+
+    let mut out_ext = ext_dims.clone();
+    for &td in &target_dims {
+        out_ext[td] = 1;
+    }
+    let mut out_dims = out_ext.clone();
+    while out_dims.len() > 2 && *out_dims.last().unwrap() == 1 {
+        out_dims.pop();
+    }
+    let out_total: usize = out_dims.iter().product();
+    if out_total == 0 {
+        let empty = Matrix::zeros_nd(out_dims);
+        return if nargout >= 2 {
+            Ok(vec![Value::matrix(empty.clone()), Value::matrix(empty)])
+        } else {
+            ok1(Value::matrix(empty))
+        };
+    }
+
+    let mut out_strides = vec![1usize; nd];
+    for d in 1..nd {
+        out_strides[d] = out_strides[d - 1] * out_ext[d - 1];
+    }
+    let mut buckets: Vec<Vec<(f64, f64)>> = vec![Vec::new(); out_total];
+    for lin in 0..m.len() {
+        let mut rem = lin;
+        let mut out_lin = 0usize;
+        for d in 0..nd {
+            let coord = rem % ext_dims[d];
+            rem /= ext_dims[d];
+            if out_ext[d] > 1 {
+                out_lin += coord * out_strides[d];
+            }
+        }
+        let z = m.get_linear_c(lin);
+        buckets[out_lin].push((z.re, z.im));
+    }
+
+    let mut s_data = Vec::with_capacity(out_total);
+    let mut mu_re = Vec::with_capacity(out_total);
+    let mut mu_im = Vec::with_capacity(out_total);
+    for b in &buckets {
+        let w_slice = match &weight_vec {
+            Some(wv) if wv.len() == b.len() => Some(wv.as_slice()),
+            Some(_) => {
+                return Err(MatroError::dimension(format!(
+                    "{name}: weight vector length must match operating dimension"
+                )));
+            }
+            None => None,
+        };
+        let (v, mu) = slice_var_c(b, w_slice, pop, omit_nan);
+        s_data.push(if take_sqrt { v.sqrt() } else { v });
+        mu_re.push(mu.0);
+        mu_im.push(mu.1);
+    }
+    let s_mat = Matrix::from_nd_col_major(out_dims.clone(), s_data)?;
+    if nargout >= 2 {
+        let mu_mat = Matrix::from_nd_complex_col_major(out_dims, mu_re, mu_im)?.normalize();
+        Ok(vec![Value::matrix(s_mat), Value::matrix(mu_mat)])
+    } else {
+        ok1(Value::matrix(s_mat))
+    }
+}
+
+pub fn fn_median(args: &[Value]) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity("median", "1 to 3", args.len()));
+    }
+    let m = args[0].to_dense_matrix()?;
+    let mut omit_nan = false;
+    let mut all_flag = false;
+    let mut dims_opt: Option<Vec<usize>> = None;
+    for a in &args[1..] {
+        if let Some(s) = crate::value_as_text(a) {
+            match s.to_ascii_lowercase().as_str() {
+                "omitnan" | "omitmissing" => omit_nan = true,
+                "includenan" | "includemissing" => omit_nan = false,
+                "all" => all_flag = true,
+                other => return Err(MatroError::runtime(format!("median: unknown option '{other}'"))),
+            }
+        } else {
+            let dm = a.to_dense_matrix()?;
+            dims_opt = Some(dm.data().iter().map(|&v| v.max(1.0).round() as usize).collect());
+        }
+    }
+    ok1(Value::matrix(reduce_nd_real(
+        &m,
+        all_flag,
+        dims_opt.as_deref(),
+        |xs| slice_median_opt(xs, omit_nan),
+    )?))
+}
+
+pub fn fn_quantile(name: &str, args: &[Value], percent: bool) -> Result<Vec<Value>> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(MatroError::arity(name, "2 or 3 (x, p [, dim])", args.len()));
+    }
+    let x = args[0].to_dense_matrix()?;
+    let p_raw = args[1].to_dense_matrix()?;
+    let scale = if percent { 0.01 } else { 1.0 };
+
+    // Integer N > 1 in `quantile(x, N)` produces N evenly spaced quantiles (1:N)/(N+1)
+    let (probs, p_dims): (Vec<f64>, Vec<usize>) =
+        if !percent && p_raw.len() == 1 && p_raw.data()[0] >= 1.0 && p_raw.data()[0] == p_raw.data()[0].floor() && p_raw.data()[0] > 1.0 {
+            let nq = p_raw.data()[0] as usize;
+            let ps: Vec<f64> = (1..=nq).map(|k| k as f64 / (nq + 1) as f64).collect();
+            (ps, vec![1, nq])
+        } else {
+            let ps: Vec<f64> = p_raw.data().iter().map(|&v| v * scale).collect();
+            (ps, p_raw.dims())
+        };
+
+    let all_flag = args
+        .get(2)
+        .and_then(crate::value_as_text)
+        .is_some_and(|s| s.eq_ignore_ascii_case("all"));
+    let dim_opt = if all_flag {
+        None
+    } else if let Some(d) = args.get(2) {
+        Some(d.as_scalar()?.max(1.0).round() as usize)
+    } else {
+        None
+    };
+
+    if all_flag || (dim_opt.is_none() && (x.rows() <= 1 || x.cols() <= 1) && x.ndims() <= 2) {
+        let vals: Vec<f64> = probs.iter().map(|&q| slice_quantile(x.data(), q)).collect();
+        let out = if vals.len() == 1 {
+            Matrix::scalar(vals[0])
+        } else {
+            Matrix::from_nd_col_major(p_dims, vals)?
+        };
+        return ok1(Value::matrix(out));
+    }
+
     let dim = dim_opt.unwrap_or(1);
     if dim == 1 {
-        let mut out = Vec::with_capacity(m.cols());
-        for c in 0..m.cols() {
-            let col: Vec<f64> = (0..m.rows()).map(|r| m.get(r, c)).collect();
-            out.push(f(&col));
+        let mut out = Matrix::zeros(probs.len(), x.cols());
+        for c in 0..x.cols() {
+            let col: Vec<f64> = (0..x.rows()).map(|r| x.get(r, c)).collect();
+            for (ri, &q) in probs.iter().enumerate() {
+                out.set(ri, c, slice_quantile(&col, q));
+            }
         }
-        ok1(Value::matrix(Matrix::row_vec(out)))
+        ok1(Value::matrix(out))
     } else if dim == 2 {
-        let mut out = Vec::with_capacity(m.rows());
-        for r in 0..m.rows() {
-            let row: Vec<f64> = (0..m.cols()).map(|c| m.get(r, c)).collect();
-            out.push(f(&row));
+        let mut out = Matrix::zeros(x.rows(), probs.len());
+        for r in 0..x.rows() {
+            let row: Vec<f64> = (0..x.cols()).map(|c| x.get(r, c)).collect();
+            for (ci, &q) in probs.iter().enumerate() {
+                out.set(r, ci, slice_quantile(&row, q));
+            }
         }
-        ok1(Value::matrix(Matrix::col_vec(out)))
+        ok1(Value::matrix(out))
     } else {
         Err(MatroError::runtime(format!("{name}: unsupported dimension {dim}")))
     }
 }
 
-/// `std(x [, w [, dim]])` and `var(x [, w [, dim]])`
-pub fn fn_std_var(name: &str, args: &[Value], take_sqrt: bool) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 3 {
-        return Err(MatroError::arity(name, "1 to 3", args.len()));
-    }
-    let m = args[0].as_matrix()?;
-    let pop = if let Some(w_val) = args.get(1) {
-        let wm = w_val.as_matrix()?;
-        !wm.is_empty() && wm.data()[0] != 0.0
-    } else {
-        false
-    };
-    let dim = if let Some(d_val) = args.get(2) {
-        Some(d_val.as_scalar()?.max(1.0).round() as usize)
-    } else {
-        None
-    };
-    reduce_stats(name, m, dim, |xs| {
-        let v = slice_var(xs, pop);
-        if take_sqrt { v.sqrt() } else { v }
-    })
-}
-
-pub fn fn_median(args: &[Value]) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 2 {
-        return Err(MatroError::arity("median", "1 or 2", args.len()));
-    }
-    let m = args[0].as_matrix()?;
-    let dim = args
-        .get(1)
-        .map(|v| v.as_scalar().map(|s| s.max(1.0).round() as usize))
-        .transpose()?;
-    reduce_stats("median", m, dim, slice_median)
-}
-
-pub fn fn_quantile(name: &str, args: &[Value], percent: bool) -> Result<Vec<Value>> {
-    if args.len() != 2 {
-        return Err(MatroError::arity(name, "2 (x, p)", args.len()));
-    }
-    let x = args[0].as_matrix()?;
-    let p = args[1].as_matrix()?;
-    let scale = if percent { 0.01 } else { 1.0 };
-    if x.rows() <= 1 || x.cols() <= 1 {
-        let vals: Vec<f64> = p
-            .data()
-            .iter()
-            .map(|&pi| slice_quantile(x.data(), pi * scale))
-            .collect();
-        let out = if p.len() == 1 {
-            Matrix::scalar(vals[0])
-        } else {
-            Matrix::row_vec(vals)
-        };
-        return ok1(Value::matrix(out));
-    }
-    let mut out = Matrix::zeros(p.len(), x.cols());
-    for c in 0..x.cols() {
-        let col: Vec<f64> = (0..x.rows()).map(|r| x.get(r, c)).collect();
-        for (ri, &pi) in p.data().iter().enumerate() {
-            out.set(ri, c, slice_quantile(&col, pi * scale));
-        }
-    }
-    ok1(Value::matrix(out))
-}
-
-fn cov_matrix_from_cols(cols: &[Vec<f64>]) -> Matrix {
+fn cov_matrix_from_cols(cols: &[Vec<f64>], pop: bool) -> Matrix {
     let k = cols.len();
     let n = cols.first().map_or(0, Vec::len);
     if k == 0 || n == 0 {
@@ -237,7 +487,13 @@ fn cov_matrix_from_cols(cols: &[Vec<f64>]) -> Matrix {
         .iter()
         .map(|col| col.iter().sum::<f64>() / n as f64)
         .collect();
-    let denom = if n > 1 { (n - 1) as f64 } else { 1.0 };
+    let denom = if pop {
+        n as f64
+    } else if n > 1 {
+        (n - 1) as f64
+    } else {
+        1.0
+    };
     let mut out = Matrix::zeros(k, k);
     for i in 0..k {
         for j in i..k {
@@ -253,13 +509,52 @@ fn cov_matrix_from_cols(cols: &[Vec<f64>]) -> Matrix {
     out
 }
 
-pub fn fn_cov_or_corr(name: &str, args: &[Value], normalize_corr: bool) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 2 {
-        return Err(MatroError::arity(name, "1 or 2", args.len()));
+pub fn fn_cov_or_corr(
+    name: &str,
+    args: &[Value],
+    nargout: usize,
+    normalize_corr: bool,
+) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 5 {
+        return Err(MatroError::arity(name, "1 to 4", args.len()));
     }
-    let cols: Vec<Vec<f64>> = if args.len() == 2 {
-        let a = args[0].as_matrix()?.data().to_vec();
-        let b = args[1].as_matrix()?.data().to_vec();
+    let mut omit_rows = false;
+    let mut pop = false;
+    let mut data_args: Vec<&Value> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(s) = crate::value_as_text(&args[i]) {
+            match s.to_ascii_lowercase().as_str() {
+                "omitrows" | "partialrows" => omit_rows = true,
+                "includenan" => omit_rows = false,
+                "rows" => {
+                    if let Some(v) = args.get(i + 1).and_then(crate::value_as_text) {
+                        omit_rows = v.eq_ignore_ascii_case("complete")
+                            || v.eq_ignore_ascii_case("pairwise");
+                    }
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        } else {
+            data_args.push(&args[i]);
+        }
+        i += 1;
+    }
+
+    // For cov: detect trailing scalar weight w (0 or 1)
+    if !normalize_corr && data_args.len() >= 2 {
+        let last = data_args.last().unwrap().to_dense_matrix()?;
+        if last.len() == 1 && (data_args.len() == 3 || data_args[0].to_dense_matrix()?.len() > 1) {
+            pop = last.data()[0] != 0.0;
+            data_args.pop();
+        }
+    }
+
+    let mut cols: Vec<Vec<f64>> = if data_args.len() >= 2 {
+        let a = data_args[0].to_dense_matrix()?.data().to_vec();
+        let b = data_args[1].to_dense_matrix()?.data().to_vec();
         if a.len() != b.len() {
             return Err(MatroError::dimension(format!(
                 "{name}: input vectors must have the same length"
@@ -267,7 +562,7 @@ pub fn fn_cov_or_corr(name: &str, args: &[Value], normalize_corr: bool) -> Resul
         }
         vec![a, b]
     } else {
-        let m = args[0].as_matrix()?;
+        let m = data_args[0].to_dense_matrix()?;
         if m.rows() == 1 || m.cols() == 1 {
             vec![m.data().to_vec()]
         } else {
@@ -276,10 +571,23 @@ pub fn fn_cov_or_corr(name: &str, args: &[Value], normalize_corr: bool) -> Resul
                 .collect()
         }
     };
-    let mut cov = cov_matrix_from_cols(&cols);
+
+    if omit_rows && !cols.is_empty() {
+        let n = cols[0].len();
+        let keep: Vec<usize> = (0..n)
+            .filter(|&r| cols.iter().all(|c| !c[r].is_nan()))
+            .collect();
+        for col in &mut cols {
+            *col = keep.iter().map(|&r| col[r]).collect();
+        }
+    }
+
+    let n_obs = cols.first().map_or(0, Vec::len);
+    let mut cov = cov_matrix_from_cols(&cols, pop);
     if normalize_corr {
         let k = cov.rows();
         let stds: Vec<f64> = (0..k).map(|i| cov.get(i, i).max(0.0).sqrt()).collect();
+        let mut pmat = Matrix::ones(k, k);
         for i in 0..k {
             for j in 0..k {
                 let d = stds[i] * stds[j];
@@ -291,51 +599,84 @@ pub fn fn_cov_or_corr(name: &str, args: &[Value], normalize_corr: bool) -> Resul
                     f64::NAN
                 };
                 cov.set(i, j, r);
+                if i != j && n_obs > 2 && r.is_finite() {
+                    let denom = (1.0 - r * r).max(0.0);
+                    let pval = if denom <= 1e-30 {
+                        0.0
+                    } else {
+                        let t = r.abs() * ((n_obs - 2) as f64 / denom).sqrt();
+                        let df = (n_obs - 2) as f64;
+                        betainc(df / (df + t * t), 0.5 * df, 0.5).clamp(0.0, 1.0)
+                    };
+                    pmat.set(i, j, pval);
+                } else if i != j {
+                    pmat.set(i, j, f64::NAN);
+                }
             }
+        }
+        if nargout >= 2 {
+            return Ok(vec![Value::matrix(cov), Value::matrix(pmat)]);
         }
     }
     ok1(Value::matrix(cov))
 }
 
-fn parse_mu_sigma(name: &str, args: &[Value]) -> Result<(f64, f64)> {
-    if args.is_empty() || args.len() > 3 {
-        return Err(MatroError::arity(name, "1 to 3 (x [, mu, sigma])", args.len()));
+fn broadcast_3(a: &Matrix, b: &Matrix, c: &Matrix, f: impl Fn(f64, f64, f64) -> f64) -> Result<Matrix> {
+    let n = a.len().max(b.len()).max(c.len());
+    let dims = if a.len() == n {
+        a.dims()
+    } else if b.len() == n {
+        b.dims()
+    } else {
+        c.dims()
+    };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let av = if a.len() == 1 { a.data()[0] } else { a.data()[i] };
+        let bv = if b.len() == 1 { b.data()[0] } else { b.data()[i] };
+        let cv = if c.len() == 1 { c.data()[0] } else { c.data()[i] };
+        out.push(f(av, bv, cv));
     }
-    let mu = args.get(1).map(|v| v.as_scalar()).transpose()?.unwrap_or(0.0);
-    let sigma = args.get(2).map(|v| v.as_scalar()).transpose()?.unwrap_or(1.0);
-    Ok((mu, sigma))
+    Matrix::from_nd_col_major(dims, out)
 }
 
 pub fn fn_normpdf(args: &[Value]) -> Result<Vec<Value>> {
-    let (mu, sigma) = parse_mu_sigma("normpdf", args)?;
-    let inv_s = 1.0 / sigma;
-    let coeff = inv_s / (2.0 * std::f64::consts::PI).sqrt();
-    let out = args[0].as_matrix()?.map(|x| {
-        if sigma <= 0.0 {
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity("normpdf", "1 to 3 (x [, mu, sigma])", args.len()));
+    }
+    let x = args[0].to_dense_matrix()?;
+    let mu = args.get(1).map(|v| v.to_dense_matrix()).transpose()?.unwrap_or_else(|| Matrix::scalar(0.0));
+    let sigma = args.get(2).map(|v| v.to_dense_matrix()).transpose()?.unwrap_or_else(|| Matrix::scalar(1.0));
+    let out = broadcast_3(&x, &mu, &sigma, |xv, mv, sv| {
+        if sv <= 0.0 || sv.is_nan() {
             f64::NAN
         } else {
-            let z = (x - mu) * inv_s;
-            coeff * (-0.5 * z * z).exp()
+            let z = (xv - mv) / sv;
+            (-0.5 * z * z).exp() / (sv * (2.0 * std::f64::consts::PI).sqrt())
         }
-    });
+    })?;
     ok1(Value::matrix(out))
 }
 
 pub fn fn_normcdf(args: &[Value]) -> Result<Vec<Value>> {
-    let (mu, sigma) = parse_mu_sigma("normcdf", args)?;
-    let denom = sigma * std::f64::consts::SQRT_2;
-    let out = args[0].as_matrix()?.map(|x| {
-        if sigma <= 0.0 {
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity("normcdf", "1 to 3 (x [, mu, sigma])", args.len()));
+    }
+    let x = args[0].to_dense_matrix()?;
+    let mu = args.get(1).map(|v| v.to_dense_matrix()).transpose()?.unwrap_or_else(|| Matrix::scalar(0.0));
+    let sigma = args.get(2).map(|v| v.to_dense_matrix()).transpose()?.unwrap_or_else(|| Matrix::scalar(1.0));
+    let out = broadcast_3(&x, &mu, &sigma, |xv, mv, sv| {
+        if sv <= 0.0 || sv.is_nan() {
             f64::NAN
         } else {
-            0.5 * (1.0 + erf_f64((x - mu) / denom))
+            0.5 * (1.0 + erf_f64((xv - mv) / (sv * std::f64::consts::SQRT_2)))
         }
-    });
+    })?;
     ok1(Value::matrix(out))
 }
 
 /// Inverse standard normal CDF (Acklam's rational approximation + Newton polish).
-fn std_norm_inv(p: f64) -> f64 {
+pub fn std_norm_inv(p: f64) -> f64 {
     if p.is_nan() || !(0.0..=1.0).contains(&p) {
         return f64::NAN;
     }
@@ -400,14 +741,19 @@ fn std_norm_inv(p: f64) -> f64 {
 }
 
 pub fn fn_norminv(args: &[Value]) -> Result<Vec<Value>> {
-    let (mu, sigma) = parse_mu_sigma("norminv", args)?;
-    let out = args[0].as_matrix()?.map(|p| {
-        if sigma <= 0.0 {
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity("norminv", "1 to 3 (p [, mu, sigma])", args.len()));
+    }
+    let p = args[0].to_dense_matrix()?;
+    let mu = args.get(1).map(|v| v.to_dense_matrix()).transpose()?.unwrap_or_else(|| Matrix::scalar(0.0));
+    let sigma = args.get(2).map(|v| v.to_dense_matrix()).transpose()?.unwrap_or_else(|| Matrix::scalar(1.0));
+    let out = broadcast_3(&p, &mu, &sigma, |pv, mv, sv| {
+        if sv <= 0.0 || sv.is_nan() {
             f64::NAN
         } else {
-            mu + sigma * std_norm_inv(p)
+            mv + sv * std_norm_inv(pv)
         }
-    });
+    })?;
     ok1(Value::matrix(out))
 }
 
@@ -676,40 +1022,100 @@ pub fn fn_kmeans(args: &[Value], nargout: usize, rng: &mut Rng) -> Result<Vec<Va
     }
 }
 
-/// `[coeff, score, latent] = pca(X)` — Principal Component Analysis via centered SVD.
+/// `[coeff, score, latent, tsquared, explained, mu] = pca(X [, 'NumComponents', k, 'Centered', tf])`.
 pub fn fn_pca(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("pca", "1 (X)", args.len()));
+    if args.is_empty() {
+        return Err(MatroError::arity("pca", ">= 1 (X [, NV...])", 0));
     }
-    let x = args[0].as_matrix()?;
+    let x = args[0].to_dense_matrix()?;
     let (n, p) = (x.rows(), x.cols());
     if n == 0 || p == 0 {
         return Err(MatroError::dimension("pca: input matrix cannot be empty"));
     }
-    let mut centered = Matrix::zeros(n, p);
+    let mut centered_flag = true;
+    let mut num_comp: Option<usize> = None;
+    let mut i = 1;
+    while i + 1 < args.len() {
+        if let Some(k) = crate::value_as_text(&args[i]) {
+            match k.to_ascii_lowercase().as_str() {
+                "centered" => centered_flag = args[i + 1].is_truthy(),
+                "numcomponents" => {
+                    num_comp = Some(args[i + 1].as_scalar()?.max(1.0).round() as usize);
+                }
+                _ => {}
+            }
+        }
+        i += 2;
+    }
+
+    let mut mu = vec![0.0; p];
+    let mut xc = Matrix::zeros(n, p);
     for c in 0..p {
-        let mean = (0..n).map(|r| x.get(r, c)).sum::<f64>() / n as f64;
+        let mean = if centered_flag {
+            (0..n).map(|r| x.get(r, c)).sum::<f64>() / n as f64
+        } else {
+            0.0
+        };
+        mu[c] = mean;
         for r in 0..n {
-            centered.set(r, c, x.get(r, c) - mean);
+            xc.set(r, c, x.get(r, c) - mean);
         }
     }
-    let (_u, s_mat, v) = centered.svd()?;
-    let k = n.min(p);
-    let score = centered.matmul(&v)?;
-    let denom = if n > 1 { (n - 1) as f64 } else { 1.0 };
-    let latent: Vec<f64> = (0..k)
-        .map(|i| {
-            let sv = s_mat.get(i, i);
+    let (_u, s_mat, v_full) = xc.svd()?;
+    let k_max = if centered_flag && n > 1 {
+        (n - 1).min(p)
+    } else {
+        n.min(p)
+    };
+    let k = num_comp.map_or(p.min(v_full.cols()), |nc| nc.min(p).min(v_full.cols()));
+    let mut coeff = Matrix::zeros(p, k);
+    for c in 0..k {
+        for r in 0..p {
+            coeff.set(r, c, v_full.get(r, c));
+        }
+    }
+    let score = xc.matmul(&coeff)?;
+    let denom = if centered_flag && n > 1 { (n - 1) as f64 } else { n as f64 };
+    let latent_all: Vec<f64> = (0..k_max.min(s_mat.rows().min(s_mat.cols())))
+        .map(|j| {
+            let sv = s_mat.get(j, j);
             (sv * sv) / denom
         })
         .collect();
+    let total_var: f64 = latent_all.iter().sum();
+    let latent: Vec<f64> = (0..k.min(latent_all.len())).map(|j| latent_all[j]).collect();
+    let explained: Vec<f64> = latent
+        .iter()
+        .map(|&l| if total_var > 0.0 { 100.0 * l / total_var } else { 0.0 })
+        .collect();
+    let tsquared: Vec<f64> = (0..n)
+        .map(|r| {
+            let mut sum = 0.0;
+            for j in 0..latent.len() {
+                if latent[j] > 1e-15 {
+                    let s = score.get(r, j);
+                    sum += (s * s) / latent[j];
+                }
+            }
+            sum
+        })
+        .collect();
 
-    let mut out = vec![Value::matrix(v)];
+    let mut out = vec![Value::matrix(coeff)];
     if nargout >= 2 {
         out.push(Value::matrix(score));
     }
     if nargout >= 3 {
         out.push(Value::matrix(Matrix::col_vec(latent)));
+    }
+    if nargout >= 4 {
+        out.push(Value::matrix(Matrix::col_vec(tsquared)));
+    }
+    if nargout >= 5 {
+        out.push(Value::matrix(Matrix::col_vec(explained)));
+    }
+    if nargout >= 6 {
+        out.push(Value::matrix(Matrix::row_vec(mu)));
     }
     Ok(out)
 }

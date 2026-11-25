@@ -805,7 +805,7 @@ impl Matrix {
         }
     }
 
-    /// Element-wise binary operation over real values (preserves N-D shape when shapes match).
+    /// Element-wise binary operation over real values with full N-D singleton broadcasting.
     pub fn elementwise(&self, other: &Self, f: impl Fn(f64, f64) -> f64) -> Result<Self> {
         if self.dims() == other.dims() {
             let re = self
@@ -829,27 +829,81 @@ impl Matrix {
         if let Some(b) = other.as_scalar() {
             return Ok(self.map(|a| f(a, b)));
         }
-        let rows_ok = self.rows == other.rows || self.rows == 1 || other.rows == 1;
-        let cols_ok = self.cols == other.cols || self.cols == 1 || other.cols == 1;
-        if rows_ok && cols_ok {
-            let out_rows = self.rows.max(other.rows);
-            let out_cols = self.cols.max(other.cols);
-            let mut out = Self::zeros(out_rows, out_cols);
-            for c in 0..out_cols {
-                let c1 = if self.cols == 1 { 0 } else { c };
-                let c2 = if other.cols == 1 { 0 } else { c };
-                for r in 0..out_rows {
-                    let r1 = if self.rows == 1 { 0 } else { r };
-                    let r2 = if other.rows == 1 { 0 } else { r };
-                    out.set(r, c, f(self.get(r1, c1), other.get(r2, c2)));
+        if self.extra_dims.is_none() && other.extra_dims.is_none() {
+            let rows_ok = self.rows == other.rows || self.rows == 1 || other.rows == 1;
+            let cols_ok = self.cols == other.cols || self.cols == 1 || other.cols == 1;
+            if rows_ok && cols_ok {
+                let out_rows = if self.is_empty() || other.is_empty() {
+                    0
+                } else {
+                    self.rows.max(other.rows)
+                };
+                let out_cols = if self.is_empty() || other.is_empty() {
+                    0
+                } else {
+                    self.cols.max(other.cols)
+                };
+                let mut out = Self::zeros(out_rows, out_cols);
+                for c in 0..out_cols {
+                    let c1 = if self.cols == 1 { 0 } else { c };
+                    let c2 = if other.cols == 1 { 0 } else { c };
+                    for r in 0..out_rows {
+                        let r1 = if self.rows == 1 { 0 } else { r };
+                        let r2 = if other.rows == 1 { 0 } else { r };
+                        out.set(r, c, f(self.get(r1, c1), other.get(r2, c2)));
+                    }
                 }
+                return Ok(out);
             }
-            return Ok(out);
+            return Err(MatroError::dimension(format!(
+                "Incompatible matrix dimensions: {}x{} and {}x{}",
+                self.rows, self.cols, other.rows, other.cols
+            )));
         }
-        Err(MatroError::dimension(format!(
-            "Incompatible matrix dimensions: {}x{} and {}x{}",
-            self.rows, self.cols, other.rows, other.cols
-        )))
+
+        // General N-D implicit broadcasting
+        let d1 = self.dims();
+        let d2 = other.dims();
+        let nd = d1.len().max(d2.len());
+        let mut out_dims = Vec::with_capacity(nd);
+        let mut s1 = vec![1usize; nd];
+        let mut s2 = vec![1usize; nd];
+        let mut cur1 = 1usize;
+        let mut cur2 = 1usize;
+        for ax in 0..nd {
+            let a = d1.get(ax).copied().unwrap_or(1);
+            let b = d2.get(ax).copied().unwrap_or(1);
+            if a != b && a != 1 && b != 1 {
+                return Err(MatroError::dimension(format!(
+                    "Incompatible array dimensions: {d1:?} and {d2:?}"
+                )));
+            }
+            out_dims.push(if a == 0 || b == 0 { 0 } else { a.max(b) });
+            s1[ax] = if a == 1 { 0 } else { cur1 };
+            s2[ax] = if b == 1 { 0 } else { cur2 };
+            cur1 = cur1.saturating_mul(a);
+            cur2 = cur2.saturating_mul(b);
+        }
+        let total: usize = out_dims.iter().product();
+        let mut re = Vec::with_capacity(total);
+        let mut coord = vec![0usize; nd];
+        for _ in 0..total {
+            let mut idx1 = 0usize;
+            let mut idx2 = 0usize;
+            for ax in 0..nd {
+                idx1 += coord[ax] * s1[ax];
+                idx2 += coord[ax] * s2[ax];
+            }
+            re.push(f(self.re[idx1], other.re[idx2]));
+            for ax in 0..nd {
+                coord[ax] += 1;
+                if coord[ax] < out_dims[ax] {
+                    break;
+                }
+                coord[ax] = 0;
+            }
+        }
+        Self::from_nd_col_major(out_dims, re)
     }
 
     /// Complex-aware element-wise binary operation with full N-D & singleton broadcasting,
@@ -968,7 +1022,7 @@ impl Matrix {
                 coord[ax] = 0;
             }
         }
-        Self::from_nd_complex_col_major(out_dims, re, im).map(Self::normalize)
+        Self::from_nd_complex_col_major(out_dims, re, im).map(finish)
     }
 
     /// Matrix multiplication (real fast-path or complex).
@@ -1169,7 +1223,9 @@ impl Matrix {
     }
 
     /// Solve linear system `A * X = B` (`A \ B` in MATLAB).
-    /// Supports square systems (real & complex LU with partial pivoting) and overdetermined real least-squares via QR!
+    /// Supports square systems (real & complex LU with partial pivoting),
+    /// overdetermined real & complex least-squares (QR with SVD fallback for rank-deficient),
+    /// and underdetermined real & complex minimum-norm solutions (SVD).
     pub fn solve(&self, rhs: &Self) -> Result<Self> {
         if let Some(a) = self.as_complex_scalar() {
             return Ok(rhs.map_c(|b| b / a).normalize());
@@ -1180,33 +1236,47 @@ impl Matrix {
                 self.rows, self.cols, rhs.rows, rhs.cols
             )));
         }
-        // Overdetermined real least squares via QR: A * x = b => R * x = Q' * b
-        if self.rows > self.cols && !self.is_complex() && !rhs.is_complex() {
-            let (q, r) = self.qr()?;
-            let qtb = q.transpose().matmul(rhs)?;
+        // Overdetermined least squares (rows > cols): real or complex QR, with SVD fallback if rank-deficient
+        if self.rows > self.cols {
             let n = self.cols;
             let m = rhs.cols;
-            let mut x = Self::zeros(n, m);
-            for k in (0..n).rev() {
-                let diag = r.get(k, k);
-                if diag.abs() < 1e-14 {
-                    return Err(MatroError::runtime("Matrix is rank deficient"));
-                }
-                for j in 0..m {
-                    let mut sum = qtb.get(k, j);
-                    for i in (k + 1)..n {
-                        sum -= r.get(k, i) * x.get(i, j);
+            if let Ok((q, r)) = self.qr() {
+                let qhb = q.ctranspose().matmul(rhs)?;
+                let mut x = if self.is_complex() || rhs.is_complex() {
+                    Self::complex_zeros(n, m)
+                } else {
+                    Self::zeros(n, m)
+                };
+                let max_diag = (0..n)
+                    .map(|k| r.get_c(k, k).abs())
+                    .fold(0.0_f64, f64::max);
+                let tol = (self.rows.max(n) as f64) * f64::EPSILON * max_diag.max(1.0);
+                let mut full_rank = max_diag > 0.0;
+                if full_rank {
+                    for k in (0..n).rev() {
+                        let diag = r.get_c(k, k);
+                        if diag.abs() <= tol {
+                            full_rank = false;
+                            break;
+                        }
+                        for j in 0..m {
+                            let mut sum = qhb.get_c(k, j);
+                            for i in (k + 1)..n {
+                                sum = sum - r.get_c(k, i) * x.get_c(i, j);
+                            }
+                            x.set_c(k, j, sum / diag);
+                        }
                     }
-                    x.set(k, j, sum / diag);
+                }
+                if full_rank {
+                    return Ok(x.normalize());
                 }
             }
-            return Ok(x);
+            return self.solve_svd_min_norm(rhs);
         }
-        if self.rows != self.cols {
-            return Err(MatroError::dimension(format!(
-                "Matrix must be square or overdetermined for linear solve (got {}x{})",
-                self.rows, self.cols
-            )));
+        // Underdetermined system (rows < cols): minimum-norm least-squares via SVD
+        if self.rows < self.cols {
+            return self.solve_svd_min_norm(rhs);
         }
         let n = self.rows;
         let m = rhs.cols;
@@ -1269,6 +1339,30 @@ impl Matrix {
             }
         }
         Ok(x.normalize())
+    }
+
+    /// Minimum-norm least-squares solve `A \ B` via SVD (`V * S^+ * U' * B`).
+    fn solve_svd_min_norm(&self, rhs: &Self) -> Result<Self> {
+        let (u, s, v) = self.svd()?;
+        let k = self.rows.min(self.cols);
+        let uhb = u.ctranspose().matmul(rhs)?;
+        let max_s = (0..k).map(|i| s.get(i, i).abs()).fold(0.0_f64, f64::max);
+        let tol = (self.rows.max(self.cols) as f64) * f64::EPSILON * max_s;
+        let m = rhs.cols;
+        let mut scaled = if self.is_complex() || rhs.is_complex() || u.is_complex() || v.is_complex() {
+            Self::complex_zeros(self.cols, m)
+        } else {
+            Self::zeros(self.cols, m)
+        };
+        for i in 0..k {
+            let si = s.get(i, i);
+            if si > tol {
+                for j in 0..m {
+                    scaled.set_c(i, j, uhb.get_c(i, j) / Complex::new(si, 0.0));
+                }
+            }
+        }
+        v.matmul(&scaled).map(Self::normalize)
     }
 
     /// Determinant (real or complex) via LU decomposition with partial pivoting.

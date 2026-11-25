@@ -310,15 +310,30 @@ pub fn solve_fmincon(
 
         let eval_grad = |vm: &mut Vm, x: &[f64], lam_in: &[f64], lam_eq: &[f64], rho: f64, stdout: &mut String| -> Result<Vec<f64>> {
             let mut g = vec![0.0; n];
+            let f0 = eval_aug_lag(vm, x, lam_in, lam_eq, rho, stdout)?;
             for i in 0..n {
                 let eps = 1e-6 * x[i].abs().max(1.0);
-                let mut xp = x.to_vec();
-                let mut xm = x.to_vec();
-                xp[i] += eps;
-                xm[i] -= eps;
-                let fp = eval_aug_lag(vm, &xp, lam_in, lam_eq, rho, stdout)?;
-                let fm = eval_aug_lag(vm, &xm, lam_in, lam_eq, rho, stdout)?;
-                g[i] = (fp - fm) / (2.0 * eps);
+                let can_plus = x[i] + eps <= ub[i];
+                let can_minus = x[i] - eps >= lb[i];
+                if can_plus && can_minus {
+                    let mut xp = x.to_vec();
+                    let mut xm = x.to_vec();
+                    xp[i] += eps;
+                    xm[i] -= eps;
+                    let fp = eval_aug_lag(vm, &xp, lam_in, lam_eq, rho, stdout)?;
+                    let fm = eval_aug_lag(vm, &xm, lam_in, lam_eq, rho, stdout)?;
+                    g[i] = (fp - fm) / (2.0 * eps);
+                } else if can_plus {
+                    let mut xp = x.to_vec();
+                    xp[i] += eps;
+                    let fp = eval_aug_lag(vm, &xp, lam_in, lam_eq, rho, stdout)?;
+                    g[i] = (fp - f0) / eps;
+                } else if can_minus {
+                    let mut xm = x.to_vec();
+                    xm[i] -= eps;
+                    let fm = eval_aug_lag(vm, &xm, lam_in, lam_eq, rho, stdout)?;
+                    g[i] = (f0 - fm) / eps;
+                }
             }
             Ok(g)
         };

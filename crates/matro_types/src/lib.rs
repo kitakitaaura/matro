@@ -612,10 +612,8 @@ impl Value {
     pub fn type_name(&self) -> &str {
         match self {
             Self::Matrix(m) if m.dtype() == NumericClass::Logical => "logical",
-            Self::Matrix(m) if m.dtype() == NumericClass::Single && m.is_complex() => "complex single",
-            Self::Matrix(m) if m.dtype() == NumericClass::Double && m.is_complex() => "complex double",
             Self::Matrix(m) => m.dtype().name(),
-            Self::Sparse(_) => "sparse double",
+            Self::Sparse(_) => "double",
             Self::String(_) => "char",
             Self::Struct(_) | Self::StructArray(_) => "struct",
             Self::Object(o) => &o.class_name,

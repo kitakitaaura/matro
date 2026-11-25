@@ -190,19 +190,29 @@ fn char_poly(a: &Matrix) -> Result<Vec<f64>> {
     Ok(coefs)
 }
 
-/// `sys = ss(A, B, C, D)`
+/// `sys = ss(A, B, C, D [, Ts])`
 pub fn fn_ss(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 4 {
-        return Err(MatroError::arity("ss", "4 (A, B, C, D)", args.len()));
+    if args.len() < 4 || args.len() > 5 {
+        return Err(MatroError::arity("ss", "4 or 5 (A, B, C, D [, Ts])", args.len()));
     }
     let a = args[0].to_dense_matrix()?;
     let b = args[1].to_dense_matrix()?;
     let c = args[2].to_dense_matrix()?;
     let d = args[3].to_dense_matrix()?;
+    let ts = args.get(4).map(|v| v.as_scalar()).transpose()?.unwrap_or(0.0);
     if a.rows() != a.cols() {
         return Err(MatroError::dimension("ss: A must be square"));
     }
-    ok1(make_ss_obj(SsModel { a, b, c, d }))
+    let mut fields = BTreeMap::new();
+    fields.insert("A".to_string(), Value::matrix(a));
+    fields.insert("B".to_string(), Value::matrix(b));
+    fields.insert("C".to_string(), Value::matrix(c));
+    fields.insert("D".to_string(), Value::matrix(d));
+    fields.insert("Ts".to_string(), Value::scalar(ts));
+    ok1(Value::Object(ObjectInstance {
+        class_name: "ss".to_string(),
+        fields,
+    }))
 }
 
 /// `[A, B, C, D] = tf2ss(num, den)`
@@ -913,13 +923,16 @@ pub fn fn_margin(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
     Ok(out)
 }
 
-/// Controllability matrix `Co = ctrb(A, B)`.
+/// Controllability matrix `Co = ctrb(A, B)` or `Co = ctrb(sys)`.
 pub fn fn_ctrb(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 2 {
-        return Err(MatroError::arity("ctrb", "2 (A, B)", args.len()));
-    }
-    let a = args[0].to_dense_matrix()?;
-    let b = args[1].to_dense_matrix()?;
+    let (a, b) = if args.len() == 1 {
+        let sys = extract_ss(&args[0])?;
+        (sys.a, sys.b)
+    } else if args.len() == 2 {
+        (args[0].to_dense_matrix()?, args[1].to_dense_matrix()?)
+    } else {
+        return Err(MatroError::arity("ctrb", "1 (sys) or 2 (A, B)", args.len()));
+    };
     let n = a.rows();
     let m = b.cols();
     let mut co = Matrix::zeros(n, n * m);
@@ -937,13 +950,16 @@ pub fn fn_ctrb(args: &[Value]) -> Result<Vec<Value>> {
     ok1(Value::matrix(co))
 }
 
-/// Observability matrix `Ob = obsv(A, C)`.
+/// Observability matrix `Ob = obsv(A, C)` or `Ob = obsv(sys)`.
 pub fn fn_obsv(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 2 {
-        return Err(MatroError::arity("obsv", "2 (A, C)", args.len()));
-    }
-    let a = args[0].to_dense_matrix()?;
-    let c = args[1].to_dense_matrix()?;
+    let (a, c) = if args.len() == 1 {
+        let sys = extract_ss(&args[0])?;
+        (sys.a, sys.c)
+    } else if args.len() == 2 {
+        (args[0].to_dense_matrix()?, args[1].to_dense_matrix()?)
+    } else {
+        return Err(MatroError::arity("obsv", "1 (sys) or 2 (A, C)", args.len()));
+    };
     let n = a.rows();
     let p = c.rows();
     let mut ob = Matrix::zeros(n * p, n);
@@ -1113,30 +1129,68 @@ pub fn solve_care_core(a: &Matrix, b: &Matrix, q: &Matrix, r: &Matrix) -> Result
     Ok(p)
 }
 
-pub fn fn_care(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 4 {
-        return Err(MatroError::arity("care", "4 (A, B, Q, R)", args.len()));
-    }
-    let p = solve_care_core(
-        &args[0].to_dense_matrix()?,
-        &args[1].to_dense_matrix()?,
-        &args[2].to_dense_matrix()?,
-        &args[3].to_dense_matrix()?,
-    )?;
-    ok1(Value::matrix(p))
-}
-
-/// `[K, S, P] = lqr(A, B, Q, R)` — Continuous-time Linear-Quadratic Regulator.
-pub fn fn_lqr(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
-    if args.len() != 4 {
-        return Err(MatroError::arity("lqr", "4 (A, B, Q, R)", args.len()));
+pub fn fn_care(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.len() < 4 || args.len() > 5 {
+        return Err(MatroError::arity("care", "4 or 5 (A, B, Q, R [, S])", args.len()));
     }
     let a = args[0].to_dense_matrix()?;
     let b = args[1].to_dense_matrix()?;
     let q = args[2].to_dense_matrix()?;
     let r = args[3].to_dense_matrix()?;
-    let s = solve_care_core(&a, &b, &q, &r)?;
-    let k = r.inv()?.matmul(&b.transpose())?.matmul(&s)?;
+    let p = solve_care_core(&a, &b, &q, &r)?;
+    let mut out = vec![Value::matrix(p.clone())];
+    if nargout >= 2 {
+        let g = r.inv()?.matmul(&b.transpose())?.matmul(&p)?;
+        let a_cl = a.elementwise(&b.matmul(&g)?, |x, y| x - y)?;
+        let (_, d) = a_cl.eig()?;
+        let poles: Vec<Complex> = (0..d.rows()).map(|i| d.get_c(i, i)).collect();
+        out.push(Value::matrix(Matrix::complex_col_vec(poles).normalize()));
+        if nargout >= 3 {
+            out.push(Value::matrix(g));
+        }
+    }
+    Ok(out)
+}
+
+/// `[K, S, P] = lqr(A, B, Q, R [, N])` or `lqr(sys, Q, R [, N])` — Continuous-time LQR.
+pub fn fn_lqr(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    let (a, b, q, r, n_opt) = if matches!(args.first(), Some(Value::Object(_))) {
+        if args.len() < 3 || args.len() > 4 {
+            return Err(MatroError::arity("lqr", "3 or 4 (sys, Q, R [, N])", args.len()));
+        }
+        let sys = extract_ss(&args[0])?;
+        let n_m = args.get(3).map(|v| v.to_dense_matrix()).transpose()?;
+        (sys.a, sys.b, args[1].to_dense_matrix()?, args[2].to_dense_matrix()?, n_m)
+    } else {
+        if args.len() < 4 || args.len() > 5 {
+            return Err(MatroError::arity("lqr", "4 or 5 (A, B, Q, R [, N])", args.len()));
+        }
+        let n_m = args.get(4).map(|v| v.to_dense_matrix()).transpose()?;
+        (
+            args[0].to_dense_matrix()?,
+            args[1].to_dense_matrix()?,
+            args[2].to_dense_matrix()?,
+            args[3].to_dense_matrix()?,
+            n_m,
+        )
+    };
+    let r_inv = r.inv()?;
+    let (a_eff, q_eff) = if let Some(ref n_mat) = n_opt {
+        let r_inv_nt = r_inv.matmul(&n_mat.transpose())?;
+        let a_e = a.elementwise(&b.matmul(&r_inv_nt)?, |x, y| x - y)?;
+        let q_e = q.elementwise(&n_mat.matmul(&r_inv_nt)?, |x, y| x - y)?;
+        (a_e, q_e)
+    } else {
+        (a.clone(), q.clone())
+    };
+    let s = solve_care_core(&a_eff, &b, &q_eff, &r)?;
+    let bts = b.transpose().matmul(&s)?;
+    let rhs = if let Some(ref n_mat) = n_opt {
+        bts.elementwise(&n_mat.transpose(), |x, y| x + y)?
+    } else {
+        bts
+    };
+    let k = r_inv.matmul(&rhs)?;
     let mut out = vec![Value::matrix(k.clone())];
     if nargout >= 2 {
         out.push(Value::matrix(s));
@@ -1174,6 +1228,573 @@ pub fn fn_lqe(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
         let (_, d) = a_est.eig()?;
         let poles: Vec<Complex> = (0..d.rows()).map(|i| d.get_c(i, i)).collect();
         out.push(Value::matrix(Matrix::complex_col_vec(poles).normalize()));
+    }
+    Ok(out)
+}
+
+/// Discrete Lyapunov equation `A*X*A' - X + Q = 0` via Kronecker linear system `(I - A kron A) vec(X) = vec(Q)`.
+pub fn solve_dlyap_core(a: &Matrix, q: &Matrix) -> Result<Matrix> {
+    let n = a.rows();
+    let n2 = n * n;
+    let mut mat = Matrix::eye(n2, n2);
+    let mut rhs = Matrix::zeros(n2, 1);
+    for j in 0..n {
+        for i in 0..n {
+            let row = j * n + i;
+            rhs.set(row, 0, q.get(i, j));
+            for l in 0..n {
+                let ajl = a.get(j, l);
+                if ajl == 0.0 {
+                    continue;
+                }
+                for k in 0..n {
+                    let col = l * n + k;
+                    mat.set(row, col, mat.get(row, col) - a.get(i, k) * ajl);
+                }
+            }
+        }
+    }
+    let vec_x = mat.solve(&rhs)?;
+    let mut x = Matrix::zeros(n, n);
+    for j in 0..n {
+        for i in 0..n {
+            x.set(i, j, vec_x.get(j * n + i, 0));
+        }
+    }
+    Ok(x)
+}
+
+pub fn fn_dlyap(args: &[Value]) -> Result<Vec<Value>> {
+    if args.len() != 2 {
+        return Err(MatroError::arity("dlyap", "2 (A, Q)", args.len()));
+    }
+    let a = args[0].to_dense_matrix()?;
+    let q = args[1].to_dense_matrix()?;
+    ok1(Value::matrix(solve_dlyap_core(&a, &q)?))
+}
+
+/// Solve Discrete Algebraic Riccati Equation `A'XA - X - A'XB(R + B'XB)^{-1}B'XA + Q = 0`
+/// via stabilized Riccati iteration + Kleinman/dlyap quadratic refinement.
+pub fn solve_dare_core(a: &Matrix, b: &Matrix, q: &Matrix, r: &Matrix) -> Result<(Matrix, Matrix)> {
+    let n = a.rows();
+    let at = a.transpose();
+    let bt = b.transpose();
+    let mut x = q.clone();
+    // Stabilized Riccati value iteration (converges geometrically)
+    for _ in 0..400 {
+        let bt_x = bt.matmul(&x)?;
+        let s_mat = r.elementwise(&bt_x.matmul(b)?, |u, v| u + v)?;
+        let k = s_mat.solve(&bt_x.matmul(a)?)?;
+        let a_cl = a.elementwise(&b.matmul(&k)?, |u, v| u - v)?;
+        // Joseph-form update for symmetry & numerical stability:
+        // X_new = A_cl' * X * A_cl + K' * R * K + Q
+        let x_next = a_cl
+            .transpose()
+            .matmul(&x)?
+            .matmul(&a_cl)?
+            .elementwise(&k.transpose().matmul(r)?.matmul(&k)?, |u, v| u + v)?
+            .elementwise(q, |u, v| u + v)?;
+        let mut diff = 0.0f64;
+        let mut sym = Matrix::zeros(n, n);
+        for rr in 0..n {
+            for cc in 0..n {
+                let v = 0.5 * (x_next.get(rr, cc) + x_next.get(cc, rr));
+                diff = diff.max((v - x.get(rr, cc)).abs());
+                sym.set(rr, cc, v);
+            }
+        }
+        x = sym;
+        if diff < 1e-12 {
+            break;
+        }
+    }
+    // 2 Newton-Kleinman polish steps via exact dlyap
+    for _ in 0..2 {
+        let bt_x = bt.matmul(&x)?;
+        let s_mat = r.elementwise(&bt_x.matmul(b)?, |u, v| u + v)?;
+        let k = s_mat.solve(&bt_x.matmul(a)?)?;
+        let a_cl = a.elementwise(&b.matmul(&k)?, |u, v| u - v)?;
+        let q_cl = q.elementwise(&k.transpose().matmul(r)?.matmul(&k)?, |u, v| u + v)?;
+        if let Ok(x_new) = solve_dlyap_core(&a_cl.transpose(), &q_cl) {
+            let mut sym = Matrix::zeros(n, n);
+            for rr in 0..n {
+                for cc in 0..n {
+                    sym.set(rr, cc, 0.5 * (x_new.get(rr, cc) + x_new.get(cc, rr)));
+                }
+            }
+            x = sym;
+        }
+    }
+    let _ = at;
+    let bt_x = bt.matmul(&x)?;
+    let s_mat = r.elementwise(&bt_x.matmul(b)?, |u, v| u + v)?;
+    let k = s_mat.solve(&bt_x.matmul(a)?)?;
+    Ok((x, k))
+}
+
+pub fn fn_dare(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.len() != 4 {
+        return Err(MatroError::arity("dare", "4 (A, B, Q, R)", args.len()));
+    }
+    let a = args[0].to_dense_matrix()?;
+    let b = args[1].to_dense_matrix()?;
+    let q = args[2].to_dense_matrix()?;
+    let r = args[3].to_dense_matrix()?;
+    let (x, g) = solve_dare_core(&a, &b, &q, &r)?;
+    let mut out = vec![Value::matrix(x)];
+    if nargout >= 2 {
+        let a_cl = a.elementwise(&b.matmul(&g)?, |u, v| u - v)?;
+        let (_, d) = a_cl.eig()?;
+        let poles: Vec<Complex> = (0..d.rows()).map(|i| d.get_c(i, i)).collect();
+        out.push(Value::matrix(Matrix::complex_col_vec(poles).normalize()));
+    }
+    if nargout >= 3 {
+        out.push(Value::matrix(g));
+    }
+    Ok(out)
+}
+
+pub fn fn_dlqr(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.len() < 4 || args.len() > 5 {
+        return Err(MatroError::arity("dlqr", "4 or 5 (A, B, Q, R [, N])", args.len()));
+    }
+    let a = args[0].to_dense_matrix()?;
+    let b = args[1].to_dense_matrix()?;
+    let q = args[2].to_dense_matrix()?;
+    let r = args[3].to_dense_matrix()?;
+    let n_opt = args.get(4).map(|v| v.to_dense_matrix()).transpose()?;
+    let r_inv = r.inv()?;
+    let (a_eff, q_eff) = if let Some(ref nm) = n_opt {
+        let r_inv_nt = r_inv.matmul(&nm.transpose())?;
+        (
+            a.elementwise(&b.matmul(&r_inv_nt)?, |u, v| u - v)?,
+            q.elementwise(&nm.matmul(&r_inv_nt)?, |u, v| u - v)?,
+        )
+    } else {
+        (a.clone(), q.clone())
+    };
+    let (s, k0) = solve_dare_core(&a_eff, &b, &q_eff, &r)?;
+    let k = if let Some(ref nm) = n_opt {
+        let s_mat = r.elementwise(&b.transpose().matmul(&s)?.matmul(&b)?, |u, v| u + v)?;
+        let rhs = b
+            .transpose()
+            .matmul(&s)?
+            .matmul(&a)?
+            .elementwise(&nm.transpose(), |u, v| u + v)?;
+        s_mat.solve(&rhs)?
+    } else {
+        k0
+    };
+    let mut out = vec![Value::matrix(k.clone())];
+    if nargout >= 2 {
+        out.push(Value::matrix(s));
+    }
+    if nargout >= 3 {
+        let a_cl = a.elementwise(&b.matmul(&k)?, |u, v| u - v)?;
+        let (_, d) = a_cl.eig()?;
+        let poles: Vec<Complex> = (0..d.rows()).map(|i| d.get_c(i, i)).collect();
+        out.push(Value::matrix(Matrix::complex_col_vec(poles).normalize()));
+    }
+    Ok(out)
+}
+
+/// `sysd = c2d(sys, Ts [, 'zoh'|'tustin'])` — Continuous-to-discrete state-space discretization.
+pub fn fn_c2d(args: &[Value]) -> Result<Vec<Value>> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(MatroError::arity("c2d", "2 or 3 (sys, Ts [, method])", args.len()));
+    }
+    let sys = extract_ss(&args[0])?;
+    let ts = args[1].as_scalar()?;
+    if ts <= 0.0 {
+        return Err(MatroError::runtime("c2d: sample time Ts must be > 0"));
+    }
+    let method = args
+        .get(2)
+        .and_then(crate::value_as_text)
+        .unwrap_or_else(|| "zoh".to_string())
+        .to_ascii_lowercase();
+    let n = sys.a.rows();
+    let m = sys.b.cols();
+    let (ad, bd, cd, dd) = if method == "tustin" {
+        let eye = Matrix::eye(n, n);
+        let half_a = sys.a.map(|v| 0.5 * ts * v);
+        let lhs = eye.elementwise(&half_a, |u, v| u - v)?;
+        let rhs = eye.elementwise(&half_a, |u, v| u + v)?;
+        let inv_lhs = lhs.inv()?;
+        let ad = inv_lhs.matmul(&rhs)?;
+        let bd = inv_lhs.matmul(&sys.b)?.map(|v| ts * v);
+        let cd = sys.c.matmul(&inv_lhs)?;
+        let dd = sys.d.elementwise(&sys.c.matmul(&bd)?.map(|v| 0.5 * v), |u, v| u + v)?;
+        (ad, bd, cd, dd)
+    } else {
+        // ZOH via augmented block matrix exponential expm([A*Ts, B*Ts; 0, 0])
+        let mut aug = Matrix::zeros(n + m, n + m);
+        for r in 0..n {
+            for c in 0..n {
+                aug.set(r, c, sys.a.get(r, c) * ts);
+            }
+            for c in 0..m {
+                aug.set(r, n + c, sys.b.get(r, c) * ts);
+            }
+        }
+        let em = aug.expm()?;
+        let mut ad = Matrix::zeros(n, n);
+        let mut bd = Matrix::zeros(n, m);
+        for r in 0..n {
+            for c in 0..n {
+                ad.set(r, c, em.get(r, c));
+            }
+            for c in 0..m {
+                bd.set(r, c, em.get(r, n + c));
+            }
+        }
+        (ad, bd, sys.c, sys.d)
+    };
+    let mut fields = BTreeMap::new();
+    fields.insert("A".to_string(), Value::matrix(ad));
+    fields.insert("B".to_string(), Value::matrix(bd));
+    fields.insert("C".to_string(), Value::matrix(cd));
+    fields.insert("D".to_string(), Value::matrix(dd));
+    fields.insert("Ts".to_string(), Value::scalar(ts));
+    ok1(Value::Object(ObjectInstance {
+        class_name: "ss".to_string(),
+        fields,
+    }))
+}
+
+/// `sysc = d2c(sysd [, 'zoh'|'tustin'])` — Discrete-to-continuous conversion.
+pub fn fn_d2c(args: &[Value]) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity("d2c", "1 or 2 (sysd [, method])", args.len()));
+    }
+    let ts = match &args[0] {
+        Value::Object(o) => o
+            .fields
+            .get("Ts")
+            .and_then(|v| v.as_scalar().ok())
+            .unwrap_or(1.0),
+        _ => 1.0,
+    };
+    if ts <= 0.0 {
+        return Err(MatroError::runtime("d2c: system must have positive sample time Ts"));
+    }
+    let sys = extract_ss(&args[0])?;
+    let method = args
+        .get(1)
+        .and_then(crate::value_as_text)
+        .unwrap_or_else(|| "zoh".to_string())
+        .to_ascii_lowercase();
+    let n = sys.a.rows();
+    let m = sys.b.cols();
+    let (ac, bc, cc, dc) = if method == "tustin" {
+        let eye = Matrix::eye(n, n);
+        let ap1 = eye.elementwise(&sys.a, |u, v| u + v)?;
+        let am1 = sys.a.elementwise(&eye, |u, v| u - v)?;
+        let inv_ap1 = ap1.inv()?;
+        let ac = inv_ap1.matmul(&am1)?.map(|v| (2.0 / ts) * v);
+        let bc = inv_ap1.matmul(&sys.b)?.map(|v| (2.0 / ts) * v);
+        let cc = sys.c.matmul(&inv_ap1)?.map(|v| 2.0 * v);
+        let dc = sys.d.elementwise(&sys.c.matmul(&inv_ap1)?.matmul(&sys.b)?, |u, v| u - v)?;
+        (ac, bc, cc, dc)
+    } else {
+        // ZOH via matrix logarithm of [Ad, Bd; 0, I]
+        let mut aug = Matrix::eye(n + m, n + m);
+        for r in 0..n {
+            for c in 0..n {
+                aug.set(r, c, sys.a.get(r, c));
+            }
+            for c in 0..m {
+                aug.set(r, n + c, sys.b.get(r, c));
+            }
+        }
+        let lm = aug.logm()?;
+        let mut ac = Matrix::zeros(n, n);
+        let mut bc = Matrix::zeros(n, m);
+        for r in 0..n {
+            for c in 0..n {
+                ac.set(r, c, lm.get_c(r, c).re / ts);
+            }
+            for c in 0..m {
+                bc.set(r, c, lm.get_c(r, n + c).re / ts);
+            }
+        }
+        (ac, bc, sys.c, sys.d)
+    };
+    let mut fields = BTreeMap::new();
+    fields.insert("A".to_string(), Value::matrix(ac));
+    fields.insert("B".to_string(), Value::matrix(bc));
+    fields.insert("C".to_string(), Value::matrix(cc));
+    fields.insert("D".to_string(), Value::matrix(dc));
+    fields.insert("Ts".to_string(), Value::scalar(0.0));
+    ok1(Value::Object(ObjectInstance {
+        class_name: "ss".to_string(),
+        fields,
+    }))
+}
+
+/// `[y, t, x] = initial(sys, x0 [, t])` — Zero-input response from initial state `x0`.
+pub fn fn_initial(args: &[Value], nargout: usize, fig: &mut PlotFigure) -> Result<Vec<Value>> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(MatroError::arity("initial", "2 or 3 (sys, x0 [, t])", args.len()));
+    }
+    let sys = extract_ss(&args[0])?;
+    let x0_m = args[1].to_dense_matrix()?;
+    if x0_m.len() != sys.a.rows() {
+        return Err(MatroError::dimension("initial: length(x0) must equal state dimension"));
+    }
+    let t_vec: Vec<f64> = if let Some(tv) = args.get(2) {
+        let m = tv.to_dense_matrix()?;
+        if m.len() == 1 {
+            let tend = m.data()[0].max(1e-3);
+            (0..200).map(|i| tend * (i as f64) / 199.0).collect()
+        } else {
+            m.data().to_vec()
+        }
+    } else {
+        default_time_grid(&sys)
+    };
+    let u_zero = Matrix::zeros(t_vec.len(), sys.b.cols().max(1));
+    let (y, x) = simulate_ss(&sys, &u_zero, &t_vec, x0_m.data())?;
+    if nargout == 0 {
+        let p = fig.panel_mut();
+        p.clear();
+        p.add_series(
+            PlotKind::Line,
+            t_vec.clone(),
+            (0..t_vec.len()).map(|r| y.get(r, 0)).collect(),
+            None,
+        );
+        p.title = "Response to Initial Conditions".to_string();
+        p.xlabel = "Time (s)".to_string();
+        p.ylabel = "Amplitude".to_string();
+        return Ok(vec![]);
+    }
+    let mut out = vec![Value::matrix(y)];
+    if nargout >= 2 { out.push(Value::matrix(Matrix::col_vec(t_vec))); }
+    if nargout >= 3 { out.push(Value::matrix(x)); }
+    Ok(out)
+}
+
+/// `S = stepinfo(sys)` or `S = stepinfo(y, t)` — Step-response characteristics.
+pub fn fn_stepinfo(args: &[Value]) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity("stepinfo", "1 (sys) or 2 (y, t)", args.len()));
+    }
+    let (y_vec, t_vec): (Vec<f64>, Vec<f64>) = if matches!(&args[0], Value::Object(_)) {
+        let sys = extract_ss(&args[0])?;
+        let t = default_time_grid(&sys);
+        let u = Matrix::ones(t.len(), sys.b.cols().max(1));
+        let x0 = vec![0.0; sys.a.rows()];
+        let (y_m, _) = simulate_ss(&sys, &u, &t, &x0)?;
+        ((0..t.len()).map(|r| y_m.get(r, 0)).collect(), t)
+    } else {
+        let ym = args[0].to_dense_matrix()?;
+        let yv = ym.data().to_vec();
+        let tv = if let Some(t_arg) = args.get(1) {
+            t_arg.to_dense_matrix()?.data().to_vec()
+        } else {
+            (0..yv.len()).map(|i| i as f64).collect()
+        };
+        (yv, tv)
+    };
+    let n = y_vec.len().min(t_vec.len());
+    if n < 2 {
+        return Err(MatroError::dimension("stepinfo: need at least 2 samples"));
+    }
+    let y_init = y_vec[0];
+    let y_final = y_vec[n - 1];
+    let delta = y_final - y_init;
+
+    let mut peak = 0.0f64;
+    let mut peak_time = t_vec[0];
+    for i in 0..n {
+        if y_vec[i].abs() > peak {
+            peak = y_vec[i].abs();
+            peak_time = t_vec[i];
+        }
+    }
+    let y_max = y_vec.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let y_min = y_vec.iter().copied().fold(f64::INFINITY, f64::min);
+    let overshoot = if delta.abs() > 1e-12 {
+        let os = if delta > 0.0 { (y_max - y_final) / delta } else { (y_final - y_min) / (-delta) };
+        (os * 100.0).max(0.0)
+    } else {
+        0.0
+    };
+    let undershoot = if delta.abs() > 1e-12 {
+        let us = if delta > 0.0 { (y_init - y_min) / delta } else { (y_max - y_init) / (-delta) };
+        (us * 100.0).max(0.0)
+    } else {
+        0.0
+    };
+
+    // Rise time: 10% to 90% of final value
+    let mut t10 = f64::NAN;
+    let mut t90 = f64::NAN;
+    for i in 0..n {
+        let frac = if delta.abs() > 1e-12 { (y_vec[i] - y_init) / delta } else { 0.0 };
+        if t10.is_nan() && frac >= 0.1 {
+            t10 = t_vec[i];
+        }
+        if t90.is_nan() && frac >= 0.9 {
+            t90 = t_vec[i];
+            break;
+        }
+    }
+    let rise_time = t90 - t10;
+
+    // Settling time: last time outside 2% band around y_final
+    let band = 0.02 * delta.abs().max(1e-12);
+    let mut settling_time = t_vec[0];
+    let mut s_min = f64::INFINITY;
+    let mut s_max = f64::NEG_INFINITY;
+    for i in (0..n).rev() {
+        if (y_vec[i] - y_final).abs() > band {
+            settling_time = t_vec[(i + 1).min(n - 1)];
+            break;
+        }
+    }
+    for i in 0..n {
+        if t_vec[i] >= t90 {
+            s_min = s_min.min(y_vec[i]);
+            s_max = s_max.max(y_vec[i]);
+        }
+    }
+    if !s_min.is_finite() { s_min = y_final; }
+    if !s_max.is_finite() { s_max = y_final; }
+
+    let mut st = BTreeMap::new();
+    st.insert("RiseTime".to_string(), Value::scalar(rise_time));
+    st.insert("SettlingTime".to_string(), Value::scalar(settling_time));
+    st.insert("SettlingMin".to_string(), Value::scalar(s_min));
+    st.insert("SettlingMax".to_string(), Value::scalar(s_max));
+    st.insert("Overshoot".to_string(), Value::scalar(overshoot));
+    st.insert("Undershoot".to_string(), Value::scalar(undershoot));
+    st.insert("Peak".to_string(), Value::scalar(peak));
+    st.insert("PeakTime".to_string(), Value::scalar(peak_time));
+    ok1(Value::Struct(st))
+}
+
+/// `[A, B, C, D, Ts] = ssdata(sys)`
+pub fn fn_ssdata(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.len() != 1 {
+        return Err(MatroError::arity("ssdata", "1 (sys)", args.len()));
+    }
+    let sys = extract_ss(&args[0])?;
+    let ts = match &args[0] {
+        Value::Object(o) => o.fields.get("Ts").and_then(|v| v.as_scalar().ok()).unwrap_or(0.0),
+        _ => 0.0,
+    };
+    let mut out = vec![
+        Value::matrix(sys.a),
+        Value::matrix(sys.b),
+        Value::matrix(sys.c),
+        Value::matrix(sys.d),
+    ];
+    if nargout >= 5 {
+        out.push(Value::scalar(ts));
+    }
+    Ok(out)
+}
+
+/// `[num, den, Ts] = tfdata(sys [, 'v'])`
+pub fn fn_tfdata(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity("tfdata", "1 or 2 (sys [, 'v'])", args.len()));
+    }
+    let as_vec = args
+        .get(1)
+        .and_then(crate::value_as_text)
+        .is_some_and(|s| s.eq_ignore_ascii_case("v"));
+    let ts = match &args[0] {
+        Value::Object(o) => o.fields.get("Ts").and_then(|v| v.as_scalar().ok()).unwrap_or(0.0),
+        _ => 0.0,
+    };
+    let (num, den) = match &args[0] {
+        Value::Object(o) if o.class_name == "tf" => (
+            o.fields["Numerator"].to_dense_matrix()?,
+            o.fields["Denominator"].to_dense_matrix()?,
+        ),
+        _ => {
+            let sys = extract_ss(&args[0])?;
+            let res = fn_ss2tf(&[
+                Value::matrix(sys.a),
+                Value::matrix(sys.b),
+                Value::matrix(sys.c),
+                Value::matrix(sys.d),
+            ])?;
+            (res[0].to_dense_matrix()?, res[1].to_dense_matrix()?)
+        }
+    };
+    let wrap = |m: Matrix| -> Value {
+        if as_vec {
+            Value::matrix(m)
+        } else {
+            Value::Cell(matro_types::CellArray {
+                rows: 1,
+                cols: 1,
+                data: vec![Value::matrix(m)],
+            })
+        }
+    };
+    let mut out = vec![wrap(num)];
+    if nargout >= 2 { out.push(wrap(den)); }
+    if nargout >= 3 { out.push(Value::scalar(ts)); }
+    Ok(out)
+}
+
+/// `[r, k] = rlocus(sys [, k])` — Root locus of SISO system `den(s) + k * num(s) = 0`.
+pub fn fn_rlocus(args: &[Value], nargout: usize, fig: &mut PlotFigure) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity("rlocus", "1 or 2 (sys [, k])", args.len()));
+    }
+    let td = fn_tfdata(&[args[0].clone(), Value::String("v".into())], 2)?;
+    let num = td[0].to_dense_matrix()?.data().to_vec();
+    let den = td[1].to_dense_matrix()?.data().to_vec();
+    let n = den.len().max(num.len());
+    let mut p_den = vec![0.0; n];
+    let mut p_num = vec![0.0; n];
+    for (i, &v) in den.iter().enumerate() {
+        p_den[n - den.len() + i] = v;
+    }
+    for (i, &v) in num.iter().enumerate() {
+        p_num[n - num.len() + i] = v;
+    }
+    let ks: Vec<f64> = if let Some(kv) = args.get(1) {
+        kv.to_dense_matrix()?.data().to_vec()
+    } else {
+        let mut v = vec![0.0];
+        for i in 0..49 {
+            v.push(10.0f64.powf(-2.0 + 5.0 * (i as f64) / 48.0));
+        }
+        v
+    };
+    let deg = n.saturating_sub(1);
+    let mut r_mat = Matrix::zeros(deg, ks.len());
+    for (ci, &k) in ks.iter().enumerate() {
+        let poly: Vec<f64> = (0..n).map(|i| p_den[i] + k * p_num[i]).collect();
+        let rts = crate::extras::fn_roots(&[Value::matrix(Matrix::row_vec(poly))])?[0].to_dense_matrix()?;
+        for r in 0..deg.min(rts.len()) {
+            r_mat.set_c(r, ci, rts.get_linear_c(r));
+        }
+    }
+    if nargout == 0 {
+        let p = fig.panel_mut();
+        p.clear();
+        p.hold = true;
+        for r in 0..deg {
+            let rx: Vec<f64> = (0..ks.len()).map(|c| r_mat.get_c(r, c).re).collect();
+            let ry: Vec<f64> = (0..ks.len()).map(|c| r_mat.get_c(r, c).im).collect();
+            p.add_series(PlotKind::Line, rx, ry, None);
+        }
+        p.title = "Root Locus".to_string();
+        p.xlabel = "Real Axis".to_string();
+        p.ylabel = "Imaginary Axis".to_string();
+        return Ok(vec![]);
+    }
+    let mut out = vec![Value::matrix(r_mat.normalize())];
+    if nargout >= 2 {
+        out.push(Value::matrix(Matrix::col_vec(ks)));
     }
     Ok(out)
 }

@@ -163,6 +163,20 @@ pub fn betainc_reg(x: f64, a: f64, b: f64) -> f64 {
     }
 }
 
+pub fn gamma_f64(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    if x <= 0.0 {
+        if x == x.floor() {
+            return f64::INFINITY;
+        }
+        let s = (std::f64::consts::PI * x).sin();
+        return std::f64::consts::PI / (s * lgamma_f64(1.0 - x).exp());
+    }
+    lgamma_f64(x).exp()
+}
+
 pub fn fn_gamma_fn(args: &[Value], is_log: bool) -> Result<Vec<Value>> {
     let fname = if is_log { "gammaln" } else { "gamma" };
     if args.len() != 1 {
@@ -173,29 +187,56 @@ pub fn fn_gamma_fn(args: &[Value], is_log: bool) -> Result<Vec<Value>> {
         if is_log {
             lgamma_f64(x)
         } else {
-            lgamma_f64(x).exp()
+            gamma_f64(x)
         }
     });
     ok1(Value::matrix(out))
 }
 
 pub fn fn_gammainc(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 2 {
-        return Err(MatroError::arity("gammainc", "2 (x, a)", args.len()));
+    if args.len() < 2 || args.len() > 3 {
+        return Err(MatroError::arity("gammainc", "2 or 3 (x, a [, 'lower'|'upper'])", args.len()));
     }
     let x = args[0].to_dense_matrix()?;
     let a = args[1].to_dense_matrix()?;
-    ok1(Value::matrix(x.elementwise(&a, gammainc_lower)?))
+    let upper = args
+        .get(2)
+        .and_then(crate::value_as_text)
+        .is_some_and(|s| s.eq_ignore_ascii_case("upper"));
+    ok1(Value::matrix(x.elementwise(&a, |xv, av| {
+        let p = gammainc_lower(xv, av);
+        if upper { 1.0 - p } else { p }
+    })?))
 }
 
 pub fn fn_betainc(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 3 {
-        return Err(MatroError::arity("betainc", "3 (x, a, b)", args.len()));
+    if args.len() < 3 || args.len() > 4 {
+        return Err(MatroError::arity("betainc", "3 or 4 (x, a, b [, 'lower'|'upper'])", args.len()));
     }
     let x = args[0].to_dense_matrix()?;
-    let a = args[1].as_scalar()?;
-    let b = args[2].as_scalar()?;
-    ok1(Value::matrix(x.map(|v| betainc_reg(v, a, b))))
+    let a = args[1].to_dense_matrix()?;
+    let b = args[2].to_dense_matrix()?;
+    let upper = args
+        .get(3)
+        .and_then(crate::value_as_text)
+        .is_some_and(|s| s.eq_ignore_ascii_case("upper"));
+    let n = x.len().max(a.len()).max(b.len());
+    let dims = if x.len() == n {
+        x.dims()
+    } else if a.len() == n {
+        a.dims()
+    } else {
+        b.dims()
+    };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let xv = if x.len() == 1 { x.data()[0] } else { x.data()[i] };
+        let av = if a.len() == 1 { a.data()[0] } else { a.data()[i] };
+        let bv = if b.len() == 1 { b.data()[0] } else { b.data()[i] };
+        let p = betainc_reg(xv, av, bv);
+        out.push(if upper { 1.0 - p } else { p });
+    }
+    ok1(Value::matrix(Matrix::from_nd_col_major(dims, out)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -257,24 +298,77 @@ pub fn fcdf_scalar(x: f64, d1: f64, d2: f64) -> f64 {
     betainc_reg(z, 0.5 * d1, 0.5 * d2)
 }
 
+fn broadcast_2(a: &Matrix, b: &Matrix, f: impl Fn(f64, f64) -> f64) -> Result<Matrix> {
+    a.elementwise(b, f)
+}
+
+fn broadcast_3(a: &Matrix, b: &Matrix, c: &Matrix, f: impl Fn(f64, f64, f64) -> f64) -> Result<Matrix> {
+    let n = a.len().max(b.len()).max(c.len());
+    let dims = if a.len() == n {
+        a.dims()
+    } else if b.len() == n {
+        b.dims()
+    } else {
+        c.dims()
+    };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let av = if a.len() == 1 { a.data()[0] } else { a.data()[i] };
+        let bv = if b.len() == 1 { b.data()[0] } else { b.data()[i] };
+        let cv = if c.len() == 1 { c.data()[0] } else { c.data()[i] };
+        out.push(f(av, bv, cv));
+    }
+    Matrix::from_nd_col_major(dims, out)
+}
+
 pub fn fn_t_dist(name: &str, args: &[Value]) -> Result<Vec<Value>> {
     if args.len() != 2 {
         return Err(MatroError::arity(name, "2 (x, nu)", args.len()));
     }
     let x = args[0].to_dense_matrix()?;
-    let nu = args[1].as_scalar()?;
+    let nu = args[1].to_dense_matrix()?;
     let out = match name {
-        "tpdf" => {
-            let log_c = lgamma_f64(0.5 * (nu + 1.0))
-                - lgamma_f64(0.5 * nu)
-                - 0.5 * (nu * std::f64::consts::PI).ln();
-            x.map(|t| (log_c - 0.5 * (nu + 1.0) * (1.0 + t * t / nu).ln()).exp())
-        }
-        "tcdf" => x.map(|t| tcdf_scalar(t, nu)),
-        "tinv" => x.map(|p| tinv_scalar(p, nu)),
+        "tpdf" => broadcast_2(&x, &nu, |t, v| {
+            if v <= 0.0 || v.is_nan() {
+                f64::NAN
+            } else {
+                let log_c = lgamma_f64(0.5 * (v + 1.0))
+                    - lgamma_f64(0.5 * v)
+                    - 0.5 * (v * std::f64::consts::PI).ln();
+                (log_c - 0.5 * (v + 1.0) * (1.0 + t * t / v).ln()).exp()
+            }
+        })?,
+        "tcdf" => broadcast_2(&x, &nu, tcdf_scalar)?,
+        "tinv" => broadcast_2(&x, &nu, tinv_scalar)?,
         _ => unreachable!(),
     };
     ok1(Value::matrix(out))
+}
+
+pub fn chi2inv_scalar(p: f64, k: f64) -> f64 {
+    if p.is_nan() || k.is_nan() || k <= 0.0 || p < 0.0 || p > 1.0 {
+        return f64::NAN;
+    }
+    if p == 0.0 {
+        return 0.0;
+    }
+    if p == 1.0 {
+        return f64::INFINITY;
+    }
+    let mut lo = 0.0;
+    let mut hi = k.max(1.0);
+    while gammainc_lower(0.5 * hi, 0.5 * k) < p && hi < 1e9 {
+        hi *= 2.0;
+    }
+    for _ in 0..80 {
+        let mid = 0.5 * (lo + hi);
+        if gammainc_lower(0.5 * mid, 0.5 * k) < p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
 }
 
 pub fn fn_chi2_dist(name: &str, args: &[Value]) -> Result<Vec<Value>> {
@@ -282,45 +376,57 @@ pub fn fn_chi2_dist(name: &str, args: &[Value]) -> Result<Vec<Value>> {
         return Err(MatroError::arity(name, "2 (x, k)", args.len()));
     }
     let x = args[0].to_dense_matrix()?;
-    let k = args[1].as_scalar()?;
+    let k = args[1].to_dense_matrix()?;
     let out = match name {
-        "chi2pdf" => {
-            let half_k = 0.5 * k;
-            let log_c = -half_k * 2.0f64.ln() - lgamma_f64(half_k);
-            x.map(|v| {
-                if v <= 0.0 {
-                    0.0
-                } else {
-                    (log_c + (half_k - 1.0) * v.ln() - 0.5 * v).exp()
-                }
-            })
-        }
-        "chi2cdf" => x.map(|v| if v <= 0.0 { 0.0 } else { gammainc_lower(0.5 * v, 0.5 * k) }),
-        "chi2inv" => x.map(|p| {
-            if p <= 0.0 {
-                return 0.0;
+        "chi2pdf" => broadcast_2(&x, &k, |v, df| {
+            if df <= 0.0 || df.is_nan() || v.is_nan() {
+                f64::NAN
+            } else if v <= 0.0 {
+                0.0
+            } else {
+                let half_k = 0.5 * df;
+                let log_c = -half_k * 2.0f64.ln() - lgamma_f64(half_k);
+                (log_c + (half_k - 1.0) * v.ln() - 0.5 * v).exp()
             }
-            if p >= 1.0 {
-                return f64::INFINITY;
+        })?,
+        "chi2cdf" => broadcast_2(&x, &k, |v, df| {
+            if df <= 0.0 || df.is_nan() || v.is_nan() {
+                f64::NAN
+            } else if v <= 0.0 {
+                0.0
+            } else {
+                gammainc_lower(0.5 * v, 0.5 * df)
             }
-            let mut lo = 0.0;
-            let mut hi = k.max(1.0);
-            while gammainc_lower(0.5 * hi, 0.5 * k) < p && hi < 1e8 {
-                hi *= 2.0;
-            }
-            for _ in 0..80 {
-                let mid = 0.5 * (lo + hi);
-                if gammainc_lower(0.5 * mid, 0.5 * k) < p {
-                    lo = mid;
-                } else {
-                    hi = mid;
-                }
-            }
-            0.5 * (lo + hi)
-        }),
+        })?,
+        "chi2inv" => broadcast_2(&x, &k, chi2inv_scalar)?,
         _ => unreachable!(),
     };
     ok1(Value::matrix(out))
+}
+
+pub fn finv_scalar(p: f64, d1: f64, d2: f64) -> f64 {
+    if p.is_nan() || d1 <= 0.0 || d2 <= 0.0 || p < 0.0 || p > 1.0 {
+        return f64::NAN;
+    }
+    if p == 0.0 {
+        return 0.0;
+    }
+    if p == 1.0 {
+        return f64::INFINITY;
+    }
+    // Solve betainc_reg(z, d1/2, d2/2) = p via bisection on z in (0, 1), then x = d2*z / (d1*(1-z))
+    let mut lo = 0.0;
+    let mut hi = 1.0;
+    for _ in 0..80 {
+        let mid = 0.5 * (lo + hi);
+        if betainc_reg(mid, 0.5 * d1, 0.5 * d2) < p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let z = 0.5 * (lo + hi);
+    (d2 * z) / (d1 * (1.0 - z).max(1e-300))
 }
 
 pub fn fn_f_dist(name: &str, args: &[Value]) -> Result<Vec<Value>> {
@@ -328,25 +434,25 @@ pub fn fn_f_dist(name: &str, args: &[Value]) -> Result<Vec<Value>> {
         return Err(MatroError::arity(name, "3 (x, d1, d2)", args.len()));
     }
     let x = args[0].to_dense_matrix()?;
-    let d1 = args[1].as_scalar()?;
-    let d2 = args[2].as_scalar()?;
+    let d1 = args[1].to_dense_matrix()?;
+    let d2 = args[2].to_dense_matrix()?;
     let out = match name {
-        "fpdf" => {
-            let log_c = lgamma_f64(0.5 * (d1 + d2))
-                - lgamma_f64(0.5 * d1)
-                - lgamma_f64(0.5 * d2)
-                + 0.5 * d1 * (d1 / d2).ln();
-            x.map(|v| {
-                if v <= 0.0 {
-                    0.0
-                } else {
-                    (log_c + (0.5 * d1 - 1.0) * v.ln()
-                        - 0.5 * (d1 + d2) * (1.0 + d1 * v / d2).ln())
+        "fpdf" => broadcast_3(&x, &d1, &d2, |v, v1, v2| {
+            if v1 <= 0.0 || v2 <= 0.0 || v.is_nan() {
+                f64::NAN
+            } else if v <= 0.0 {
+                0.0
+            } else {
+                let log_c = lgamma_f64(0.5 * (v1 + v2))
+                    - lgamma_f64(0.5 * v1)
+                    - lgamma_f64(0.5 * v2)
+                    + 0.5 * v1 * (v1 / v2).ln();
+                (log_c + (0.5 * v1 - 1.0) * v.ln() - 0.5 * (v1 + v2) * (1.0 + v1 * v / v2).ln())
                     .exp()
-                }
-            })
-        }
-        "fcdf" => x.map(|v| fcdf_scalar(v, d1, d2)),
+            }
+        })?,
+        "fcdf" => broadcast_3(&x, &d1, &d2, fcdf_scalar)?,
+        "finv" => broadcast_3(&x, &d1, &d2, finv_scalar)?,
         _ => unreachable!(),
     };
     ok1(Value::matrix(out))
@@ -357,83 +463,175 @@ pub fn fn_exp_dist(name: &str, args: &[Value]) -> Result<Vec<Value>> {
         return Err(MatroError::arity(name, "1 or 2 (x [, mu])", args.len()));
     }
     let x = args[0].to_dense_matrix()?;
-    let mu = args.get(1).map(|v| v.as_scalar()).transpose()?.unwrap_or(1.0);
+    let mu = args
+        .get(1)
+        .map(|v| v.to_dense_matrix())
+        .transpose()?
+        .unwrap_or_else(|| Matrix::scalar(1.0));
     let out = match name {
-        "exppdf" => x.map(|v| if v < 0.0 { 0.0 } else { (-v / mu).exp() / mu }),
-        "expcdf" => x.map(|v| if v < 0.0 { 0.0 } else { 1.0 - (-v / mu).exp() }),
-        "expinv" => x.map(|p| {
-            if p < 0.0 || p > 1.0 {
+        "exppdf" => broadcast_2(&x, &mu, |v, m| {
+            if m <= 0.0 || m.is_nan() || v.is_nan() {
+                f64::NAN
+            } else if v < 0.0 {
+                0.0
+            } else {
+                (-v / m).exp() / m
+            }
+        })?,
+        "expcdf" => broadcast_2(&x, &mu, |v, m| {
+            if m <= 0.0 || m.is_nan() || v.is_nan() {
+                f64::NAN
+            } else if v < 0.0 {
+                0.0
+            } else {
+                1.0 - (-v / m).exp()
+            }
+        })?,
+        "expinv" => broadcast_2(&x, &mu, |p, m| {
+            if m <= 0.0 || m.is_nan() || p.is_nan() || p < 0.0 || p > 1.0 {
                 f64::NAN
             } else {
-                -mu * (1.0 - p).ln()
+                -m * (1.0 - p).ln()
             }
-        }),
+        })?,
         _ => unreachable!(),
     };
     ok1(Value::matrix(out))
+}
+
+fn binocdf_scalar(k: f64, n: f64, p: f64) -> f64 {
+    if k.is_nan() || n.is_nan() || p.is_nan() || n < 0.0 || !(0.0..=1.0).contains(&p) {
+        return f64::NAN;
+    }
+    let nr = n.round();
+    if k < 0.0 {
+        return 0.0;
+    }
+    if k >= nr {
+        return 1.0;
+    }
+    let kf = k.floor();
+    betainc_reg(1.0 - p, nr - kf, kf + 1.0)
 }
 
 pub fn fn_bino_dist(name: &str, args: &[Value]) -> Result<Vec<Value>> {
     if args.len() != 3 {
-        return Err(MatroError::arity(name, "3 (k, n, p)", args.len()));
+        return Err(MatroError::arity(name, "3 (x, n, p)", args.len()));
     }
     let kv = args[0].to_dense_matrix()?;
-    let n = args[1].as_scalar()?.round().max(0.0);
-    let p = args[2].as_scalar()?;
-    let pmf = |k: f64| -> f64 {
-        let ki = k.round();
-        if (k - ki).abs() > 1e-12 || ki < 0.0 || ki > n {
-            return 0.0;
-        }
-        if p == 0.0 {
-            return if ki == 0.0 { 1.0 } else { 0.0 };
-        }
-        if p == 1.0 {
-            return if ki == n { 1.0 } else { 0.0 };
-        }
-        let log_c = lgamma_f64(n + 1.0) - lgamma_f64(ki + 1.0) - lgamma_f64(n - ki + 1.0);
-        (log_c + ki * p.ln() + (n - ki) * (1.0 - p).ln()).exp()
-    };
+    let nv = args[1].to_dense_matrix()?;
+    let pv = args[2].to_dense_matrix()?;
     let out = match name {
-        "binopdf" => kv.map(pmf),
-        "binocdf" => kv.map(|k| {
-            if k < 0.0 {
-                0.0
-            } else if k >= n {
-                1.0
-            } else {
-                let kf = k.floor() as usize;
-                (0..=kf).map(|i| pmf(i as f64)).sum::<f64>().min(1.0)
+        "binopdf" => broadcast_3(&kv, &nv, &pv, |k, n_raw, p| {
+            let n = n_raw.round();
+            if n < 0.0 || !(0.0..=1.0).contains(&p) {
+                return f64::NAN;
             }
-        }),
+            let ki = k.round();
+            if (k - ki).abs() > 1e-12 || ki < 0.0 || ki > n {
+                return 0.0;
+            }
+            if p == 0.0 {
+                return if ki == 0.0 { 1.0 } else { 0.0 };
+            }
+            if p == 1.0 {
+                return if ki == n { 1.0 } else { 0.0 };
+            }
+            let log_c = lgamma_f64(n + 1.0) - lgamma_f64(ki + 1.0) - lgamma_f64(n - ki + 1.0);
+            (log_c + ki * p.ln() + (n - ki) * (1.0 - p).ln()).exp()
+        })?,
+        "binocdf" => broadcast_3(&kv, &nv, &pv, binocdf_scalar)?,
+        "binoinv" => broadcast_3(&kv, &nv, &pv, |y, n_raw, p| {
+            if y.is_nan() || n_raw < 0.0 || !(0.0..=1.0).contains(&p) || y < 0.0 || y > 1.0 {
+                return f64::NAN;
+            }
+            let n = n_raw.round() as usize;
+            if y == 0.0 {
+                return 0.0;
+            }
+            if y == 1.0 {
+                return n as f64;
+            }
+            let mut lo = 0usize;
+            let mut hi = n;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if binocdf_scalar(mid as f64, n as f64, p) < y {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo as f64
+        })?,
         _ => unreachable!(),
     };
     ok1(Value::matrix(out))
 }
 
+fn poisscdf_scalar(k: f64, lam: f64) -> f64 {
+    if k.is_nan() || lam.is_nan() || lam < 0.0 {
+        return f64::NAN;
+    }
+    if k < 0.0 {
+        return 0.0;
+    }
+    if lam == 0.0 {
+        return 1.0;
+    }
+    let kf = k.floor();
+    (1.0 - gammainc_lower(lam, kf + 1.0)).clamp(0.0, 1.0)
+}
+
 pub fn fn_poiss_dist(name: &str, args: &[Value]) -> Result<Vec<Value>> {
     if args.len() != 2 {
-        return Err(MatroError::arity(name, "2 (k, lambda)", args.len()));
+        return Err(MatroError::arity(name, "2 (x, lambda)", args.len()));
     }
     let kv = args[0].to_dense_matrix()?;
-    let lam = args[1].as_scalar()?;
-    let pmf = |k: f64| -> f64 {
-        let ki = k.round();
-        if (k - ki).abs() > 1e-12 || ki < 0.0 {
-            return 0.0;
-        }
-        (-lam + ki * lam.ln() - lgamma_f64(ki + 1.0)).exp()
-    };
+    let lv = args[1].to_dense_matrix()?;
     let out = match name {
-        "poisspdf" => kv.map(pmf),
-        "poisscdf" => kv.map(|k| {
-            if k < 0.0 {
-                0.0
-            } else {
-                let kf = k.floor() as usize;
-                (0..=kf).map(|i| pmf(i as f64)).sum::<f64>().min(1.0)
+        "poisspdf" => broadcast_2(&kv, &lv, |k, lam| {
+            if lam < 0.0 || lam.is_nan() || k.is_nan() {
+                return f64::NAN;
             }
-        }),
+            let ki = k.round();
+            if (k - ki).abs() > 1e-12 || ki < 0.0 {
+                return 0.0;
+            }
+            if lam == 0.0 {
+                return if ki == 0.0 { 1.0 } else { 0.0 };
+            }
+            (-lam + ki * lam.ln() - lgamma_f64(ki + 1.0)).exp()
+        })?,
+        "poisscdf" => broadcast_2(&kv, &lv, poisscdf_scalar)?,
+        "poissinv" => broadcast_2(&kv, &lv, |y, lam| {
+            if y.is_nan() || lam.is_nan() || lam < 0.0 || y < 0.0 || y > 1.0 {
+                return f64::NAN;
+            }
+            if y == 0.0 {
+                return 0.0;
+            }
+            if y == 1.0 {
+                return f64::INFINITY;
+            }
+            if lam == 0.0 {
+                return 0.0;
+            }
+            let mut hi = (lam + 10.0 * lam.sqrt() + 20.0).ceil() as usize;
+            while poisscdf_scalar(hi as f64, lam) < y && hi < 10_000_000 {
+                hi *= 2;
+            }
+            let mut lo = 0usize;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if poisscdf_scalar(mid as f64, lam) < y {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo as f64
+        })?,
         _ => unreachable!(),
     };
     ok1(Value::matrix(out))
@@ -444,33 +642,62 @@ pub fn fn_poiss_dist(name: &str, args: &[Value]) -> Result<Vec<Value>> {
 // ---------------------------------------------------------------------------
 
 pub fn fn_zscore(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
-    if args.is_empty() {
-        return Err(MatroError::arity("zscore", "1 (X)", 0));
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity("zscore", "1 to 3 (X [, flag [, dim]])", args.len()));
     }
     let x = args[0].to_dense_matrix()?;
-    if x.rows() == 1 || x.cols() == 1 {
+    let pop = args
+        .get(1)
+        .map(|v| {
+            let m = v.to_dense_matrix()?;
+            Ok::<bool, MatroError>(!m.is_empty() && m.data()[0] != 0.0)
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let dim_opt = args
+        .get(2)
+        .map(|v| v.as_scalar().map(|s| s.max(1.0).round() as usize))
+        .transpose()?;
+
+    if dim_opt.is_none() && (x.rows() == 1 || x.cols() == 1) {
         let n = x.len() as f64;
         let mu = x.data().iter().sum::<f64>() / n;
-        let sd = (x.data().iter().map(|&v| (v - mu).powi(2)).sum::<f64>() / (n - 1.0).max(1.0)).sqrt();
+        let denom = if pop { n } else { (n - 1.0).max(1.0) };
+        let sd = (x.data().iter().map(|&v| (v - mu).powi(2)).sum::<f64>() / denom).sqrt();
         let z = x.map(|v| if sd > 0.0 { (v - mu) / sd } else { 0.0 });
         let mut out = vec![Value::matrix(z)];
-        if nargout >= 2 {
-            out.push(Value::scalar(mu));
-        }
-        if nargout >= 3 {
-            out.push(Value::scalar(sd));
-        }
+        if nargout >= 2 { out.push(Value::scalar(mu)); }
+        if nargout >= 3 { out.push(Value::scalar(sd)); }
         return Ok(out);
     }
+    let dim = dim_opt.unwrap_or(1);
     let (r, c) = (x.rows(), x.cols());
+    if dim == 2 {
+        let mut z = Matrix::zeros(r, c);
+        let mut mus = Vec::with_capacity(r);
+        let mut sds = Vec::with_capacity(r);
+        let denom = if pop { c as f64 } else { (c as f64 - 1.0).max(1.0) };
+        for row in 0..r {
+            let mu = (0..c).map(|col| x.get(row, col)).sum::<f64>() / (c as f64);
+            let sd = ((0..c).map(|col| (x.get(row, col) - mu).powi(2)).sum::<f64>() / denom).sqrt();
+            mus.push(mu);
+            sds.push(sd);
+            for col in 0..c {
+                z.set(row, col, if sd > 0.0 { (x.get(row, col) - mu) / sd } else { 0.0 });
+            }
+        }
+        let mut out = vec![Value::matrix(z)];
+        if nargout >= 2 { out.push(Value::matrix(Matrix::col_vec(mus))); }
+        if nargout >= 3 { out.push(Value::matrix(Matrix::col_vec(sds))); }
+        return Ok(out);
+    }
     let mut z = Matrix::zeros(r, c);
     let mut mus = Vec::with_capacity(c);
     let mut sds = Vec::with_capacity(c);
+    let denom = if pop { r as f64 } else { (r as f64 - 1.0).max(1.0) };
     for col in 0..c {
         let mu = (0..r).map(|row| x.get(row, col)).sum::<f64>() / (r as f64);
-        let sd = ((0..r).map(|row| (x.get(row, col) - mu).powi(2)).sum::<f64>()
-            / ((r as f64) - 1.0).max(1.0))
-        .sqrt();
+        let sd = ((0..r).map(|row| (x.get(row, col) - mu).powi(2)).sum::<f64>() / denom).sqrt();
         mus.push(mu);
         sds.push(sd);
         for row in 0..r {
@@ -478,51 +705,113 @@ pub fn fn_zscore(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
         }
     }
     let mut out = vec![Value::matrix(z)];
-    if nargout >= 2 {
-        out.push(Value::matrix(Matrix::row_vec(mus)));
-    }
-    if nargout >= 3 {
-        out.push(Value::matrix(Matrix::row_vec(sds)));
-    }
+    if nargout >= 2 { out.push(Value::matrix(Matrix::row_vec(mus))); }
+    if nargout >= 3 { out.push(Value::matrix(Matrix::row_vec(sds))); }
     Ok(out)
 }
 
-pub fn fn_moment_stat(name: &str, args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity(name, "1", args.len()));
-    }
-    let x = args[0].to_dense_matrix()?;
-    let data = x.data();
-    let n = data.len() as f64;
+fn moment_slice(name: &str, raw: &[f64], flag: i32) -> f64 {
+    let data: Vec<f64> = raw.iter().copied().filter(|x| !x.is_nan()).collect();
     if data.is_empty() {
-        return ok1(Value::scalar(f64::NAN));
+        return f64::NAN;
     }
-    let mu = data.iter().sum::<f64>() / n;
-    let m2 = data.iter().map(|&v| (v - mu).powi(2)).sum::<f64>() / n;
-    let res = match name {
+    let n = data.len() as f64;
+    match name {
         "skewness" => {
+            let mu = data.iter().sum::<f64>() / n;
+            let m2 = data.iter().map(|&v| (v - mu).powi(2)).sum::<f64>() / n;
             let m3 = data.iter().map(|&v| (v - mu).powi(3)).sum::<f64>() / n;
-            m3 / m2.powf(1.5)
+            let s1 = m3 / m2.powf(1.5);
+            if flag == 0 && data.len() > 2 {
+                ((n * (n - 1.0)).sqrt() / (n - 2.0)) * s1
+            } else {
+                s1
+            }
         }
         "kurtosis" => {
+            let mu = data.iter().sum::<f64>() / n;
+            let m2 = data.iter().map(|&v| (v - mu).powi(2)).sum::<f64>() / n;
             let m4 = data.iter().map(|&v| (v - mu).powi(4)).sum::<f64>() / n;
-            m4 / (m2 * m2)
+            let k1 = m4 / (m2 * m2);
+            if flag == 0 && data.len() > 3 {
+                ((n - 1.0) / ((n - 2.0) * (n - 3.0))) * ((n + 1.0) * k1 - 3.0 * (n - 1.0)) + 3.0
+            } else {
+                k1
+            }
         }
-        "mad" => data.iter().map(|&v| (v - mu).abs()).sum::<f64>() / n,
+        "mad" => {
+            if flag == 1 {
+                // Median absolute deviation from median
+                let mut s = data.clone();
+                s.sort_by(f64::total_cmp);
+                let med = if s.len() % 2 == 1 {
+                    s[s.len() / 2]
+                } else {
+                    0.5 * (s[s.len() / 2 - 1] + s[s.len() / 2])
+                };
+                let mut devs: Vec<f64> = data.iter().map(|&v| (v - med).abs()).collect();
+                devs.sort_by(f64::total_cmp);
+                if devs.len() % 2 == 1 {
+                    devs[devs.len() / 2]
+                } else {
+                    0.5 * (devs[devs.len() / 2 - 1] + devs[devs.len() / 2])
+                }
+            } else {
+                let mu = data.iter().sum::<f64>() / n;
+                data.iter().map(|&v| (v - mu).abs()).sum::<f64>() / n
+            }
+        }
         "iqr" => {
-            let mut sorted = data.to_vec();
-            sorted.sort_by(|a, b| a.total_cmp(b));
-            let q = |p: f64| -> f64 {
-                let pos = p * ((sorted.len() - 1) as f64);
-                let lo = pos.floor() as usize;
-                let hi = (lo + 1).min(sorted.len() - 1);
-                sorted[lo] + (pos - lo as f64) * (sorted[hi] - sorted[lo])
-            };
-            q(0.75) - q(0.25)
+            crate::stats::slice_quantile(&data, 0.75) - crate::stats::slice_quantile(&data, 0.25)
         }
         _ => unreachable!(),
-    };
-    ok1(Value::scalar(res))
+    }
+}
+
+pub fn fn_moment_stat(name: &str, args: &[Value]) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity(name, "1 to 3", args.len()));
+    }
+    let x = args[0].to_dense_matrix()?;
+    let mut all_flag = false;
+    let mut flag = if name == "mad" { 0 } else { 1 };
+    let mut dim_opt: Option<Vec<usize>> = None;
+
+    if name == "iqr" {
+        if let Some(a1) = args.get(1) {
+            if crate::value_as_text(a1).is_some_and(|s| s.eq_ignore_ascii_case("all")) {
+                all_flag = true;
+            } else {
+                let dm = a1.to_dense_matrix()?;
+                dim_opt = Some(dm.data().iter().map(|&v| v.max(1.0).round() as usize).collect());
+            }
+        }
+    } else {
+        if let Some(a1) = args.get(1) {
+            if crate::value_as_text(a1).is_some_and(|s| s.eq_ignore_ascii_case("all")) {
+                all_flag = true;
+            } else {
+                let fm = a1.to_dense_matrix()?;
+                if !fm.is_empty() {
+                    flag = fm.data()[0].round() as i32;
+                }
+            }
+        }
+        if let Some(a2) = args.get(2) {
+            if crate::value_as_text(a2).is_some_and(|s| s.eq_ignore_ascii_case("all")) {
+                all_flag = true;
+            } else {
+                let dm = a2.to_dense_matrix()?;
+                dim_opt = Some(dm.data().iter().map(|&v| v.max(1.0).round() as usize).collect());
+            }
+        }
+    }
+    ok1(Value::matrix(crate::stats::reduce_nd_real(
+        &x,
+        all_flag,
+        dim_opt.as_deref(),
+        |xs| moment_slice(name, xs, flag),
+    )?))
 }
 
 // ---------------------------------------------------------------------------
@@ -619,13 +908,14 @@ pub fn fn_fitlm(args: &[Value]) -> Result<Vec<Value>> {
     }))
 }
 
-/// `[b, bint, r] = regress(y, X)` — OLS without auto-intercept (MATLAB convention).
+/// `[b, bint, r, rint, stats] = regress(y, X [, alpha])` — OLS without auto-intercept (MATLAB convention).
 pub fn fn_regress(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
-    if args.len() != 2 {
-        return Err(MatroError::arity("regress", "2 (y, X)", args.len()));
+    if args.len() < 2 || args.len() > 3 {
+        return Err(MatroError::arity("regress", "2 or 3 (y, X [, alpha])", args.len()));
     }
     let y = args[0].to_dense_matrix()?;
     let x = args[1].to_dense_matrix()?;
+    let alpha = args.get(2).map(|v| v.as_scalar()).transpose()?.unwrap_or(0.05);
     let n = y.len();
     if x.rows() != n {
         return Err(MatroError::dimension("regress: X rows must match length(y)"));
@@ -636,19 +926,23 @@ pub fn fn_regress(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
     let xtx = xt.matmul(&x)?;
     let b = xtx.solve(&xt.matmul(&y_col)?)?;
     let yhat = x.matmul(&b)?;
+    let y_mean = y.data().iter().sum::<f64>() / (n.max(1) as f64);
     let mut r = Matrix::zeros(n, 1);
     let mut sse = 0.0;
+    let mut sst = 0.0;
     for i in 0..n {
         let e = y.data()[i] - yhat.get(i, 0);
         r.set(i, 0, e);
         sse += e * e;
+        sst += (y.data()[i] - y_mean).powi(2);
     }
+    let df = (n.saturating_sub(p)).max(1) as f64;
+    let mse = sse / df;
+    let tcrit = tinv_scalar(1.0 - 0.5 * alpha, df);
+    let inv_xtx = xtx.inv().unwrap_or_else(|_| Matrix::eye(p, p));
+
     let mut out = vec![Value::matrix(b.clone())];
     if nargout >= 2 {
-        let df = (n.saturating_sub(p)).max(1) as f64;
-        let mse = sse / df;
-        let tcrit = tinv_scalar(0.975, df);
-        let inv_xtx = xtx.inv()?;
         let mut bint = Matrix::zeros(p, 2);
         for i in 0..p {
             let half = tcrit * (mse * inv_xtx.get(i, i).max(0.0)).sqrt();
@@ -658,21 +952,53 @@ pub fn fn_regress(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
         out.push(Value::matrix(bint));
     }
     if nargout >= 3 {
-        out.push(Value::matrix(r));
+        out.push(Value::matrix(r.clone()));
+    }
+    if nargout >= 4 {
+        let mut rint = Matrix::zeros(n, 2);
+        for i in 0..n {
+            // Leverage h_ii = x_i * (X'X)^-1 * x_i'
+            let mut h_ii = 0.0;
+            for a in 0..p {
+                let xa = x.get(i, a);
+                for c in 0..p {
+                    h_ii += xa * inv_xtx.get(a, c) * x.get(i, c);
+                }
+            }
+            let half = tcrit * (mse * (1.0 - h_ii).max(0.0)).sqrt();
+            let ri = r.get(i, 0);
+            rint.set(i, 0, ri - half);
+            rint.set(i, 1, ri + half);
+        }
+        out.push(Value::matrix(rint));
+    }
+    if nargout >= 5 {
+        let r2 = if sst > 0.0 { 1.0 - sse / sst } else { 1.0 };
+        let df_reg = (p.saturating_sub(1)).max(1) as f64;
+        let f_stat = if mse > 0.0 {
+            ((sst - sse).max(0.0) / df_reg) / mse
+        } else {
+            f64::INFINITY
+        };
+        let p_val = (1.0 - fcdf_scalar(f_stat, df_reg, df)).clamp(0.0, 1.0);
+        out.push(Value::matrix(Matrix::row_vec(vec![r2, f_stat, p_val, mse])));
     }
     Ok(out)
 }
 
-/// `[p, stats] = anova1(X [, group])` — one-way ANOVA F-test.
+/// `[p, tbl, stats] = anova1(X [, group [, displayopt]])` — one-way ANOVA F-test.
 pub fn fn_anova1(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 2 {
-        return Err(MatroError::arity("anova1", "1 or 2 (X [, group])", args.len()));
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity("anova1", "1 to 3 (X [, group [, displayopt]])", args.len()));
     }
     let mut groups: Vec<Vec<f64>> = Vec::new();
-    if args.len() == 1 {
+    let use_group = args.len() >= 2
+        && !matches!(&args[1], Value::Matrix(m) if m.is_empty())
+        && crate::value_as_text(&args[1]).is_none();
+    if !use_group {
         let x = args[0].to_dense_matrix()?;
         for c in 0..x.cols() {
-            groups.push((0..x.rows()).map(|r| x.get(r, c)).collect());
+            groups.push((0..x.rows()).map(|r| x.get(r, c)).filter(|v| !v.is_nan()).collect());
         }
     } else {
         let x = args[0].to_dense_matrix()?;
@@ -682,7 +1008,9 @@ pub fn fn_anova1(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
         }
         let mut map: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
         for i in 0..x.len() {
-            map.entry(g.data()[i].round() as i64).or_default().push(x.data()[i]);
+            if !x.data()[i].is_nan() {
+                map.entry(g.data()[i].round() as i64).or_default().push(x.data()[i]);
+            }
         }
         groups = map.into_values().collect();
     }
@@ -694,8 +1022,12 @@ pub fn fn_anova1(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
     let grand_mean = groups.iter().flatten().sum::<f64>() / (n_total as f64);
     let mut ss_between = 0.0;
     let mut ss_within = 0.0;
+    let mut g_means = Vec::with_capacity(k);
+    let mut g_counts = Vec::with_capacity(k);
     for g in &groups {
         let gm = g.iter().sum::<f64>() / (g.len() as f64);
+        g_means.push(gm);
+        g_counts.push(g.len() as f64);
         ss_between += (g.len() as f64) * (gm - grand_mean).powi(2);
         for &v in g {
             ss_within += (v - gm).powi(2);
@@ -708,14 +1040,57 @@ pub fn fn_anova1(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
     let f_stat = if ms_w > 0.0 { ms_b / ms_w } else { f64::INFINITY };
     let p_val = (1.0 - fcdf_scalar(f_stat, df_b, df_w)).clamp(0.0, 1.0);
 
+    let mut st = BTreeMap::new();
+    st.insert("F".to_string(), Value::scalar(f_stat));
+    st.insert("df".to_string(), Value::scalar(df_w));
+    st.insert("df_between".to_string(), Value::scalar(df_b));
+    st.insert("df_within".to_string(), Value::scalar(df_w));
+    st.insert("SS_between".to_string(), Value::scalar(ss_between));
+    st.insert("SS_within".to_string(), Value::scalar(ss_within));
+    st.insert("s".to_string(), Value::scalar(ms_w.sqrt()));
+    st.insert("means".to_string(), Value::matrix(Matrix::row_vec(g_means)));
+    st.insert("n".to_string(), Value::matrix(Matrix::row_vec(g_counts)));
+
     let mut out = vec![Value::scalar(p_val)];
-    if nargout >= 2 {
-        let mut st = BTreeMap::new();
-        st.insert("F".to_string(), Value::scalar(f_stat));
-        st.insert("df_between".to_string(), Value::scalar(df_b));
-        st.insert("df_within".to_string(), Value::scalar(df_w));
-        st.insert("SS_between".to_string(), Value::scalar(ss_between));
-        st.insert("SS_within".to_string(), Value::scalar(ss_within));
+    if nargout == 2 {
+        out.push(Value::Struct(st));
+    } else if nargout >= 3 {
+        // 4x6 ANOVA table cell array
+        let rows = vec![
+            vec![
+                Value::String("Source".into()),
+                Value::String("SS".into()),
+                Value::String("df".into()),
+                Value::String("MS".into()),
+                Value::String("F".into()),
+                Value::String("Prob>F".into()),
+            ],
+            vec![
+                Value::String("Columns".into()),
+                Value::scalar(ss_between),
+                Value::scalar(df_b),
+                Value::scalar(ms_b),
+                Value::scalar(f_stat),
+                Value::scalar(p_val),
+            ],
+            vec![
+                Value::String("Error".into()),
+                Value::scalar(ss_within),
+                Value::scalar(df_w),
+                Value::scalar(ms_w),
+                Value::empty(),
+                Value::empty(),
+            ],
+            vec![
+                Value::String("Total".into()),
+                Value::scalar(ss_between + ss_within),
+                Value::scalar(df_b + df_w),
+                Value::empty(),
+                Value::empty(),
+                Value::empty(),
+            ],
+        ];
+        out.push(Value::Cell(matro_types::CellArray::from_rows(rows)?));
         out.push(Value::Struct(st));
     }
     Ok(out)
@@ -1025,22 +1400,66 @@ pub fn fn_predict(args: &[Value]) -> Result<Vec<Value>> {
     }
 }
 
-/// Pairwise Euclidean distances `Y = pdist(X)` (condensed `1 x n*(n-1)/2` row vector).
+pub fn pair_distance(a: &[f64], b: &[f64], metric: &str, p_exp: f64) -> f64 {
+    let d = a.len();
+    match metric {
+        "squaredeuclidean" | "seuclidean" => a.iter().zip(b.iter()).map(|(u, v)| (u - v) * (u - v)).sum(),
+        "cityblock" | "manhattan" | "l1" => a.iter().zip(b.iter()).map(|(u, v)| (u - v).abs()).sum(),
+        "chebychev" | "chebyshev" => a
+            .iter()
+            .zip(b.iter())
+            .map(|(u, v)| (u - v).abs())
+            .fold(0.0f64, f64::max),
+        "minkowski" => a
+            .iter()
+            .zip(b.iter())
+            .map(|(u, v)| (u - v).abs().powf(p_exp))
+            .sum::<f64>()
+            .powf(1.0 / p_exp),
+        "cosine" => {
+            let dot: f64 = a.iter().zip(b.iter()).map(|(u, v)| u * v).sum();
+            let na: f64 = a.iter().map(|u| u * u).sum::<f64>().sqrt();
+            let nb: f64 = b.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if na * nb > 0.0 { (1.0 - dot / (na * nb)).max(0.0) } else { 1.0 }
+        }
+        "correlation" => {
+            let ma = a.iter().sum::<f64>() / d.max(1) as f64;
+            let mb = b.iter().sum::<f64>() / d.max(1) as f64;
+            let dot: f64 = a.iter().zip(b.iter()).map(|(u, v)| (u - ma) * (v - mb)).sum();
+            let na: f64 = a.iter().map(|u| (u - ma).powi(2)).sum::<f64>().sqrt();
+            let nb: f64 = b.iter().map(|v| (v - mb).powi(2)).sum::<f64>().sqrt();
+            if na * nb > 0.0 { (1.0 - dot / (na * nb)).max(0.0) } else { 1.0 }
+        }
+        "hamming" => {
+            if d == 0 {
+                0.0
+            } else {
+                a.iter().zip(b.iter()).filter(|(u, v)| (**u - **v).abs() > 1e-12).count() as f64 / d as f64
+            }
+        }
+        _ => a.iter().zip(b.iter()).map(|(u, v)| (u - v) * (u - v)).sum::<f64>().sqrt(),
+    }
+}
+
+/// Pairwise distances `Y = pdist(X [, metric [, p]])` (condensed `1 x n*(n-1)/2` row vector).
 pub fn fn_pdist(args: &[Value]) -> Result<Vec<Value>> {
-    if args.is_empty() {
-        return Err(MatroError::arity("pdist", "1 (X)", 0));
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity("pdist", "1 to 3 (X [, metric [, p]])", args.len()));
     }
     let x = args[0].to_dense_matrix()?;
+    let metric = args
+        .get(1)
+        .and_then(crate::value_as_text)
+        .unwrap_or_else(|| "euclidean".to_string())
+        .to_ascii_lowercase();
+    let p_exp = args.get(2).and_then(|v| v.as_scalar().ok()).unwrap_or(2.0);
     let n = x.rows();
     let d = x.cols();
+    let rows: Vec<Vec<f64>> = (0..n).map(|r| (0..d).map(|c| x.get(r, c)).collect()).collect();
     let mut out = Vec::with_capacity(n * n.saturating_sub(1) / 2);
     for i in 0..n {
         for j in (i + 1)..n {
-            let dist = (0..d)
-                .map(|c| (x.get(i, c) - x.get(j, c)).powi(2))
-                .sum::<f64>()
-                .sqrt();
-            out.push(dist);
+            out.push(pair_distance(&rows[i], &rows[j], &metric, p_exp));
         }
     }
     ok1(Value::matrix(Matrix::row_vec(out)))
@@ -1171,9 +1590,17 @@ pub fn fn_linkage(args: &[Value]) -> Result<Vec<Value>> {
             }
             let d_ik = dist_mat[bi][k];
             let d_jk = dist_mat[bj][k];
+            let sz_k = cluster_sz[k] as f64;
             let d_new = match method.as_str() {
                 "complete" => d_ik.max(d_jk),
                 "average" => (sz_i * d_ik + sz_j * d_jk) / (sz_i + sz_j),
+                "ward" => {
+                    let denom = sz_i + sz_j + sz_k;
+                    let val = ((sz_i + sz_k) * d_ik * d_ik + (sz_j + sz_k) * d_jk * d_jk
+                        - sz_k * best_d * best_d)
+                        / denom;
+                    val.max(0.0).sqrt()
+                }
                 _ => d_ik.min(d_jk), // single
             };
             dist_mat[bi][k] = d_new;

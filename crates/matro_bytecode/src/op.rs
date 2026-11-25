@@ -41,6 +41,7 @@ pub enum OpCode {
     Div,
     ElemDiv,
     LeftDiv,
+    ElemLeftDiv,
     Pow,
     ElemPow,
 

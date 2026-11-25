@@ -442,10 +442,12 @@ impl SparseMatrix {
         Ok(y)
     }
 
-    /// Sparse matrix * dense matrix (`C = A * B`).
+    /// Sparse matrix * dense matrix (`C = A * B`), real or complex RHS.
     pub fn matmul_dense(&self, rhs: &Matrix) -> Result<Matrix> {
-        if let Some(s) = rhs.as_scalar() {
-            return Ok(self.scale(s).to_dense());
+        if let Some(s) = rhs.as_complex_scalar() {
+            let mut out = self.to_dense();
+            out = out.map_c(|v| v * s).normalize();
+            return Ok(out);
         }
         if self.cols != rhs.rows() {
             return Err(MatroError::dimension(format!(
@@ -456,6 +458,19 @@ impl SparseMatrix {
                 rhs.cols()
             )));
         }
+        if rhs.is_complex() {
+            let mut out = Matrix::complex_zeros(self.rows, rhs.cols());
+            for j in 0..rhs.cols() {
+                let col_re: Vec<f64> = (0..rhs.rows()).map(|r| rhs.get_c(r, j).re).collect();
+                let col_im: Vec<f64> = (0..rhs.rows()).map(|r| rhs.get_c(r, j).im).collect();
+                let res_re = self.matvec(&col_re)?;
+                let res_im = self.matvec(&col_im)?;
+                for i in 0..self.rows {
+                    out.set_c(i, j, crate::Complex::new(res_re[i], res_im[i]));
+                }
+            }
+            return Ok(out.normalize());
+        }
         let mut out = Matrix::zeros(self.rows, rhs.cols());
         for j in 0..rhs.cols() {
             let col: Vec<f64> = (0..rhs.rows()).map(|r| rhs.get(r, j)).collect();
@@ -465,6 +480,84 @@ impl SparseMatrix {
             }
         }
         Ok(out)
+    }
+
+    /// Horizontal concatenation of sparse matrices (`[A, B, ...]`).
+    pub fn horzcat(mats: &[&Self]) -> Result<Self> {
+        if mats.is_empty() {
+            return Ok(Self::zeros(0, 0));
+        }
+        let rows = mats[0].rows;
+        let mut total_cols = 0usize;
+        for m in mats {
+            if m.rows != rows {
+                return Err(MatroError::dimension(format!(
+                    "Sparse horzcat row mismatch: {} vs {}",
+                    rows, m.rows
+                )));
+            }
+            total_cols += m.cols;
+        }
+        let mut col_ptr = Vec::with_capacity(total_cols + 1);
+        let mut row_idx = Vec::new();
+        let mut values = Vec::new();
+        col_ptr.push(0);
+        for m in mats {
+            for c in 0..m.cols {
+                for idx in m.col_ptr[c]..m.col_ptr[c + 1] {
+                    row_idx.push(m.row_idx[idx]);
+                    values.push(m.values[idx]);
+                }
+                col_ptr.push(row_idx.len());
+            }
+        }
+        Ok(Self {
+            rows,
+            cols: total_cols,
+            col_ptr,
+            row_idx,
+            values,
+        })
+    }
+
+    /// Vertical concatenation of sparse matrices (`[A; B; ...]`).
+    pub fn vertcat(mats: &[&Self]) -> Result<Self> {
+        if mats.is_empty() {
+            return Ok(Self::zeros(0, 0));
+        }
+        let cols = mats[0].cols;
+        let mut total_rows = 0usize;
+        for m in mats {
+            if m.cols != cols {
+                return Err(MatroError::dimension(format!(
+                    "Sparse vertcat column mismatch: {} vs {}",
+                    cols, m.cols
+                )));
+            }
+            total_rows += m.rows;
+        }
+        let mut col_ptr = Vec::with_capacity(cols + 1);
+        let mut row_idx = Vec::new();
+        let mut values = Vec::new();
+        col_ptr.push(0);
+        for c in 0..cols {
+            let mut row_offset = 0usize;
+            for m in mats {
+                for idx in m.col_ptr[c]..m.col_ptr[c + 1] {
+                    row_idx.push(row_offset + m.row_idx[idx]);
+                    values.push(m.values[idx]);
+                }
+                row_offset += m.rows;
+            }
+            col_ptr.push(row_idx.len());
+        }
+        Ok(Self {
+            rows: total_rows,
+            cols,
+            col_ptr,
+            row_idx,
+            values,
+        })
     }
 
     /// Sparse-sparse matrix multiplication (`C = A * B`).
@@ -817,16 +910,49 @@ impl SparseMatrix {
         Ok(x)
     }
 
-    /// Sparse linear solve `S \ B`: uses exact Banded Cholesky (for banded SPD),
-    /// exact Banded LU (for general banded), and falls back to Jacobi-PCG / BiCGSTAB.
+    /// Sparse linear solve `S \ B`: supports complex RHS, rectangular systems, exact Banded Cholesky
+    /// (for banded SPD), exact Banded LU (for general banded), and Jacobi-PCG / BiCGSTAB fallback.
     pub fn solve_dense(&self, rhs: &Matrix) -> Result<Matrix> {
-        if self.rows != self.cols || self.rows != rhs.rows() {
+        if self.rows != rhs.rows() {
             return Err(MatroError::dimension(format!(
                 "Sparse solve dimension mismatch: {}x{} \\ {}x{}",
                 self.rows,
                 self.cols,
                 rhs.rows(),
                 rhs.cols()
+            )));
+        }
+        if rhs.is_complex() {
+            let re_mat = Matrix::from_col_major(rhs.rows(), rhs.cols(), rhs.data().to_vec())?;
+            let im_data = rhs
+                .imag_data()
+                .map(|s| s.to_vec())
+                .unwrap_or_else(|| vec![0.0; rhs.len()]);
+            let im_mat = Matrix::from_col_major(rhs.rows(), rhs.cols(), im_data)?;
+            let x_re = self.solve_dense(&re_mat)?;
+            let x_im = self.solve_dense(&im_mat)?;
+            return Matrix::from_complex_col_major(
+                x_re.rows(),
+                x_re.cols(),
+                x_re.data().to_vec(),
+                x_im.data().to_vec(),
+            )
+            .map(Matrix::normalize);
+        }
+        if self.rows != self.cols {
+            // Rectangular sparse system: dense QR/SVD solve for moderate sizes, normal equations otherwise
+            if self.rows.saturating_mul(self.cols) <= 250_000 {
+                return self.to_dense().solve(rhs);
+            }
+            if self.rows > self.cols {
+                let at = self.transpose();
+                let ata = at.matmul_sparse(self)?;
+                let atb = at.matmul_dense(rhs)?;
+                return ata.solve_dense(&atb);
+            }
+            return Err(MatroError::dimension(format!(
+                "Underdetermined large sparse solve ({}x{}) exceeds dense fallback limit",
+                self.rows, self.cols
             )));
         }
         let n = self.rows;

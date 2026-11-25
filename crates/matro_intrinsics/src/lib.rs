@@ -19,7 +19,9 @@ mod regex;
 mod signal;
 mod signal_ext;
 mod sparse_eig;
+pub mod special_math;
 mod stats;
+mod stats_ext;
 pub mod stats_ml;
 pub mod tables;
 
@@ -44,8 +46,10 @@ pub fn call_intrinsic(
         "pi" => ok1(Value::scalar(std::f64::consts::PI)),
         "e" => ok1(Value::scalar(std::f64::consts::E)),
         "i" | "j" => ok1(Value::complex(0.0, 1.0)),
-        "inf" | "Inf" => ok1(Value::scalar(f64::INFINITY)),
-        "nan" | "NaN" => ok1(Value::scalar(f64::NAN)),
+        "inf" | "Inf" => fn_const_array("Inf", args, f64::INFINITY, NumericClass::Double),
+        "nan" | "NaN" => fn_const_array("NaN", args, f64::NAN, NumericClass::Double),
+        "true" => fn_const_array("true", args, 1.0, NumericClass::Logical),
+        "false" => fn_const_array("false", args, 0.0, NumericClass::Logical),
         "eps" => fn_eps(args),
         "realmax" => ok1(Value::scalar(f64::MAX)),
         "realmin" => ok1(Value::scalar(f64::MIN_POSITIVE)),
@@ -126,14 +130,17 @@ pub fn call_intrinsic(
         "rng" => fn_rng(args, nargout, ctx.rng),
         "linspace" => fn_linspace(args),
         "logspace" => fn_logspace(args),
-        "meshgrid" => fn_meshgrid(args),
-        "ndgrid" => fn_ndgrid(args),
+        "meshgrid" => fn_meshgrid(args, nargout),
+        "ndgrid" => fn_ndgrid(args, nargout),
         "diag" => fn_diag(args),
         "magic" => fn_magic(args),
         "cell" => fn_cell(args),
         "struct" => fn_struct(args),
         "sparse" => fn_sparse(args),
         "speye" => fn_speye(args),
+        "sprand" => fn_sprand(args, ctx.rng, false, false),
+        "sprandn" => fn_sprand(args, ctx.rng, true, false),
+        "sprandsym" => fn_sprand(args, ctx.rng, true, true),
         "full" => fn_full(args),
         "issparse" => fn_issparse(args),
         "nnz" => fn_nnz(args),
@@ -156,8 +163,8 @@ pub fn call_intrinsic(
         "strfind" => extras::fn_strfind(args),
         "strrep" => extras::fn_strrep(args),
         "contains" => extras::fn_str_pred(name, args),
-        "regexp" => regex::fn_regexp(args, false),
-        "regexpi" => regex::fn_regexp(args, true),
+        "regexp" => regex::fn_regexp(args, nargout, false),
+        "regexpi" => regex::fn_regexp(args, nargout, true),
         "regexprep" => regex::fn_regexprep(args),
         "jsonencode" => extras::fn_jsonencode(args),
         "jsondecode" => extras::fn_jsondecode(args),
@@ -189,40 +196,48 @@ pub fn call_intrinsic(
         "det" => fn_unary_mat(name, args, |m| Ok(Matrix::complex_scalar(m.det_c()?).normalize())),
         "inv" => fn_unary_mat(name, args, |m| m.inv()),
         "expm" => fn_unary_mat(name, args, |m| m.expm()),
+        "logm" => fn_unary_mat(name, args, |m| m.logm()),
+        "sqrtm" => fn_unary_mat(name, args, |m| m.sqrtm()),
         "lu" => fn_lu(args, nargout),
         "qr" => fn_qr(args, nargout),
         "svd" => fn_svd(args, nargout),
         "eig" => fn_eig(args, nargout),
         "eigs" => sparse_eig::fn_eigs(args, nargout, ctx.rng),
         "svds" => sparse_eig::fn_svds(args, nargout, ctx.rng),
-        "chol" => fn_unary_mat(name, args, |m| m.chol()),
+        "chol" => fn_chol(args, nargout),
         "rank" => fn_rank(args),
         "cond" => fn_cond(args),
         "trace" => fn_trace(args),
         "dot" => fn_dot(args),
         "norm" => fn_norm(args),
-        "fft" => fn_unary_mat(name, args, |m| Ok(m.fft())),
-        "ifft" => fn_unary_mat(name, args, |m| Ok(m.ifft())),
-        "fft2" => fn_unary_mat(name, args, |m| Ok(m.fft2())),
-        "ifft2" => fn_unary_mat(name, args, |m| Ok(m.ifft2())),
+        "fft" => fn_fft(args, false),
+        "ifft" => fn_fft(args, true),
+        "fft2" => fn_fft2(args, false),
+        "ifft2" => fn_fft2(args, true),
+        "fftn" => fn_fftn(args, false),
+        "ifftn" => fn_fftn(args, true),
         "roots" => extras::fn_roots(args),
         "poly" => extras::fn_poly(args),
-        "polyfit" => fn_polyfit(args),
-        "polyval" => fn_polyval(args),
+        "polyfit" => fn_polyfit(args, nargout),
+        "polyval" => fn_polyval(args, nargout),
         "conv" => fn_conv(args),
         "conv2" => extras::fn_conv2(args),
-        "filter" => extras::fn_filter(args),
+        "filter" => extras::fn_filter(args, nargout),
         "interp1" => interp::fn_interp1(args),
         "interp2" => extras::fn_interp2(args),
+        "interp3" => interp::fn_interp3(args),
+        "interpn" => interp::fn_interpn(args),
         "pchip" => interp::fn_pchip(args),
         "spline" => interp::fn_spline(args),
+        "makima" => interp::fn_makima(args),
         "mkpp" => interp::fn_mkpp(args),
         "ppval" => interp::fn_ppval(args),
+        "unmkpp" => interp::fn_unmkpp(args, nargout),
         "griddedInterpolant" => interp::fn_gridded_interpolant(args),
         "sort" => fn_sort(args, nargout),
-        "unique" => extras::fn_unique(args),
-        "ismember" => extras::fn_ismember(args),
-        "setdiff" | "intersect" | "union" => extras::fn_set_binary(name, args),
+        "unique" => extras::fn_unique(args, nargout),
+        "ismember" => extras::fn_ismember(args, nargout),
+        "setdiff" | "intersect" | "union" | "setxor" => extras::fn_set_binary(name, args, nargout),
         "cumsum" => fn_cumsum(args),
         "cumprod" => extras::fn_cumprod(args),
         "diff" => fn_diff(args),
@@ -251,46 +266,73 @@ pub fn call_intrinsic(
         "sin" => fn_unary_mat(name, args, |m| Ok(m.map_c(Complex::sin).normalize())),
         "cos" => fn_unary_mat(name, args, |m| Ok(m.map_c(Complex::cos).normalize())),
         "tan" => fn_unary_mat(name, args, |m| Ok(m.map_c(Complex::tan).normalize())),
-        "asin" => fn_elem1(name, args, f64::asin),
-        "acos" => fn_elem1(name, args, f64::acos),
-        "atan" => fn_elem1(name, args, f64::atan),
+        "asin" => fn_unary_mat(name, args, |m| Ok(m.map_c(Complex::asin).normalize())),
+        "acos" => fn_unary_mat(name, args, |m| Ok(m.map_c(Complex::acos).normalize())),
+        "atan" => fn_unary_mat(name, args, |m| Ok(m.map_c(Complex::atan).normalize())),
         "atan2" => fn_elem2(name, args, f64::atan2),
-        "log10" => fn_elem1(name, args, f64::log10),
-        "log2" => fn_elem1(name, args, f64::log2),
-        "floor" => fn_elem1(name, args, f64::floor),
-        "ceil" => fn_elem1(name, args, f64::ceil),
-        "round" => fn_elem1(name, args, f64::round),
-        "sign" => fn_elem1(name, args, |x| {
-            if x > 0.0 {
-                1.0
-            } else if x < 0.0 {
-                -1.0
+        "log10" => fn_unary_mat(name, args, |m| Ok(m.map_c(Complex::log10).normalize())),
+        "log2" => fn_log2(args, nargout),
+        "floor" => fn_unary_mat(name, args, |m| {
+            Ok(m.map_c(|c| Complex::new(c.re.floor(), c.im.floor())).normalize())
+        }),
+        "ceil" => fn_unary_mat(name, args, |m| {
+            Ok(m.map_c(|c| Complex::new(c.re.ceil(), c.im.ceil())).normalize())
+        }),
+        "round" => fn_round(args),
+        "sign" => fn_unary_mat(name, args, |m| Ok(m.map_c(Complex::sign).normalize())),
+        "mod" => fn_elem2(name, args, |a, b| {
+            if b == 0.0 {
+                a
+            } else if b.is_infinite() {
+                if a.is_finite() && (a == 0.0 || a.signum() == b.signum()) {
+                    a
+                } else {
+                    f64::NAN
+                }
             } else {
-                0.0
+                let r = a - (a / b).floor() * b;
+                if r == b { 0.0 } else { r }
             }
         }),
-        "mod" => fn_elem2(name, args, |a, b| ((a % b) + b) % b),
         "rem" => fn_elem2(name, args, |a, b| a % b),
 
         // Output
         "disp" => fn_disp(args, ctx.stdout),
-        "fprintf" | "printf" => fn_fprintf(args, ctx.stdout),
+        "fprintf" | "printf" => fn_fprintf(args, nargout, ctx.stdout),
 
         // Statistics toolbox
-        "std" => stats::fn_std_var("std", args, true),
-        "var" => stats::fn_std_var("var", args, false),
+        "std" => stats::fn_std_var("std", args, nargout, true),
+        "var" => stats::fn_std_var("var", args, nargout, false),
         "median" => stats::fn_median(args),
         "prctile" => stats::fn_quantile("prctile", args, true),
         "quantile" => stats::fn_quantile("quantile", args, false),
-        "cov" => stats::fn_cov_or_corr("cov", args, false),
-        "corrcoef" => stats::fn_cov_or_corr("corrcoef", args, true),
+        "cov" => stats::fn_cov_or_corr("cov", args, nargout, false),
+        "corrcoef" => stats::fn_cov_or_corr("corrcoef", args, nargout, true),
+        "corr" => stats_ext::fn_corr(args, nargout),
+        "geomean" | "harmmean" | "trimmean" | "nansum" | "nanmean" | "nanmedian" | "nanstd"
+        | "nanvar" => stats_ext::fn_extra_means(name, args),
+        "mode" => stats_ext::fn_mode(args, nargout),
         "erf" => stats::fn_erf(args),
         "erfc" => stats::fn_erfc(args),
         "normpdf" => stats::fn_normpdf(args),
         "normcdf" => stats::fn_normcdf(args),
         "norminv" => stats::fn_norminv(args),
+        "mvnpdf" => stats_ext::fn_mvnpdf(args),
+        "mvnrnd" => stats_ext::fn_mvnrnd(args, ctx.rng),
+        "lognpdf" | "logncdf" | "logninv" => stats_ext::fn_logn_dist(name, args),
+        "gampdf" | "gamcdf" | "gaminv" => stats_ext::fn_gam_dist(name, args),
+        "betapdf" | "betacdf" | "betainv" => stats_ext::fn_beta_dist(name, args),
+        "unifpdf" | "unifcdf" | "unifinv" => stats_ext::fn_unif_dist(name, args),
+        "normrnd" | "lognrnd" | "unifrnd" | "exprnd" | "gamrnd" | "betarnd" | "poissrnd"
+        | "binornd" | "chi2rnd" | "trnd" | "frnd" => stats_ext::fn_dist_rnd(name, args, ctx.rng),
+        "randsample" => stats_ext::fn_randsample(args, ctx.rng),
+        "datasample" => stats_ext::fn_datasample(args, nargout, ctx.rng),
         "ttest" => stats::fn_ttest(args, nargout),
         "ttest2" => stats_ml::fn_ttest2(args, nargout),
+        "kstest" => stats_ext::fn_kstest(args, nargout),
+        "kstest2" => stats_ext::fn_kstest2(args, nargout),
+        "ranksum" => stats_ext::fn_ranksum(args, nargout),
+        "signrank" => stats_ext::fn_signrank(args, nargout),
         "kmeans" => stats::fn_kmeans(args, nargout, ctx.rng),
         "pca" => stats::fn_pca(args, nargout),
         "gamma" => stats_ml::fn_gamma_fn(args, false),
@@ -299,10 +341,10 @@ pub fn call_intrinsic(
         "betainc" => stats_ml::fn_betainc(args),
         "tpdf" | "tcdf" | "tinv" => stats_ml::fn_t_dist(name, args),
         "chi2pdf" | "chi2cdf" | "chi2inv" => stats_ml::fn_chi2_dist(name, args),
-        "fpdf" | "fcdf" => stats_ml::fn_f_dist(name, args),
+        "fpdf" | "fcdf" | "finv" => stats_ml::fn_f_dist(name, args),
         "exppdf" | "expcdf" | "expinv" => stats_ml::fn_exp_dist(name, args),
-        "binopdf" | "binocdf" => stats_ml::fn_bino_dist(name, args),
-        "poisspdf" | "poisscdf" => stats_ml::fn_poiss_dist(name, args),
+        "binopdf" | "binocdf" | "binoinv" => stats_ml::fn_bino_dist(name, args),
+        "poisspdf" | "poisscdf" | "poissinv" => stats_ml::fn_poiss_dist(name, args),
         "zscore" => stats_ml::fn_zscore(args, nargout),
         "skewness" | "kurtosis" | "iqr" | "mad" => stats_ml::fn_moment_stat(name, args),
         "fitlm" => stats_ml::fn_fitlm(args),
@@ -313,6 +355,8 @@ pub fn call_intrinsic(
         "fitcnb" => stats_ml::fn_fitcnb(args),
         "predict" => stats_ml::fn_predict(args),
         "pdist" => stats_ml::fn_pdist(args),
+        "pdist2" => stats_ext::fn_pdist2(args),
+        "knnsearch" => stats_ext::fn_knnsearch(args, nargout),
         "squareform" => stats_ml::fn_squareform(args),
         "linkage" => stats_ml::fn_linkage(args),
         "cluster" => stats_ml::fn_cluster(args),
@@ -321,16 +365,22 @@ pub fn call_intrinsic(
         "fftshift" => signal::fn_fftshift(args, false),
         "ifftshift" => signal::fn_fftshift(args, true),
         "hann" | "hamming" | "blackman" => signal::fn_window(name, args),
-        "xcorr" => signal::fn_xcorr(args, nargout),
+        "xcorr" => signal::fn_xcorr_or_xcov(args, nargout, false),
+        "xcov" => signal::fn_xcorr_or_xcov(args, nargout, true),
         "findpeaks" => signal::fn_findpeaks(args, nargout),
-        "butter" => signal::fn_butter(args),
-        "cheby1" => signal_ext::fn_cheby1(args),
-        "cheby2" => signal_ext::fn_cheby2(args),
+        "butter" => signal::fn_butter(args, nargout),
+        "cheby1" => signal_ext::fn_cheby1(args, nargout),
+        "cheby2" => signal_ext::fn_cheby2(args, nargout),
+        "zp2sos" => signal_ext::fn_zp2sos(args, nargout),
+        "sos2tf" => signal_ext::fn_sos2tf(args),
+        "tf2sos" => signal_ext::fn_tf2sos(args, nargout),
+        "sosfilt" => signal_ext::fn_sosfilt(args),
         "fir1" => signal_ext::fn_fir1(args),
         "freqz" => signal_ext::fn_freqz(args, nargout, ctx.figure),
         "grpdelay" => signal_ext::fn_grpdelay(args, nargout),
         "filtfilt" => signal::fn_filtfilt(args),
         "pwelch" => signal::fn_pwelch(args, nargout),
+        "periodogram" => signal::fn_periodogram(args, nargout),
         "spectrogram" | "stft" => signal_ext::fn_spectrogram(args, nargout, ctx.figure),
         "hilbert" => signal_ext::fn_hilbert(args),
         "envelope" => signal_ext::fn_envelope(args, nargout),
@@ -339,8 +389,10 @@ pub fn call_intrinsic(
         "detrend" => signal_ext::fn_detrend(args),
         "downsample" => signal_ext::fn_downsample(args),
         "upsample" => signal_ext::fn_upsample(args),
+        "decimate" => signal_ext::fn_decimate(args),
         "resample" => signal_ext::fn_resample(args),
-        "bartlett" | "kaiser" | "flattopwin" => signal_ext::fn_extra_window(name, args),
+        "bartlett" | "kaiser" | "flattopwin" | "tukeywin" | "gausswin" | "rectwin" | "triang"
+        | "blackmanharris" => signal_ext::fn_extra_window(name, args),
 
         // Optimization & Control toolbox
         "linprog" => opt_ctrl::fn_linprog(args, nargout),
@@ -356,6 +408,9 @@ pub fn call_intrinsic(
         "step" => control_ext::fn_step_unified(args, nargout, ctx.figure),
         "impulse" => control_ext::fn_impulse(args, nargout, ctx.figure),
         "lsim" => control_ext::fn_lsim(args, nargout, ctx.figure),
+        "initial" => control_ext::fn_initial(args, nargout, ctx.figure),
+        "stepinfo" => control_ext::fn_stepinfo(args),
+        "rlocus" => control_ext::fn_rlocus(args, nargout, ctx.figure),
         "bode" => control_ext::fn_bode_unified(args, nargout, ctx.figure),
         "nyquist" => control_ext::fn_nyquist(args, nargout, ctx.figure),
         "pzmap" => control_ext::fn_pzmap(args, ctx.figure),
@@ -367,9 +422,16 @@ pub fn call_intrinsic(
         "obsv" => control_ext::fn_obsv(args),
         "place" | "acker" => control_ext::fn_place(args),
         "lyap" => control_ext::fn_lyap(args),
-        "care" => control_ext::fn_care(args),
+        "dlyap" => control_ext::fn_dlyap(args),
+        "care" => control_ext::fn_care(args, nargout),
+        "dare" => control_ext::fn_dare(args, nargout),
         "lqr" => control_ext::fn_lqr(args, nargout),
+        "dlqr" => control_ext::fn_dlqr(args, nargout),
         "lqe" => control_ext::fn_lqe(args, nargout),
+        "c2d" => control_ext::fn_c2d(args),
+        "d2c" => control_ext::fn_d2c(args),
+        "ssdata" => control_ext::fn_ssdata(args, nargout),
+        "tfdata" => control_ext::fn_tfdata(args, nargout),
 
         // VFS & module path helpers
         "addpath" => fn_addpath(args, ctx.loader),
@@ -378,6 +440,11 @@ pub fn call_intrinsic(
         "path" => fn_path(args, ctx.loader),
         "csvread" => fn_csvread(args, ctx.loader),
         "csvwrite" => fn_csvwrite(args, ctx.loader),
+        "readmatrix" => fs_media::fn_readmatrix(args, ctx.loader),
+        "writematrix" => fs_media::fn_writematrix(args, ctx.loader),
+        "dlmread" => fs_media::fn_dlmread(args, ctx.loader),
+        "dlmwrite" => fs_media::fn_dlmwrite(args, ctx.loader),
+        "importdata" => fs_media::fn_importdata(args, ctx.loader),
         "fileread" => fn_fileread(args, ctx.loader),
 
         // Tables & dictionaries
@@ -393,8 +460,14 @@ pub fn call_intrinsic(
         "tail" => tables::fn_head_tail(args, true),
         "array2table" => tables::fn_array2table(args),
         "table2array" => tables::fn_table2array(args),
+        "table2struct" => tables::fn_table2struct(args),
+        "struct2table" => tables::fn_struct2table(args),
+        "cell2table" => tables::fn_cell2table(args),
+        "table2cell" => tables::fn_table2cell(args),
         "renamevars" => tables::fn_renamevars(args),
         "removevars" => tables::fn_removevars(args),
+        "addvars" => tables::fn_addvars(args),
+        "movevars" => tables::fn_movevars(args),
         "innerjoin" => tables::fn_table_join(args, tables::JoinKind::Inner),
         "outerjoin" => tables::fn_table_join(args, tables::JoinKind::Outer),
         "groupsummary" => tables::fn_groupsummary(args),
@@ -445,8 +518,8 @@ pub fn call_intrinsic(
                 modern_types::fn_join(args)
             }
         }
-        "startsWith" => modern_types::fn_starts_ends_with("startsWith", args, false),
-        "endsWith" => modern_types::fn_starts_ends_with("endsWith", args, true),
+        "startsWith" => extras::fn_str_pred("startsWith", args),
+        "endsWith" => extras::fn_str_pred("endsWith", args),
         "erase" => modern_types::fn_erase(args),
         "strip" => modern_types::fn_strip(args),
         "replace" => extras::fn_strrep(args),
@@ -496,7 +569,15 @@ pub fn call_intrinsic(
         "repelem" => base_ext::fn_repelem(args),
         "accumarray" => base_ext::fn_accumarray(args),
         "histcounts" => base_ext::fn_histcounts(args, nargout),
-        "discretize" => base_ext::fn_discretize(args),
+        "histc" => base_ext::fn_histc(args, nargout),
+        "discretize" => base_ext::fn_discretize(args, nargout),
+        "beta" => special_math::fn_beta(args, false),
+        "betaln" => special_math::fn_beta(args, true),
+        "erfinv" => special_math::fn_erfinv(args, false),
+        "erfcinv" => special_math::fn_erfinv(args, true),
+        "besselj" | "bessely" | "besseli" | "besselk" => special_math::fn_bessel(name, args),
+        "legendre" => special_math::fn_legendre(args),
+        "ellipke" => special_math::fn_ellipke(args, nargout),
         "ipermute" => base_ext::fn_ipermute(args),
         "horzcat" => base_ext::fn_horzcat(args),
         "vertcat" => base_ext::fn_vertcat(args),
@@ -511,17 +592,18 @@ pub fn call_intrinsic(
         "cross" => base_ext::fn_cross(args),
         "vecnorm" => base_ext::fn_vecnorm(args),
         "rms" => base_ext::fn_rms(args),
-        "normalize" => base_ext::fn_normalize(args),
+        "normalize" => base_ext::fn_normalize(args, nargout),
         "rescale" => base_ext::fn_rescale(args),
         "clip" => base_ext::fn_clip(args),
         "trapz" => base_ext::fn_trapz(args, false),
         "cumtrapz" => base_ext::fn_trapz(args, true),
         "gradient" => base_ext::fn_gradient(args, nargout),
         "deconv" => base_ext::fn_deconv(args, nargout),
-        "polyder" => base_ext::fn_polyder(args),
+        "polyder" => base_ext::fn_polyder(args, nargout),
         "polyint" => base_ext::fn_polyint(args),
         "factorial" => base_ext::fn_factorial(args),
         "nchoosek" => base_ext::fn_nchoosek(args),
+        "perms" => base_ext::fn_perms(args),
         "gcd" => base_ext::fn_gcd_lcm(args, false),
         "lcm" => base_ext::fn_gcd_lcm(args, true),
         "isprime" => base_ext::fn_isprime(args),
@@ -535,6 +617,16 @@ pub fn call_intrinsic(
         "movmean" | "movsum" | "movstd" | "movvar" | "movmedian" | "movmin" | "movmax" => {
             base_ext::fn_mov_window(name, args)
         }
+        "smoothdata" => base_ext::fn_smoothdata(args),
+        "islocalmin" => base_ext::fn_islocal_extrema(args, false),
+        "islocalmax" => base_ext::fn_islocal_extrema(args, true),
+        "mink" => base_ext::fn_mink_maxk(args, nargout, false),
+        "maxk" => base_ext::fn_mink_maxk(args, nargout, true),
+        "topkrows" => base_ext::fn_topkrows(args, nargout),
+        "shiftdim" => base_ext::fn_shiftdim(args, nargout),
+        "pagetranspose" => base_ext::fn_pagetranspose(args, false),
+        "pagectranspose" => base_ext::fn_pagetranspose(args, true),
+        "pagemtimes" => base_ext::fn_pagemtimes(args),
         "cummin" => base_ext::fn_cum_extrema(args, false),
         "cummax" => base_ext::fn_cum_extrema(args, true),
         "bounds" => base_ext::fn_bounds(args, nargout),
@@ -548,8 +640,12 @@ pub fn call_intrinsic(
         }
         "rmfield" => base_ext::fn_rmfield(args),
         "orderfields" => base_ext::fn_orderfields(args),
+        "getfield" => base_ext::fn_getfield(args),
+        "setfield" => base_ext::fn_setfield(args),
         "struct2cell" => base_ext::fn_struct2cell(args),
+        "cell2struct" => base_ext::fn_cell2struct(args),
         "cell2mat" => base_ext::fn_cell2mat(args),
+        "mat2cell" => base_ext::fn_mat2cell(args),
         "num2cell" => base_ext::fn_num2cell(args),
         "deal" => base_ext::fn_deal(args, nargout),
 
@@ -566,6 +662,10 @@ pub fn call_intrinsic(
         "le" => tables::fn_binop_cmp("le", args, |a, b| a <= b),
         "gt" => tables::fn_binop_cmp("gt", args, |a, b| a > b),
         "ge" => tables::fn_binop_cmp("ge", args, |a, b| a >= b),
+        "and" => tables::fn_binop_cmp("and", args, |a, b| a != 0.0 && b != 0.0),
+        "or" => tables::fn_binop_cmp("or", args, |a, b| a != 0.0 || b != 0.0),
+        "xor" => tables::fn_binop_cmp("xor", args, |a, b| (a != 0.0) ^ (b != 0.0)),
+        "not" => fn_pred_mat("not", args, |c| c.is_zero()),
 
         // Plotting & Handle Graphics
         "plot" => fn_plot(PlotKind::Line, args, nargout, ctx.figure, false, false),
@@ -613,6 +713,7 @@ pub fn call_intrinsic(
         "pwd" => fs_media::fn_pwd(ctx.loader),
         "cd" => fs_media::fn_cd(args, ctx.loader),
         "mkdir" => fs_media::fn_mkdir(args, ctx.loader),
+        "rmdir" => fs_media::fn_rmdir(args, ctx.loader),
         "delete" => fs_media::fn_delete(args, ctx.loader),
         "copyfile" => fs_media::fn_copyfile(args, ctx.loader),
         "movefile" => fs_media::fn_movefile(args, ctx.loader),
@@ -621,18 +722,25 @@ pub fn call_intrinsic(
         "audioread" => fs_media::fn_audioread(args, nargout, ctx.loader),
         "audiowrite" => fs_media::fn_audiowrite(args, ctx.loader),
 
-        // Image Processing Toolbox basics
+        // Image Processing Toolbox
         "rgb2gray" => image_proc::fn_rgb2gray(args),
         "im2double" => image_proc::fn_im2double(args),
         "im2uint8" => image_proc::fn_im2uint8(args),
+        "mat2gray" => image_proc::fn_mat2gray(args),
+        "imcomplement" => image_proc::fn_imcomplement(args),
         "imresize" => image_proc::fn_imresize(args),
         "imfilter" => image_proc::fn_imfilter(args),
         "imgaussfilt" => image_proc::fn_imgaussfilt(args),
+        "medfilt2" => image_proc::fn_medfilt2(args),
+        "fspecial" => image_proc::fn_fspecial(args),
         "edge" => image_proc::fn_edge(args),
         "graythresh" => image_proc::fn_graythresh(args),
         "imbinarize" => image_proc::fn_imbinarize(args),
         "imhist" => image_proc::fn_imhist(args, nargout),
         "imadjust" => image_proc::fn_imadjust(args),
+        "bwlabel" => image_proc::fn_bwlabel(args, nargout),
+        "regionprops" => image_proc::fn_regionprops(args),
+        "imerode" | "imdilate" | "imopen" | "imclose" => image_proc::fn_morph(name, args),
 
         _ => return None,
     };
@@ -676,11 +784,119 @@ fn fn_assert(args: &[Value]) -> Result<Vec<Value>> {
     Ok(vec![])
 }
 
+/// Returns true if `name` is a registered Matro intrinsic function.
+pub fn is_intrinsic(name: &str) -> bool {
+    matches!(
+        name,
+        "pi" | "eps" | "inf" | "Inf" | "nan" | "NaN" | "realmax" | "realmin" | "intmax" | "intmin"
+            | "true" | "false" | "disp" | "clc" | "format" | "tic" | "toc" | "error" | "assert"
+            | "warning" | "isreal" | "isempty" | "isnan" | "isinf" | "isfinite" | "issparse"
+            | "isscalar" | "isvector" | "isrow" | "iscolumn" | "ismatrix" | "isnumeric"
+            | "islogical" | "ischar" | "isstring" | "iscell" | "iscellstr" | "isstruct"
+            | "isfloat" | "isinteger" | "istable" | "istimetable" | "iscategorical"
+            | "isdatetime" | "isduration" | "isobject" | "ishandle" | "isa" | "class"
+            | "find" | "any" | "all" | "complex" | "real" | "imag" | "conj" | "angle"
+            | "zeros" | "ones" | "eye" | "rand" | "randn" | "randi" | "randperm" | "rng"
+            | "linspace" | "logspace" | "meshgrid" | "ndgrid" | "diag" | "blkdiag" | "kron"
+            | "magic" | "pascal" | "hilb" | "invhilb" | "vander" | "toeplitz" | "hankel"
+            | "compan" | "gallery" | "cat" | "horzcat" | "vertcat" | "reshape" | "repmat"
+            | "repelem" | "permute" | "ipermute" | "squeeze" | "shiftdim" | "flip" | "fliplr"
+            | "flipud" | "rot90" | "circshift" | "tril" | "triu" | "size" | "length" | "numel"
+            | "ndims" | "sub2ind" | "ind2sub" | "sparse" | "speye" | "spdiags" | "spones"
+            | "sprand" | "sprandn" | "sprandsym" | "full" | "nnz" | "nonzeros" | "nzmax"
+            | "spalloc" | "spfun" | "spy" | "sum" | "prod" | "mean" | "median" | "std" | "var"
+            | "min" | "max" | "cumsum" | "cumprod" | "cummin" | "cummax" | "diff" | "sort"
+            | "sortrows" | "issorted" | "unique" | "ismember" | "intersect" | "union"
+            | "setdiff" | "setxor" | "abs" | "sqrt" | "exp" | "expm1" | "log" | "log1p"
+            | "log2" | "log10" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2"
+            | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "sind" | "cosd" | "tand"
+            | "asind" | "acosd" | "atand" | "atan2d" | "sec" | "csc" | "cot" | "secd" | "cscd"
+            | "cotd" | "asec" | "acsc" | "acot" | "sech" | "csch" | "coth" | "asech" | "acsch"
+            | "acoth" | "floor" | "ceil" | "round" | "fix" | "sign" | "mod" | "rem" | "hypot"
+            | "nthroot" | "pow2" | "nextpow2" | "sinc" | "deg2rad" | "rad2deg" | "wrapToPi"
+            | "wrapTo2Pi" | "wrapTo180" | "wrapTo360" | "unwrap" | "inv" | "det" | "lu" | "qr"
+            | "svd" | "eig" | "eigs" | "svds" | "chol" | "pinv" | "rank" | "cond" | "rcond"
+            | "null" | "orth" | "rref" | "trace" | "dot" | "cross" | "norm" | "vecnorm"
+            | "expm" | "logm" | "sqrtm" | "schur" | "hess" | "balance" | "issymmetric"
+            | "ishermitian" | "bandwidth" | "fft" | "ifft" | "fft2" | "ifft2" | "fftn" | "ifftn"
+            | "fftshift" | "ifftshift" | "conv" | "conv2" | "deconv" | "filter" | "filtfilt"
+            | "xcorr" | "xcov" | "pwelch" | "periodogram" | "spectrogram" | "stft" | "hilbert"
+            | "envelope" | "detrend" | "findpeaks" | "butter" | "cheby1" | "cheby2" | "fir1"
+            | "freqz" | "grpdelay" | "decimate" | "resample" | "downsample" | "upsample"
+            | "medfilt1" | "sgolayfilt" | "hann" | "hamming" | "blackman" | "kaiser"
+            | "bartlett" | "flattopwin" | "tukeywin" | "gausswin" | "rectwin" | "triang"
+            | "blackmanharris" | "zp2sos" | "sos2tf" | "tf2sos" | "sosfilt" | "polyfit"
+            | "polyval" | "polyder" | "polyint" | "roots" | "poly" | "interp1" | "interp2"
+            | "interp3" | "interpn" | "pchip" | "spline" | "makima" | "mkpp" | "ppval"
+            | "unmkpp" | "griddedInterpolant" | "trapz" | "cumtrapz" | "gradient" | "del2"
+            | "histcounts" | "histc" | "discretize" | "accumarray" | "movmean" | "movsum"
+            | "movstd" | "movvar" | "movmedian" | "movmin" | "movmax" | "smoothdata"
+            | "normalize" | "rescale" | "clip" | "bounds" | "rms" | "mink" | "maxk"
+            | "topkrows" | "pagemtimes" | "pagetranspose" | "islocalmin" | "islocalmax"
+            | "cov" | "corrcoef" | "corr" | "prctile" | "quantile" | "iqr" | "mad" | "zscore"
+            | "skewness" | "kurtosis" | "geomean" | "harmmean" | "trimmean" | "mode"
+            | "nansum" | "nanmean" | "nanstd" | "nanvar" | "nanmedian" | "normpdf" | "normcdf"
+            | "norminv" | "normrnd" | "mvnpdf" | "mvnrnd" | "lognpdf" | "logncdf" | "logninv"
+            | "lognrnd" | "gampdf" | "gamcdf" | "gaminv" | "gamrnd" | "betapdf" | "betacdf"
+            | "betainv" | "betarnd" | "unifpdf" | "unifcdf" | "unifinv" | "unifrnd"
+            | "exppdf" | "expcdf" | "expinv" | "exprnd" | "tpdf" | "tcdf" | "tinv" | "trnd"
+            | "chi2pdf" | "chi2cdf" | "chi2inv" | "chi2rnd" | "fpdf" | "fcdf" | "finv" | "frnd"
+            | "poisspdf" | "poisscdf" | "poissinv" | "poissrnd" | "binopdf" | "binocdf"
+            | "binoinv" | "binornd" | "gamma" | "gammaln" | "gammainc" | "beta" | "betaln"
+            | "betainc" | "erf" | "erfc" | "erfinv" | "erfcinv" | "besselj" | "bessely"
+            | "besseli" | "besselk" | "legendre" | "ellipke" | "factorial" | "nchoosek"
+            | "perms" | "gcd" | "lcm" | "primes" | "isprime" | "factor" | "pca" | "kmeans"
+            | "fitlm" | "regress" | "anova1" | "ttest" | "ttest2" | "kstest" | "kstest2"
+            | "ranksum" | "signrank" | "pdist" | "pdist2" | "squareform" | "linkage"
+            | "cluster" | "knnsearch" | "randsample" | "datasample" | "sprintf" | "fprintf"
+            | "num2str" | "str2double" | "str2num" | "mat2str" | "strcmp" | "strcmpi"
+            | "strncmp" | "strncmpi" | "strfind" | "strrep" | "replace" | "contains"
+            | "startsWith" | "endsWith" | "strsplit" | "strjoin" | "strcat" | "strtrim"
+            | "deblank" | "strip" | "erase" | "upper" | "lower" | "regexp" | "regexpi"
+            | "regexprep" | "split" | "join" | "string" | "char" | "double" | "single"
+            | "logical" | "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32"
+            | "uint64" | "cast" | "cell" | "struct" | "fieldnames" | "isfield" | "rmfield"
+            | "orderfields" | "getfield" | "setfield" | "deal" | "cell2mat" | "mat2cell"
+            | "num2cell" | "struct2cell" | "cell2struct" | "table" | "timetable" | "datetime"
+            | "addvars" | "movevars" | "removevars" | "renamevars" | "array2table" | "table2array"
+            | "table2struct" | "struct2table" | "cell2table" | "table2cell" | "innerjoin"
+            | "outerjoin" | "groupsummary" | "head" | "tail" | "height" | "width"
+            | "summary" | "duration" | "categorical" | "readtable" | "writetable"
+            | "readmatrix"
+            | "writematrix" | "csvread" | "csvwrite" | "dlmread" | "dlmwrite" | "importdata"
+            | "jsonencode" | "jsondecode" | "linprog" | "quadprog" | "lsqlin" | "lsqnonneg"
+            | "optimset" | "optimoptions" | "tf" | "ss" | "bode" | "nyquist" | "margin"
+            | "step" | "impulse" | "lsim" | "initial" | "stepinfo" | "rlocus" | "pzmap"
+            | "lqr" | "dlqr" | "lqe" | "care" | "dare" | "lyap" | "dlyap" | "place" | "acker"
+            | "ctrb" | "obsv" | "c2d" | "d2c" | "ssdata" | "tfdata" | "ss2tf" | "tf2ss"
+            | "imfilter" | "medfilt2" | "imgaussfilt" | "imresize" | "rgb2gray" | "edge"
+            | "bwlabel" | "regionprops" | "fspecial" | "imerode" | "imdilate" | "imopen"
+            | "imclose" | "mat2gray" | "imcomplement" | "imbinarize" | "imadjust" | "graythresh"
+            | "imhist" | "im2double" | "im2uint8" | "imread" | "imwrite" | "audioread"
+            | "audiowrite" | "plot" | "plot3" | "scatter" | "bar" | "hist" | "histogram"
+            | "contour" | "surf" | "mesh" | "quiver" | "imagesc" | "figure" | "subplot"
+            | "hold" | "grid" | "title" | "xlabel" | "ylabel" | "zlabel" | "legend" | "xlim"
+            | "ylim" | "zlim" | "colorbar" | "colormap" | "axis" | "clf" | "gca" | "gcf"
+            | "get" | "set" | "dir" | "pwd" | "cd" | "mkdir" | "rmdir" | "delete" | "copyfile"
+            | "movefile" | "isfile" | "isfolder" | "fullfile" | "fileparts" | "plus" | "minus"
+            | "times" | "rdivide" | "ldivide" | "power" | "mtimes" | "mrdivide" | "mldivide"
+            | "mpower" | "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "and" | "or" | "xor" | "not"
+            | "bitand" | "bitor" | "bitxor" | "bitshift" | "bitget" | "bitset" | "bitcmp"
+            | "dec2bin" | "bin2dec" | "dec2hex" | "hex2dec" | "cart2pol" | "pol2cart"
+            | "cart2sph" | "sph2cart"
+    )
+}
+
 fn fn_isreal(args: &[Value]) -> Result<Vec<Value>> {
     if args.len() != 1 {
         return Err(MatroError::arity("isreal", "1", args.len()));
     }
-    ok1(Value::bool(!args[0].as_matrix()?.is_complex()))
+    let real = match &args[0] {
+        Value::Matrix(m) => !m.is_complex(),
+        Value::Sparse(_) => true,
+        _ => true,
+    };
+    ok1(Value::bool(real))
 }
 
 fn fn_isempty(args: &[Value]) -> Result<Vec<Value>> {
@@ -692,7 +908,7 @@ fn fn_isempty(args: &[Value]) -> Result<Vec<Value>> {
         Value::Sparse(s) => s.rows() == 0 || s.cols() == 0,
         Value::String(s) => s.is_empty(),
         Value::Cell(c) => c.data.is_empty(),
-        Value::Struct(m) => m.is_empty(),
+        Value::Struct(_) => false,
         Value::StructArray(sa) => sa.items.is_empty(),
         Value::Table(t) => t.nrows == 0 || t.columns.is_empty(),
         Value::Map(m) => m.entries.is_empty(),
@@ -705,7 +921,7 @@ fn fn_pred_mat(name: &str, args: &[Value], pred: impl Fn(Complex) -> bool) -> Re
     if args.len() != 1 {
         return Err(MatroError::arity(name, "1", args.len()));
     }
-    let m = args[0].as_matrix()?;
+    let m = args[0].to_dense_matrix()?;
     let out = m
         .map_c_to_real(|c| if pred(c) { 1.0 } else { 0.0 })
         .with_logical(true);
@@ -747,7 +963,15 @@ fn fn_find(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
         None
     };
     let take_last = if args.len() == 3 {
-        value_as_text(&args[2]).is_some_and(|s| s.eq_ignore_ascii_case("last"))
+        let s = value_as_text(&args[2])
+            .ok_or_else(|| MatroError::runtime("find: direction must be 'first' or 'last'"))?;
+        if s.eq_ignore_ascii_case("last") {
+            true
+        } else if s.eq_ignore_ascii_case("first") {
+            false
+        } else {
+            return Err(MatroError::runtime(format!("find: unknown direction '{s}'")));
+        }
     } else {
         false
     };
@@ -763,17 +987,20 @@ fn fn_find(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
                 (s.rows(), s.rows() == 1 && s.cols() > 1, trips)
             }
             other => {
-                let m = other.as_matrix()?;
+                let m = other.to_dense_matrix()?;
+                let nrows = m.rows();
                 let mut e = Vec::new();
-                for c in 0..m.cols() {
-                    for r in 0..m.rows() {
-                        let v = m.get_c(r, c);
+                if nrows > 0 {
+                    for lin in 0..m.len() {
+                        let v = m.get_linear_c(lin);
                         if !v.is_zero() {
+                            let r = lin % nrows;
+                            let c = lin / nrows;
                             e.push((r, c, v));
                         }
                     }
                 }
-                (m.rows(), m.rows() == 1 && m.cols() > 1, e)
+                (nrows, m.ndims() == 2 && m.rows() == 1 && m.cols() > 1, e)
             }
         };
 
@@ -791,13 +1018,25 @@ fn fn_find(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
     if nargout >= 2 {
         let rows: Vec<f64> = entries.iter().map(|&(r, _, _)| (r + 1) as f64).collect();
         let cols: Vec<f64> = entries.iter().map(|&(_, c, _)| (c + 1) as f64).collect();
-        let mut out = vec![
-            Value::matrix(Matrix::col_vec(rows)),
-            Value::matrix(Matrix::col_vec(cols)),
-        ];
+        let r_mat = if is_row_vec {
+            Matrix::row_vec(rows)
+        } else {
+            Matrix::col_vec(rows)
+        };
+        let c_mat = if is_row_vec {
+            Matrix::row_vec(cols)
+        } else {
+            Matrix::col_vec(cols)
+        };
+        let mut out = vec![Value::matrix(r_mat), Value::matrix(c_mat)];
         if nargout >= 3 {
             let vals: Vec<Complex> = entries.iter().map(|&(_, _, v)| v).collect();
-            out.push(Value::matrix(Matrix::complex_col_vec(vals).normalize()));
+            let v_mat = if is_row_vec {
+                Matrix::complex_row_vec(vals)
+            } else {
+                Matrix::complex_col_vec(vals)
+            };
+            out.push(Value::matrix(v_mat.normalize()));
         }
         return Ok(out);
     }
@@ -814,54 +1053,87 @@ fn fn_find(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
     ok1(Value::matrix(out))
 }
 
+fn parse_vecdim(val: &Value, ctx: &str) -> Result<Vec<usize>> {
+    let m = val.to_dense_matrix()?;
+    let mut dims = Vec::with_capacity(m.len());
+    for &x in m.data() {
+        let d = x.round() as isize;
+        if !x.is_finite() || (x - d as f64).abs() > 1e-12 || d < 1 {
+            return Err(MatroError::runtime(format!(
+                "{ctx}: dimension must be positive integer, got {x}"
+            )));
+        }
+        let du = d as usize;
+        if !dims.contains(&du) {
+            dims.push(du);
+        }
+    }
+    Ok(dims)
+}
+
 fn fn_any_all(name: &str, args: &[Value], is_all: bool) -> Result<Vec<Value>> {
     if args.is_empty() || args.len() > 2 {
         return Err(MatroError::arity(name, "1 or 2 (A [, dim | 'all'])", args.len()));
     }
     let m = args[0].to_dense_matrix()?;
-    let pred = |c: Complex| !c.is_zero() && !c.re.is_nan() && !c.im.is_nan();
+    // MATLAB ignores NaN in any/all (NaN is neither true nor false; all([1 NaN]) == true, any([0 NaN]) == false)
+    let is_nan_c = |c: Complex| c.re.is_nan() || c.im.is_nan();
+    let is_nonzero = |c: Complex| !c.is_zero() && !is_nan_c(c);
+    let reduce_slice = |slice: &[Complex]| -> bool {
+        if is_all {
+            slice.iter().all(|&c| is_nan_c(c) || !c.is_zero())
+        } else {
+            slice.iter().any(|&c| is_nonzero(c))
+        }
+    };
     let all_mode = args
         .get(1)
         .and_then(value_as_text)
         .is_some_and(|s| s.eq_ignore_ascii_case("all"));
-    if all_mode || (args.len() == 1 && (m.rows() <= 1 || m.cols() <= 1)) {
-        let b = if is_all {
-            (0..m.len()).all(|i| pred(m.get_linear_c(i)))
-        } else {
-            (0..m.len()).any(|i| pred(m.get_linear_c(i)))
-        };
-        return ok1(Value::bool(b));
+    let m_dims = m.dims();
+    let is_vec = m.ndims() == 2 && (m.rows() <= 1 || m.cols() <= 1);
+    if all_mode || (args.len() == 1 && is_vec) {
+        let vals: Vec<Complex> = (0..m.len()).map(|i| m.get_linear_c(i)).collect();
+        return ok1(Value::bool(reduce_slice(&vals)));
     }
-    let dim = if let Some(a) = args.get(1) {
-        as_usize(a, name)?
+    let target_dims = if let Some(a) = args.get(1) {
+        parse_vecdim(a, name)?
     } else {
-        1
+        vec![m_dims.iter().position(|&d| d != 1).map_or(1, |i| i + 1)]
     };
-    if dim == 1 {
-        let mut out = Vec::with_capacity(m.cols());
-        for c in 0..m.cols() {
-            let b = if is_all {
-                (0..m.rows()).all(|r| pred(m.get_c(r, c)))
-            } else {
-                (0..m.rows()).any(|r| pred(m.get_c(r, c)))
-            };
-            out.push(if b { 1.0 } else { 0.0 });
+    let mut cur = m;
+    for dim in target_dims {
+        let cur_dims = cur.dims();
+        let ax = dim - 1;
+        if ax >= cur_dims.len() {
+            let out = cur.map_c_to_real(|c| {
+                let b = if is_all { is_nan_c(c) || !c.is_zero() } else { is_nonzero(c) };
+                if b { 1.0 } else { 0.0 }
+            });
+            cur = out.with_logical(true);
+            continue;
         }
-        ok1(Value::matrix(Matrix::row_vec(out).with_logical(true)))
-    } else if dim == 2 {
-        let mut out = Vec::with_capacity(m.rows());
-        for r in 0..m.rows() {
-            let b = if is_all {
-                (0..m.cols()).all(|c| pred(m.get_c(r, c)))
-            } else {
-                (0..m.cols()).any(|c| pred(m.get_c(r, c)))
-            };
-            out.push(if b { 1.0 } else { 0.0 });
+        let inner: usize = cur_dims[..ax].iter().product();
+        let axis_len = cur_dims[ax];
+        let outer: usize = cur_dims[ax + 1..].iter().product();
+        let mut out_dims = cur_dims.clone();
+        out_dims[ax] = 1;
+        let out_total = inner * outer;
+        let mut out_data = Vec::with_capacity(out_total);
+        let mut buf = Vec::with_capacity(axis_len);
+        for o in 0..outer {
+            let block = o * axis_len * inner;
+            for i in 0..inner {
+                buf.clear();
+                for k in 0..axis_len {
+                    buf.push(cur.get_linear_c(block + k * inner + i));
+                }
+                out_data.push(if reduce_slice(&buf) { 1.0 } else { 0.0 });
+            }
         }
-        ok1(Value::matrix(Matrix::col_vec(out).with_logical(true)))
-    } else {
-        Err(MatroError::runtime(format!("{name}: unsupported dimension {dim}")))
+        cur = Matrix::from_nd_col_major(out_dims, out_data)?.with_logical(true);
     }
+    ok1(Value::matrix(cur.with_logical(true)))
 }
 
 fn fn_complex(args: &[Value]) -> Result<Vec<Value>> {
@@ -880,71 +1152,126 @@ fn fn_complex(args: &[Value]) -> Result<Vec<Value>> {
     }
 }
 
-fn fn_fill(name: &str, args: &[Value], make: fn(usize, usize) -> Matrix) -> Result<Vec<Value>> {
-    if args.len() == 1 {
-        if let Ok(m) = args[0].to_dense_matrix() {
-            if m.len() >= 2 {
-                let dims: Vec<usize> = m
-                    .data()
-                    .iter()
-                    .map(|&x| x.max(0.0).round() as usize)
-                    .collect();
-                if dims.len() == 2 {
-                    return ok1(Value::matrix(make(dims[0], dims[1])));
-                }
-                if name != "eye" {
-                    let mat = if name == "ones" {
-                        Matrix::ones_nd(dims)
-                    } else {
-                        Matrix::zeros_nd(dims)
-                    };
-                    return ok1(Value::matrix(mat));
-                }
+fn parse_class_name(s: &str) -> Option<NumericClass> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "double" => Some(NumericClass::Double),
+        "single" => Some(NumericClass::Single),
+        "logical" => Some(NumericClass::Logical),
+        "int8" => Some(NumericClass::Int8),
+        "int16" => Some(NumericClass::Int16),
+        "int32" => Some(NumericClass::Int32),
+        "int64" => Some(NumericClass::Int64),
+        "uint8" => Some(NumericClass::Uint8),
+        "uint16" => Some(NumericClass::Uint16),
+        "uint32" => Some(NumericClass::Uint32),
+        "uint64" => Some(NumericClass::Uint64),
+        _ => None,
+    }
+}
+
+/// Parses MATLAB array constructor args `(sz1, sz2, ..., [typename | 'like', prototype])`.
+fn parse_dims_and_class(
+    name: &str,
+    args: &[Value],
+    default_class: NumericClass,
+) -> Result<(Vec<usize>, NumericClass, bool)> {
+    let mut class = default_class;
+    let mut make_sparse = false;
+    let mut end = args.len();
+    if end >= 2 && value_as_text(&args[end - 2]).is_some_and(|s| s.eq_ignore_ascii_case("like")) {
+        match &args[end - 1] {
+            Value::Sparse(_) => {
+                make_sparse = true;
+                class = NumericClass::Double;
+            }
+            Value::Matrix(m) => class = m.dtype(),
+            _ => {}
+        }
+        end -= 2;
+    } else if end >= 1 {
+        if let Some(s) = value_as_text(&args[end - 1]) {
+            if let Some(c) = parse_class_name(&s) {
+                class = c;
+                end -= 1;
             }
         }
     }
-    if args.len() > 2 && name != "eye" {
-        let dims: Vec<usize> = args
-            .iter()
-            .map(|a| as_usize(a, name))
-            .collect::<Result<_>>()?;
-        let m = if name == "ones" {
-            Matrix::ones_nd(dims)
-        } else {
-            Matrix::zeros_nd(dims)
-        };
-        return ok1(Value::matrix(m));
-    }
-    let (r, c) = match args.len() {
-        0 => (1, 1),
+    let dim_args = &args[..end];
+    let dims: Vec<usize> = match dim_args.len() {
+        0 => vec![1, 1],
         1 => {
-            let n = as_usize(&args[0], name)?;
-            (n, n)
+            let m = dim_args[0].to_dense_matrix()?;
+            if m.len() >= 2 {
+                m.data().iter().map(|&x| x.max(0.0).round() as usize).collect()
+            } else if m.len() == 1 {
+                let n = m.data()[0].max(0.0).round() as usize;
+                vec![n, n]
+            } else {
+                vec![0, 0]
+            }
         }
-        2 => (as_usize(&args[0], name)?, as_usize(&args[1], name)?),
-        n => return Err(MatroError::arity(name, "0..=2", n)),
+        _ => dim_args
+            .iter()
+            .map(|a| {
+                let s = a.as_scalar()?;
+                if !s.is_finite() {
+                    return Err(MatroError::runtime(format!("{name}: size must be finite")));
+                }
+                Ok(s.max(0.0).round() as usize)
+            })
+            .collect::<Result<_>>()?,
     };
-    ok1(Value::matrix(make(r, c)))
+    Ok((dims, class, make_sparse))
+}
+
+fn finish_constructed_array(m: Matrix, class: NumericClass, make_sparse: bool) -> Result<Vec<Value>> {
+    if make_sparse && m.ndims() == 2 {
+        return ok1(Value::sparse(SparseMatrix::from_dense(&m)));
+    }
+    let out = if class == NumericClass::Logical {
+        m.with_logical(true)
+    } else if class != NumericClass::Double {
+        m.cast_to(class)
+    } else {
+        m
+    };
+    ok1(Value::matrix(out))
+}
+
+fn fn_const_array(
+    name: &str,
+    args: &[Value],
+    fill_val: f64,
+    default_class: NumericClass,
+) -> Result<Vec<Value>> {
+    let (dims, class, make_sparse) = parse_dims_and_class(name, args, default_class)?;
+    let total: usize = dims.iter().product();
+    let m = Matrix::from_nd_col_major(dims, vec![fill_val; total])?;
+    finish_constructed_array(m, class, make_sparse)
+}
+
+fn fn_fill(name: &str, args: &[Value], make: fn(usize, usize) -> Matrix) -> Result<Vec<Value>> {
+    let (dims, class, make_sparse) = parse_dims_and_class(name, args, NumericClass::Double)?;
+    if name == "eye" {
+        if dims.len() > 2 {
+            return Err(MatroError::dimension("eye: only supports 2D dimensions"));
+        }
+        let m = make(dims[0], dims[1]);
+        return finish_constructed_array(m, class, make_sparse);
+    }
+    let m = if dims.len() == 2 {
+        make(dims[0], dims[1])
+    } else if name == "ones" {
+        Matrix::ones_nd(dims)
+    } else {
+        Matrix::zeros_nd(dims)
+    };
+    finish_constructed_array(m, class, make_sparse)
 }
 
 fn fn_rand(args: &[Value], rng: &mut Rng, normal: bool) -> Result<Vec<Value>> {
     let name = if normal { "randn" } else { "rand" };
-    let dims: Vec<usize> = match args.len() {
-        0 => vec![1, 1],
-        1 => {
-            let m = args[0].to_dense_matrix()?;
-            if m.len() >= 2 {
-                m.data().iter().map(|&x| x.max(0.0).round() as usize).collect()
-            } else {
-                let n = as_usize(&args[0], name)?;
-                vec![n, n]
-            }
-        }
-        _ => args
-            .iter()
-            .map(|a| as_usize(a, name))
-            .collect::<Result<_>>()?,
-    };
+    let (dims, class, make_sparse) = parse_dims_and_class(name, args, NumericClass::Double)?;
     let total: usize = dims.iter().product();
     let mut data = Vec::with_capacity(total);
     for _ in 0..total {
@@ -954,7 +1281,8 @@ fn fn_rand(args: &[Value], rng: &mut Rng, normal: bool) -> Result<Vec<Value>> {
             rng.next_f64()
         });
     }
-    ok1(Value::matrix(Matrix::from_nd_col_major(dims, data)?))
+    let m = Matrix::from_nd_col_major(dims, data)?;
+    finish_constructed_array(m, class, make_sparse)
 }
 
 fn rng_state_struct(rng: &Rng) -> Value {
@@ -1080,27 +1408,70 @@ fn fn_rng(args: &[Value], nargout: usize, rng: &mut Rng) -> Result<Vec<Value>> {
     }
 }
 
-fn fn_meshgrid(args: &[Value]) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 2 {
-        return Err(MatroError::arity("meshgrid", "1 or 2", args.len()));
+fn fn_meshgrid(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity("meshgrid", "1, 2, or 3", args.len()));
     }
-    let xv = args[0].as_matrix()?.data();
-    let yv = if args.len() == 2 {
-        args[1].as_matrix()?.data()
+    let xm = args[0].to_dense_matrix()?;
+    let ym = if args.len() >= 2 {
+        args[1].to_dense_matrix()?
     } else {
-        xv
+        xm.clone()
     };
-    let rows = yv.len();
-    let cols = xv.len();
-    let mut x_mat = Matrix::zeros(rows, cols);
-    let mut y_mat = Matrix::zeros(rows, cols);
-    for r in 0..rows {
-        for c in 0..cols {
-            x_mat.set(r, c, xv[c]);
-            y_mat.set(r, c, yv[r]);
+    let want_3d = args.len() == 3 || nargout >= 3;
+    if !want_3d {
+        let rows = ym.len();
+        let cols = xm.len();
+        let mut x_mat = Matrix::zeros(rows, cols);
+        let mut y_mat = Matrix::zeros(rows, cols);
+        for r in 0..rows {
+            for c in 0..cols {
+                x_mat.set_c(r, c, xm.get_linear_c(c));
+                y_mat.set_c(r, c, ym.get_linear_c(r));
+            }
+        }
+        return Ok(vec![
+            Value::matrix(x_mat.normalize()),
+            Value::matrix(y_mat.normalize()),
+        ]);
+    }
+    let zm = if args.len() == 3 {
+        args[2].to_dense_matrix()?
+    } else {
+        xm.clone()
+    };
+    let nx = xm.len();
+    let ny = ym.len();
+    let nz = zm.len();
+    let dims = vec![ny, nx, nz];
+    let total = ny * nx * nz;
+    let mut x_re = vec![0.0; total];
+    let mut x_im = vec![0.0; total];
+    let mut y_re = vec![0.0; total];
+    let mut y_im = vec![0.0; total];
+    let mut z_re = vec![0.0; total];
+    let mut z_im = vec![0.0; total];
+    for iz in 0..nz {
+        let zv = zm.get_linear_c(iz);
+        for ix in 0..nx {
+            let xv = xm.get_linear_c(ix);
+            for iy in 0..ny {
+                let yv = ym.get_linear_c(iy);
+                let pos = iz * (ny * nx) + ix * ny + iy;
+                x_re[pos] = xv.re;
+                x_im[pos] = xv.im;
+                y_re[pos] = yv.re;
+                y_im[pos] = yv.im;
+                z_re[pos] = zv.re;
+                z_im[pos] = zv.im;
+            }
         }
     }
-    Ok(vec![Value::matrix(x_mat), Value::matrix(y_mat)])
+    Ok(vec![
+        Value::matrix(Matrix::from_nd_complex_col_major(dims.clone(), x_re, x_im)?.normalize()),
+        Value::matrix(Matrix::from_nd_complex_col_major(dims.clone(), y_re, y_im)?.normalize()),
+        Value::matrix(Matrix::from_nd_complex_col_major(dims, z_re, z_im)?.normalize()),
+    ])
 }
 
 fn fn_cell(args: &[Value]) -> Result<Vec<Value>> {
@@ -1144,6 +1515,14 @@ fn fn_fieldnames(args: &[Value]) -> Result<Vec<Value>> {
                 .collect();
             ok1(Value::Cell(CellArray::from_rows(rows)?))
         }
+        Value::StructArray(sa) => {
+            let rows: Vec<Vec<Value>> = sa
+                .items
+                .first()
+                .map(|m| m.keys().map(|k| vec![Value::String(k.clone())]).collect())
+                .unwrap_or_default();
+            ok1(Value::Cell(CellArray::from_rows(rows)?))
+        }
         Value::Object(o) => {
             let rows: Vec<Vec<Value>> = o
                 .fields
@@ -1163,25 +1542,65 @@ fn fn_isfield(args: &[Value]) -> Result<Vec<Value>> {
     if args.len() != 2 {
         return Err(MatroError::arity("isfield", "2", args.len()));
     }
-    let field = args[1].as_str()?;
-    let present = match &args[0] {
-        Value::Struct(map) => map.contains_key(field),
-        Value::Object(o) => o.fields.contains_key(field),
-        _ => false,
+    let has_field = |f: &str| -> bool {
+        match &args[0] {
+            Value::Struct(map) => map.contains_key(f),
+            Value::StructArray(sa) => sa.items.first().is_some_and(|m| m.contains_key(f)),
+            Value::Object(o) => o.fields.contains_key(f),
+            _ => false,
+        }
     };
-    ok1(Value::bool(present))
+    if let Some(field) = value_as_text(&args[1]) {
+        return ok1(Value::bool(has_field(&field)));
+    }
+    if let Value::Cell(c) = &args[1] {
+        let mut out = Matrix::zeros(c.rows, c.cols);
+        for col in 0..c.cols {
+            for row in 0..c.rows {
+                let b = value_as_text(c.get(row, col)).is_some_and(|f| has_field(&f));
+                out.set(row, col, if b { 1.0 } else { 0.0 });
+            }
+        }
+        return ok1(Value::matrix(out.with_logical(true)));
+    }
+    if let Value::Object(o) = &args[1] {
+        if o.class_name == "string" {
+            if let Some(Value::Cell(c)) = o.fields.get("Data") {
+                let mut out = Matrix::zeros(c.rows, c.cols);
+                for col in 0..c.cols {
+                    for row in 0..c.rows {
+                        let b = value_as_text(c.get(row, col)).is_some_and(|f| has_field(&f));
+                        out.set(row, col, if b { 1.0 } else { 0.0 });
+                    }
+                }
+                return ok1(Value::matrix(out.with_logical(true)));
+            }
+        }
+    }
+    ok1(Value::bool(false))
 }
 
 fn fn_isa(args: &[Value]) -> Result<Vec<Value>> {
     if args.len() != 2 {
         return Err(MatroError::arity("isa", "2", args.len()));
     }
-    let expected = args[1].as_str()?;
-    let matched = match expected {
+    let expected = value_as_text(&args[1])
+        .ok_or_else(|| MatroError::runtime("isa: expected class name string"))?;
+    let matched = match expected.as_str() {
         "numeric" => matches!(&args[0], Value::Matrix(m) if !m.is_logical())
             || matches!(&args[0], Value::Sparse(_)),
-        "double" => matches!(&args[0], Value::Matrix(m) if !m.is_logical())
-            || matches!(&args[0], Value::Sparse(_)),
+        "float" => matches!(
+            &args[0],
+            Value::Matrix(m) if matches!(m.dtype(), matro_types::NumericClass::Double | matro_types::NumericClass::Single)
+        ) || matches!(&args[0], Value::Sparse(_)),
+        "integer" => matches!(
+            &args[0],
+            Value::Matrix(m) if m.dtype().is_integer()
+        ),
+        "double" => matches!(
+            &args[0],
+            Value::Matrix(m) if m.dtype() == matro_types::NumericClass::Double
+        ) || matches!(&args[0], Value::Sparse(_)),
         other => args[0].type_name() == other,
     };
     ok1(Value::bool(matched))
@@ -1202,24 +1621,28 @@ fn fn_sparse(args: &[Value]) -> Result<Vec<Value>> {
             let n = as_usize(&args[1], "sparse")?;
             ok1(Value::sparse(SparseMatrix::zeros(m, n)))
         }
-        3 | 5 => {
-            let iv = args[0].as_matrix()?.data();
-            let jv = args[1].as_matrix()?.data();
-            let vv = args[2].as_matrix()?;
-            if iv.len() != jv.len() {
-                return Err(MatroError::dimension("sparse(i, j, v): i and j must have equal length"));
+        3 | 5 | 6 => {
+            let im = args[0].to_dense_matrix()?;
+            let jm = args[1].to_dense_matrix()?;
+            let vv = args[2].to_dense_matrix()?;
+            let n_entries = im.len().max(jm.len()).max(vv.len());
+            if im.len() != 1 && im.len() != n_entries {
+                return Err(MatroError::dimension("sparse(i, j, v): i length mismatch"));
             }
-            let n_entries = iv.len();
-            let scalar_v = vv.as_scalar();
-            if scalar_v.is_none() && vv.len() != n_entries {
-                return Err(MatroError::dimension("sparse(i, j, v): v length must match i and j"));
+            if jm.len() != 1 && jm.len() != n_entries {
+                return Err(MatroError::dimension("sparse(i, j, v): j length mismatch"));
             }
+            if vv.len() != 1 && vv.len() != n_entries {
+                return Err(MatroError::dimension("sparse(i, j, v): v length mismatch"));
+            }
+            let iv = im.data();
+            let jv = jm.data();
             let mut max_r = 0usize;
             let mut max_c = 0usize;
             let mut triplets = Vec::with_capacity(n_entries);
             for k in 0..n_entries {
-                let r = iv[k].round() as isize;
-                let c = jv[k].round() as isize;
+                let r = (if iv.len() == 1 { iv[0] } else { iv[k] }).round() as isize;
+                let c = (if jv.len() == 1 { jv[0] } else { jv[k] }).round() as isize;
                 if r < 1 || c < 1 {
                     return Err(MatroError::index("sparse: indices must be >= 1"));
                 }
@@ -1227,26 +1650,120 @@ fn fn_sparse(args: &[Value]) -> Result<Vec<Value>> {
                 let c0 = (c - 1) as usize;
                 max_r = max_r.max(r0 + 1);
                 max_c = max_c.max(c0 + 1);
-                let val = scalar_v.unwrap_or_else(|| vv.data()[k]);
+                let val = if vv.len() == 1 { vv.data()[0] } else { vv.data()[k] };
                 triplets.push((r0, c0, val));
             }
-            let (rows, cols) = if args.len() == 5 {
+            let (rows, cols) = if args.len() >= 5 {
                 (as_usize(&args[3], "sparse")?, as_usize(&args[4], "sparse")?)
             } else {
                 (max_r, max_c)
             };
+            if args.len() == 6 {
+                let _nzmax = as_usize(&args[5], "sparse")?;
+            }
             ok1(Value::sparse(SparseMatrix::from_triplets(rows, cols, &triplets)?))
         }
-        n => Err(MatroError::arity("sparse", "1, 2, 3, or 5", n)),
+        n => Err(MatroError::arity("sparse", "1, 2, 3, 5, or 6", n)),
     }
 }
 
 fn fn_speye(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("speye", "1", args.len()));
+    let (m, n) = match args.len() {
+        0 => (1, 1),
+        1 => {
+            let mat = args[0].to_dense_matrix()?;
+            if mat.len() >= 2 {
+                (
+                    mat.data()[0].max(0.0).round() as usize,
+                    mat.data()[1].max(0.0).round() as usize,
+                )
+            } else {
+                let k = as_usize(&args[0], "speye")?;
+                (k, k)
+            }
+        }
+        2 => (as_usize(&args[0], "speye")?, as_usize(&args[1], "speye")?),
+        k => return Err(MatroError::arity("speye", "0, 1, or 2", k)),
+    };
+    let d = m.min(n);
+    let triplets: Vec<(usize, usize, f64)> = (0..d).map(|i| (i, i, 1.0)).collect();
+    ok1(Value::sparse(SparseMatrix::from_triplets(m, n, &triplets)?))
+}
+
+fn fn_sprand(args: &[Value], rng: &mut Rng, normal: bool, sym: bool) -> Result<Vec<Value>> {
+    let name = if sym {
+        "sprandsym"
+    } else if normal {
+        "sprandn"
+    } else {
+        "sprand"
+    };
+    if sym {
+        if args.is_empty() || args.len() > 3 {
+            return Err(MatroError::arity(name, "1..=3 (n, density [, rc])", args.len()));
+        }
+        if args.len() == 1 {
+            let s = match &args[0] {
+                Value::Sparse(sp) => (**sp).clone(),
+                other => SparseMatrix::from_dense(&other.to_dense_matrix()?),
+            };
+            let n = s.rows().min(s.cols());
+            let mut trips = Vec::new();
+            for (r, c, _) in s.triplets() {
+                if r <= c && r < n && c < n {
+                    let v = rng.next_normal();
+                    trips.push((r, c, v));
+                    if r != c {
+                        trips.push((c, r, v));
+                    }
+                }
+            }
+            return ok1(Value::sparse(SparseMatrix::from_triplets(n, n, &trips)?));
+        }
+        let n = as_usize(&args[0], name)?;
+        let density = args[1].as_scalar()?.clamp(0.0, 1.0);
+        let nnz_target = ((n * n) as f64 * density * 0.5).round() as usize;
+        let mut trips = Vec::with_capacity(nnz_target * 2);
+        for _ in 0..nnz_target {
+            let r = (rng.next_f64() * (n as f64)).floor().min((n.saturating_sub(1)) as f64) as usize;
+            let c = (rng.next_f64() * (n as f64)).floor().min((n.saturating_sub(1)) as f64) as usize;
+            let v = rng.next_normal();
+            trips.push((r, c, v));
+            if r != c {
+                trips.push((c, r, v));
+            }
+        }
+        return ok1(Value::sparse(SparseMatrix::from_triplets(n, n, &trips)?));
     }
-    let n = as_usize(&args[0], "speye")?;
-    ok1(Value::sparse(SparseMatrix::eye(n)))
+    if args.len() == 1 {
+        let s = match &args[0] {
+            Value::Sparse(sp) => (**sp).clone(),
+            other => SparseMatrix::from_dense(&other.to_dense_matrix()?),
+        };
+        let trips: Vec<(usize, usize, f64)> = s
+            .triplets()
+            .into_iter()
+            .map(|(r, c, _)| (r, c, if normal { rng.next_normal() } else { rng.next_f64() }))
+            .collect();
+        return ok1(Value::sparse(SparseMatrix::from_triplets(s.rows(), s.cols(), &trips)?));
+    }
+    if args.len() != 3 && args.len() != 4 {
+        return Err(MatroError::arity(name, "1, 3, or 4 (m, n, density [, rc])", args.len()));
+    }
+    let m = as_usize(&args[0], name)?;
+    let n = as_usize(&args[1], name)?;
+    let density = args[2].as_scalar()?.clamp(0.0, 1.0);
+    let nnz_target = ((m * n) as f64 * density).round() as usize;
+    let mut trips = Vec::with_capacity(nnz_target);
+    if m > 0 && n > 0 {
+        for _ in 0..nnz_target {
+            let r = (rng.next_f64() * (m as f64)).floor().min((m - 1) as f64) as usize;
+            let c = (rng.next_f64() * (n as f64)).floor().min((n - 1) as f64) as usize;
+            let v = if normal { rng.next_normal() } else { rng.next_f64() };
+            trips.push((r, c, v));
+        }
+    }
+    ok1(Value::sparse(SparseMatrix::from_triplets(m, n, &trips)?))
 }
 
 fn fn_full(args: &[Value]) -> Result<Vec<Value>> {
@@ -1308,11 +1825,55 @@ fn fn_strcmp(args: &[Value]) -> Result<Vec<Value>> {
     if args.len() != 2 {
         return Err(MatroError::arity("strcmp", "2", args.len()));
     }
-    let eq = match (&args[0], &args[1]) {
-        (Value::String(a), Value::String(b)) => a == b,
-        _ => false,
+    fn extract_str_arr(v: &Value) -> Option<(Vec<String>, usize, usize)> {
+        match v {
+            Value::String(s) => Some((vec![s.clone()], 1, 1)),
+            Value::Cell(c) => {
+                let mut out = Vec::with_capacity(c.data.len());
+                for item in &c.data {
+                    out.push(value_as_text(item).unwrap_or_default());
+                }
+                Some((out, c.rows, c.cols))
+            }
+            Value::Object(o) if o.class_name == "string" => {
+                if let Some(Value::Cell(c)) = o.fields.get("Data") {
+                    let mut out = Vec::with_capacity(c.data.len());
+                    for item in &c.data {
+                        out.push(value_as_text(item).unwrap_or_default());
+                    }
+                    return Some((out, c.rows, c.cols));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    let Some((sa, ra, ca)) = extract_str_arr(&args[0]) else {
+        return ok1(Value::bool(false));
     };
-    ok1(Value::bool(eq))
+    let Some((sb, rb, cb)) = extract_str_arr(&args[1]) else {
+        return ok1(Value::bool(false));
+    };
+    if sa.len() == 1 && sb.len() == 1 {
+        return ok1(Value::bool(sa[0] == sb[0]));
+    }
+    if sa.len() == 1 {
+        let vals: Vec<f64> = sb.iter().map(|b| if sa[0] == *b { 1.0 } else { 0.0 }).collect();
+        return ok1(Value::matrix(Matrix::from_col_major(rb, cb, vals)?.with_logical(true)));
+    }
+    if sb.len() == 1 {
+        let vals: Vec<f64> = sa.iter().map(|a| if *a == sb[0] { 1.0 } else { 0.0 }).collect();
+        return ok1(Value::matrix(Matrix::from_col_major(ra, ca, vals)?.with_logical(true)));
+    }
+    if ra == rb && ca == cb {
+        let vals: Vec<f64> = sa
+            .iter()
+            .zip(sb.iter())
+            .map(|(a, b)| if a == b { 1.0 } else { 0.0 })
+            .collect();
+        return ok1(Value::matrix(Matrix::from_col_major(ra, ca, vals)?.with_logical(true)));
+    }
+    Err(MatroError::dimension("strcmp: string arrays must have compatible sizes"))
 }
 
 fn fn_class(args: &[Value]) -> Result<Vec<Value>> {
@@ -1330,8 +1891,33 @@ fn fn_sprintf(args: &[Value]) -> Result<Vec<Value>> {
 }
 
 fn fn_num2str(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("num2str", "1", args.len()));
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity("num2str", "1 or 2 (A [, precision | formatSpec])", args.len()));
+    }
+    let m = args[0].to_dense_matrix()?;
+    if args.len() == 2 {
+        if let Some(fmt_spec) = value_as_text(&args[1]) {
+            let mut lines = Vec::with_capacity(m.rows());
+            for r in 0..m.rows() {
+                let mut row_vals = Vec::with_capacity(m.cols());
+                for c in 0..m.cols() {
+                    row_vals.push(Value::scalar(m.get(r, c)));
+                }
+                let mut call_a = vec![Value::String(fmt_spec.clone())];
+                call_a.extend(row_vals);
+                lines.push(format_printf(&call_a)?);
+            }
+            return ok1(Value::String(lines.join("\n")));
+        }
+        let prec = as_usize(&args[1], "num2str")?;
+        let mut lines = Vec::with_capacity(m.rows());
+        for r in 0..m.rows() {
+            let parts: Vec<String> = (0..m.cols())
+                .map(|c| format_g_value(m.get(r, c), prec, false))
+                .collect();
+            lines.push(parts.join("  "));
+        }
+        return ok1(Value::String(lines.join("\n")));
     }
     ok1(Value::String(format!("{}", args[0])))
 }
@@ -1446,20 +2032,58 @@ fn fn_logspace(args: &[Value]) -> Result<Vec<Value>> {
 }
 
 fn fn_diag(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("diag", "1", args.len()));
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity("diag", "1 or 2 (v|A [, k])", args.len()));
     }
-    let m = args[0].as_matrix()?;
+    let k: isize = if args.len() == 2 {
+        let kf = args[1].as_scalar()?;
+        if !kf.is_finite() || (kf - kf.round()).abs() > 1e-12 {
+            return Err(MatroError::runtime("diag: diagonal offset k must be an integer"));
+        }
+        kf.round() as isize
+    } else {
+        0
+    };
+    let is_sp = matches!(&args[0], Value::Sparse(_));
+    let m = args[0].to_dense_matrix()?;
+    let k_abs = k.unsigned_abs();
     if m.rows() == 1 || m.cols() == 1 {
-        let n = m.len();
+        let len = m.len();
+        let n = len + k_abs;
+        if is_sp && !m.is_complex() {
+            let mut trips = Vec::with_capacity(len);
+            for i in 0..len {
+                let (r, c) = if k >= 0 { (i, i + k_abs) } else { (i + k_abs, i) };
+                let v = m.data()[i];
+                if v != 0.0 {
+                    trips.push((r, c, v));
+                }
+            }
+            return ok1(Value::sparse(SparseMatrix::from_triplets(n, n, &trips)?));
+        }
         let mut out = Matrix::zeros(n, n);
-        for i in 0..n {
-            out.set_c(i, i, m.get_linear_c(i));
+        for i in 0..len {
+            let (r, c) = if k >= 0 { (i, i + k_abs) } else { (i + k_abs, i) };
+            out.set_c(r, c, m.get_linear_c(i));
         }
         ok1(Value::matrix(out.normalize()))
     } else {
-        let n = m.rows().min(m.cols());
-        let vals: Vec<Complex> = (0..n).map(|i| m.get_c(i, i)).collect();
+        let (r0, c0) = if k >= 0 { (0usize, k_abs) } else { (k_abs, 0usize) };
+        if r0 >= m.rows() || c0 >= m.cols() {
+            return ok1(Value::matrix(Matrix::zeros(0, 1)));
+        }
+        let len = (m.rows() - r0).min(m.cols() - c0);
+        if is_sp && !m.is_complex() {
+            let mut trips = Vec::new();
+            for i in 0..len {
+                let v = m.get(r0 + i, c0 + i);
+                if v != 0.0 {
+                    trips.push((i, 0, v));
+                }
+            }
+            return ok1(Value::sparse(SparseMatrix::from_triplets(len, 1, &trips)?));
+        }
+        let vals: Vec<Complex> = (0..len).map(|i| m.get_c(r0 + i, c0 + i)).collect();
         ok1(Value::matrix(Matrix::complex_col_vec(vals).normalize()))
     }
 }
@@ -1530,23 +2154,46 @@ fn value_dims(v: &Value) -> Vec<usize> {
 }
 
 fn fn_size(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 2 {
-        return Err(MatroError::arity("size", "1 or 2", args.len()));
+    if args.is_empty() {
+        return Err(MatroError::arity("size", ">= 1", 0));
     }
     let dims = value_dims(&args[0]);
-    if args.len() == 2 {
-        let dim = as_usize(&args[1], "size")?;
-        let val = if dim >= 1 {
-            dims.get(dim - 1).copied().unwrap_or(1)
+    if args.len() >= 2 {
+        let mut requested = Vec::new();
+        for a in &args[1..] {
+            let dm = a.to_dense_matrix()?;
+            for &x in dm.data() {
+                let d = x.round() as isize;
+                if d < 1 {
+                    return Err(MatroError::runtime(format!(
+                        "size: dimension must be >= 1, got {x}"
+                    )));
+                }
+                requested.push(dims.get((d - 1) as usize).copied().unwrap_or(1) as f64);
+            }
+        }
+        if nargout >= 2 {
+            let mut out = Vec::with_capacity(nargout);
+            for k in 0..nargout {
+                out.push(Value::scalar(requested.get(k).copied().unwrap_or(1.0)));
+            }
+            return Ok(out);
+        }
+        return if requested.len() == 1 {
+            ok1(Value::scalar(requested[0]))
         } else {
-            1
+            ok1(Value::matrix(Matrix::row_vec(requested)))
         };
-        return ok1(Value::scalar(val as f64));
     }
     if nargout >= 2 {
         let mut out = Vec::with_capacity(nargout);
         for k in 0..nargout {
-            out.push(Value::scalar(dims.get(k).copied().unwrap_or(1) as f64));
+            let val = if k + 1 == nargout && dims.len() > nargout {
+                dims[k..].iter().product()
+            } else {
+                dims.get(k).copied().unwrap_or(1)
+            };
+            out.push(Value::scalar(val as f64));
         }
         Ok(out)
     } else {
@@ -1652,13 +2299,13 @@ fn fn_kron(args: &[Value]) -> Result<Vec<Value>> {
 }
 
 fn fn_sum(args: &[Value]) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 3 {
-        return Err(MatroError::arity("sum", "1 to 3", args.len()));
+    if args.is_empty() || args.len() > 4 {
+        return Err(MatroError::arity("sum", "1 to 4", args.len()));
     }
     if let Value::Sparse(s) = &args[0] {
         let mut all_mode = false;
         let mut omit_nan = false;
-        let mut dim_opt: Option<usize> = None;
+        let mut vecdim: Option<Vec<usize>> = None;
         for a in &args[1..] {
             if let Some(txt) = value_as_text(a) {
                 match txt.trim().to_ascii_lowercase().as_str() {
@@ -1667,7 +2314,7 @@ fn fn_sum(args: &[Value]) -> Result<Vec<Value>> {
                     _ => {}
                 }
             } else {
-                dim_opt = Some(as_usize(a, "sum")?);
+                vecdim = Some(parse_vecdim(a, "sum")?);
             }
         }
         if all_mode {
@@ -1678,11 +2325,14 @@ fn fn_sum(args: &[Value]) -> Result<Vec<Value>> {
                 .sum();
             return ok1(Value::scalar(total));
         }
-        let dim = dim_opt.unwrap_or(if s.rows() == 1 { 2 } else { 1 });
-        if dim != 1 && dim != 2 {
-            return Err(MatroError::runtime(format!("sum: unsupported dimension {dim}")));
+        if !omit_nan && vecdim.as_ref().is_none_or(|v| v.len() == 1) {
+            let dim = vecdim
+                .and_then(|v| v.first().copied())
+                .unwrap_or(if s.rows() == 1 { 2 } else { 1 });
+            if dim == 1 || dim == 2 {
+                return ok1(Value::matrix(s.sum_dim(dim)));
+            }
         }
-        return ok1(Value::matrix(s.sum_dim(dim)));
     }
     fn_reduce_c("sum", args, |slice| {
         slice.iter().copied().fold(Complex::ZERO, |a, b| a + b)
@@ -1900,17 +2550,36 @@ fn fn_unary_mat(
     if args.len() != 1 {
         return Err(MatroError::arity(name, "1", args.len()));
     }
-    let m = args[0].as_matrix()?;
-    ok1(Value::matrix(f(m)?))
+    let m = args[0].to_dense_matrix()?;
+    ok1(Value::matrix(f(&m)?))
 }
 
 fn fn_lu(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("lu", "1", args.len()));
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity("lu", "1 or 2 (A [, 'vector'|'matrix'])", args.len()));
     }
-    let (l, u, p) = args[0].as_matrix()?.lu()?;
+    let vec_perm = args
+        .get(1)
+        .and_then(value_as_text)
+        .is_some_and(|s| s.eq_ignore_ascii_case("vector"));
+    let (l, u, p) = args[0].to_dense_matrix()?.lu()?;
     if nargout >= 3 {
-        Ok(vec![Value::matrix(l), Value::matrix(u), Value::matrix(p)])
+        let p_out = if vec_perm {
+            let n = p.rows();
+            let mut pv = vec![0.0; n];
+            for r in 0..n {
+                for c in 0..p.cols() {
+                    if p.get(r, c) != 0.0 {
+                        pv[r] = (c + 1) as f64;
+                        break;
+                    }
+                }
+            }
+            Matrix::col_vec(pv)
+        } else {
+            p
+        };
+        Ok(vec![Value::matrix(l), Value::matrix(u), Value::matrix(p_out)])
     } else if nargout == 2 {
         let pl = p.transpose().matmul(&l)?;
         Ok(vec![Value::matrix(pl), Value::matrix(u)])
@@ -1919,86 +2588,425 @@ fn fn_lu(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
     }
 }
 
-fn fn_qr(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("qr", "1", args.len()));
-    }
-    let (q, r) = args[0].as_matrix()?.qr()?;
-    if nargout >= 2 {
-        Ok(vec![Value::matrix(q), Value::matrix(r)])
+fn slice_submatrix(m: &Matrix, r_end: usize, c_end: usize) -> Matrix {
+    let mut out = if m.is_complex() {
+        Matrix::complex_zeros(r_end, c_end)
     } else {
-        ok1(Value::matrix(r))
+        Matrix::zeros(r_end, c_end)
+    };
+    for c in 0..c_end {
+        for r in 0..r_end {
+            out.set_c(r, c, m.get_c(r, c));
+        }
+    }
+    out.normalize()
+}
+
+fn fn_qr(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity("qr", "1 to 3 (A [, 'econ'|0, 'vector'|'matrix'])", args.len()));
+    }
+    let a = args[0].to_dense_matrix()?;
+    let mut econ = false;
+    let mut vec_perm = false;
+    for arg in &args[1..] {
+        if let Some(s) = value_as_text(arg) {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "econ" => econ = true,
+                "vector" => vec_perm = true,
+                "matrix" => vec_perm = false,
+                _ => {}
+            }
+        } else if let Ok(v) = arg.as_scalar() {
+            if v == 0.0 {
+                econ = true;
+                if nargout >= 3 {
+                    vec_perm = true;
+                }
+            }
+        }
+    }
+    let m = a.rows();
+    let n = a.cols();
+    let k = m.min(n);
+    if nargout >= 3 {
+        let (q_full, r_full, perm) = a.qr_pivoted()?;
+        let (q, r) = if econ && m > n {
+            (slice_submatrix(&q_full, m, k), slice_submatrix(&r_full, k, n))
+        } else {
+            (q_full, r_full)
+        };
+        let e = if vec_perm {
+            Matrix::row_vec(perm.iter().map(|&p| (p + 1) as f64).collect())
+        } else {
+            let mut em = Matrix::zeros(n, n);
+            for (col, &p) in perm.iter().enumerate() {
+                em.set(p, col, 1.0);
+            }
+            em
+        };
+        Ok(vec![Value::matrix(q), Value::matrix(r), Value::matrix(e)])
+    } else {
+        let (q_full, r_full) = a.qr()?;
+        let (q, r) = if econ && m > n {
+            (slice_submatrix(&q_full, m, k), slice_submatrix(&r_full, k, n))
+        } else {
+            (q_full, r_full)
+        };
+        if nargout >= 2 {
+            Ok(vec![Value::matrix(q), Value::matrix(r)])
+        } else {
+            ok1(Value::matrix(r))
+        }
     }
 }
 
 fn fn_svd(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("svd", "1", args.len()));
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity("svd", "1 to 3 (A [, 'econ'|0 [, 'vector'|'matrix']])", args.len()));
     }
-    let (u, s, v) = args[0].as_matrix()?.svd()?;
+    let a = args[0].to_dense_matrix()?;
+    let mut econ = false;
+    let mut s_vec = false;
+    for arg in &args[1..] {
+        if let Some(s) = value_as_text(arg) {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "econ" => econ = true,
+                "vector" => s_vec = true,
+                "matrix" => s_vec = false,
+                _ => {}
+            }
+        } else if let Ok(v) = arg.as_scalar() {
+            if v == 0.0 {
+                econ = true;
+            }
+        }
+    }
+    let (u_full, s_full, v_full) = a.svd()?;
+    let m = a.rows();
+    let n = a.cols();
+    let k = m.min(n);
     if nargout >= 3 {
-        Ok(vec![Value::matrix(u), Value::matrix(s), Value::matrix(v)])
+        let (u, s, v) = if econ {
+            (
+                slice_submatrix(&u_full, m, k),
+                slice_submatrix(&s_full, k, k),
+                slice_submatrix(&v_full, n, k),
+            )
+        } else {
+            (u_full, s_full, v_full)
+        };
+        let s_out = if s_vec {
+            Matrix::col_vec((0..k).map(|i| s.get(i, i)).collect())
+        } else {
+            s
+        };
+        Ok(vec![Value::matrix(u), Value::matrix(s_out), Value::matrix(v)])
     } else {
-        let k = s.rows().min(s.cols());
-        let diag: Vec<f64> = (0..k).map(|i| s.get(i, i)).collect();
+        let diag: Vec<f64> = (0..k).map(|i| s_full.get(i, i)).collect();
         ok1(Value::matrix(Matrix::col_vec(diag)))
     }
 }
 
-fn fn_eig(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("eig", "1", args.len()));
+fn fn_chol(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity("chol", "1 to 3 (A [, 'upper'|'lower'])", args.len()));
     }
-    let (v, d) = args[0].as_matrix()?.eig()?;
+    let a = args[0].to_dense_matrix()?;
+    let mut lower = false;
+    for arg in &args[1..] {
+        if let Some(s) = value_as_text(arg) {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "lower" => lower = true,
+                "upper" => lower = false,
+                _ => {}
+            }
+        }
+    }
+    let (factor, flag) = a.chol_with_flag(lower)?;
     if nargout >= 2 {
-        Ok(vec![Value::matrix(v), Value::matrix(d)])
+        Ok(vec![Value::matrix(factor), Value::scalar(flag as f64)])
+    } else if flag != 0 {
+        Err(MatroError::runtime("Matrix is not positive definite for chol()"))
     } else {
-        let n = d.rows().min(d.cols());
+        ok1(Value::matrix(factor))
+    }
+}
+
+fn fn_eig(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 4 {
+        return Err(MatroError::arity("eig", "1 to 4 (A [, B] [, 'vector'|'matrix'])", args.len()));
+    }
+    let a = args[0].to_dense_matrix()?;
+    let mut b_opt: Option<Matrix> = None;
+    let mut d_mode: Option<&str> = None;
+    for arg in &args[1..] {
+        if let Some(s) = value_as_text(arg) {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "vector" => d_mode = Some("vector"),
+                "matrix" => d_mode = Some("matrix"),
+                _ => {}
+            }
+        } else if b_opt.is_none() {
+            b_opt = Some(arg.to_dense_matrix()?);
+        }
+    }
+    let (v, d) = if let Some(b) = b_opt {
+        if b.rows() != a.rows() || b.cols() != a.cols() {
+            return Err(MatroError::dimension("eig(A, B): A and B must have the same square dimensions"));
+        }
+        // If B is SPD, solve symmetric generalized problem via Cholesky: L^{-1} A L^{-T} y = lambda y
+        if let Ok((l, 0)) = b.chol_with_flag(true) {
+            let linv_a = l.solve(&a)?;
+            let sym_m = l.solve(&linv_a.ctranspose())?.ctranspose();
+            let (y, d_mat) = sym_m.eig()?;
+            let v_mat = l.ctranspose().solve(&y)?;
+            (v_mat.normalize(), d_mat.normalize())
+        } else {
+            let m = b.solve(&a)?;
+            m.eig()?
+        }
+    } else {
+        a.eig()?
+    };
+
+    let n = d.rows().min(d.cols());
+    let d_vec = || {
         let diag: Vec<Complex> = (0..n).map(|i| d.get_c(i, i)).collect();
-        ok1(Value::matrix(Matrix::complex_col_vec(diag).normalize()))
+        Matrix::complex_col_vec(diag).normalize()
+    };
+
+    if nargout >= 3 {
+        // Left eigenvectors W satisfy W' * A = D * W' => columns of W are eigenvectors of A'
+        let (w, _) = a.ctranspose().eig()?;
+        let d_out = if d_mode == Some("vector") { d_vec() } else { d };
+        Ok(vec![Value::matrix(v), Value::matrix(d_out), Value::matrix(w)])
+    } else if nargout == 2 {
+        let d_out = if d_mode == Some("vector") { d_vec() } else { d };
+        Ok(vec![Value::matrix(v), Value::matrix(d_out)])
+    } else if d_mode == Some("matrix") {
+        ok1(Value::matrix(d))
+    } else {
+        ok1(Value::matrix(d_vec()))
     }
 }
 
 fn fn_rank(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("rank", "1", args.len()));
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity("rank", "1 or 2 (A [, tol])", args.len()));
     }
-    let m = args[0].as_matrix()?;
+    let m = args[0].to_dense_matrix()?;
     let (_, s, _) = m.svd()?;
     let k = s.rows().min(s.cols());
     if k == 0 {
         return ok1(Value::scalar(0.0));
     }
     let max_s = s.get(0, 0);
-    let tol = (m.rows().max(m.cols()) as f64) * f64::EPSILON * max_s.max(1.0);
+    let tol = if args.len() == 2 {
+        args[1].as_scalar()?
+    } else {
+        (m.rows().max(m.cols()) as f64) * f64::EPSILON * max_s
+    };
     let r = (0..k).filter(|&i| s.get(i, i) > tol).count();
     ok1(Value::scalar(r as f64))
 }
 
 fn fn_cond(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("cond", "1", args.len()));
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity("cond", "1 or 2 (A [, p])", args.len()));
     }
-    let (_, s, _) = args[0].as_matrix()?.svd()?;
+    let a = args[0].to_dense_matrix()?;
+    if a.is_empty() {
+        return ok1(Value::scalar(0.0));
+    }
+    if args.len() == 2 {
+        let is_two = args[1].as_scalar().ok() == Some(2.0);
+        if !is_two {
+            let n_a = matrix_norm_p(&a, &args[1])?;
+            if let Ok(ainv) = a.inv() {
+                let n_inv = matrix_norm_p(&ainv, &args[1])?;
+                return ok1(Value::scalar(n_a * n_inv));
+            }
+            return ok1(Value::scalar(f64::INFINITY));
+        }
+    }
+    let (_, s, _) = a.svd()?;
     let k = s.rows().min(s.cols());
     if k == 0 {
         return ok1(Value::scalar(0.0));
     }
     let smax = s.get(0, 0);
     let smin = s.get(k - 1, k - 1);
-    ok1(Value::scalar(if smin < 1e-15 {
+    ok1(Value::scalar(if smin == 0.0 || (smax > 0.0 && smin / smax < f64::EPSILON * 0.1) {
         f64::INFINITY
     } else {
         smax / smin
     }))
 }
 
-fn fn_polyfit(args: &[Value]) -> Result<Vec<Value>> {
+fn fn_fft(args: &[Value], inverse: bool) -> Result<Vec<Value>> {
+    let name = if inverse { "ifft" } else { "fft" };
+    if args.is_empty() || args.len() > 4 {
+        return Err(MatroError::arity(name, "1 to 4 (X [, n [, dim [, symflag]]])", args.len()));
+    }
+    let m = args[0].to_dense_matrix()?;
+    let mut symmetric = false;
+    let mut num_args: Vec<&Value> = Vec::new();
+    for a in &args[1..] {
+        if let Some(s) = value_as_text(a) {
+            if s.eq_ignore_ascii_case("symmetric") {
+                symmetric = true;
+            } else if s.eq_ignore_ascii_case("nonsymmetric") {
+                symmetric = false;
+            } else {
+                return Err(MatroError::runtime(format!("{name}: unknown flag '{s}'")));
+            }
+        } else {
+            num_args.push(a);
+        }
+    }
+    let n_opt = if let Some(v) = num_args.first() {
+        if v.to_dense_matrix().is_ok_and(|nm| nm.is_empty()) {
+            None
+        } else {
+            Some(as_usize(v, name)?)
+        }
+    } else {
+        None
+    };
+    let dim_opt = if let Some(v) = num_args.get(1) {
+        Some(as_usize(v, name)?)
+    } else {
+        None
+    };
+    ok1(Value::matrix(m.fft_along_dim(n_opt, dim_opt, inverse, symmetric)?))
+}
+
+fn fn_fft2(args: &[Value], inverse: bool) -> Result<Vec<Value>> {
+    let name = if inverse { "ifft2" } else { "fft2" };
+    if args.is_empty() || args.len() > 4 {
+        return Err(MatroError::arity(name, "1 to 4 (X [, m, n [, symflag]])", args.len()));
+    }
+    let m = args[0].to_dense_matrix()?;
+    let mut symmetric = false;
+    let mut num_args: Vec<&Value> = Vec::new();
+    for a in &args[1..] {
+        if let Some(s) = value_as_text(a) {
+            if s.eq_ignore_ascii_case("symmetric") {
+                symmetric = true;
+            } else if s.eq_ignore_ascii_case("nonsymmetric") {
+                symmetric = false;
+            }
+        } else {
+            num_args.push(a);
+        }
+    }
+    let m_opt = num_args.first().map(|v| as_usize(v, name)).transpose()?;
+    let n_opt = num_args.get(1).map(|v| as_usize(v, name)).transpose()?;
+    ok1(Value::matrix(m.fft2_sized(m_opt, n_opt, inverse, symmetric)?))
+}
+
+fn fn_fftn(args: &[Value], inverse: bool) -> Result<Vec<Value>> {
+    let name = if inverse { "ifftn" } else { "fftn" };
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity(name, "1 to 3 (X [, sz [, symflag]])", args.len()));
+    }
+    let m = args[0].to_dense_matrix()?;
+    let mut symmetric = false;
+    let mut sz_opt: Option<Vec<usize>> = None;
+    for a in &args[1..] {
+        if let Some(s) = value_as_text(a) {
+            if s.eq_ignore_ascii_case("symmetric") {
+                symmetric = true;
+            }
+        } else {
+            let sm = a.to_dense_matrix()?;
+            if !sm.is_empty() {
+                sz_opt = Some(sm.data().iter().map(|&x| x.max(0.0).round() as usize).collect());
+            }
+        }
+    }
+    ok1(Value::matrix(m.fftn_sized(sz_opt.as_deref(), inverse, symmetric)?))
+}
+
+fn fn_log2(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.len() != 1 {
+        return Err(MatroError::arity("log2", "1", args.len()));
+    }
+    let m = args[0].to_dense_matrix()?;
+    if nargout >= 2 {
+        let mut f_data = Vec::with_capacity(m.len());
+        let mut e_data = Vec::with_capacity(m.len());
+        for &x in m.data() {
+            if x == 0.0 || !x.is_finite() {
+                f_data.push(x);
+                e_data.push(0.0);
+            } else {
+                let ax = x.abs();
+                let exp = ax.log2().floor() as i32 + 1;
+                let mant = x / (2.0_f64).powi(exp);
+                f_data.push(mant);
+                e_data.push(exp as f64);
+            }
+        }
+        let dims = m.dims();
+        Ok(vec![
+            Value::matrix(Matrix::from_nd_col_major(dims.clone(), f_data)?),
+            Value::matrix(Matrix::from_nd_col_major(dims, e_data)?),
+        ])
+    } else {
+        ok1(Value::matrix(m.map_c(Complex::log2).normalize()))
+    }
+}
+
+fn round_scalar_n(x: f64, n: i32, sig: bool) -> f64 {
+    if !x.is_finite() || x == 0.0 {
+        return x;
+    }
+    if sig {
+        if n <= 0 {
+            return 0.0;
+        }
+        let mag = x.abs().log10().floor() as i32;
+        let scale = 10.0_f64.powi(n - 1 - mag);
+        (x * scale).round() / scale
+    } else if n == 0 {
+        x.round()
+    } else if n > 0 {
+        let scale = 10.0_f64.powi(n);
+        (x * scale).round() / scale
+    } else {
+        let scale = 10.0_f64.powi(-n);
+        (x / scale).round() * scale
+    }
+}
+
+fn fn_round(args: &[Value]) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity("round", "1 to 3 (X [, N [, 'decimals'|'significant']])", args.len()));
+    }
+    let m = args[0].to_dense_matrix()?;
+    let n = if let Some(nv) = args.get(1) {
+        nv.as_scalar()?.round() as i32
+    } else {
+        0
+    };
+    let sig = args
+        .get(2)
+        .and_then(value_as_text)
+        .is_some_and(|s| s.eq_ignore_ascii_case("significant"));
+    let out = m
+        .map_c(|c| Complex::new(round_scalar_n(c.re, n, sig), round_scalar_n(c.im, n, sig)))
+        .normalize();
+    ok1(Value::matrix(out))
+}
+
+fn fn_polyfit(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
     if args.len() != 3 {
         return Err(MatroError::arity("polyfit", "3", args.len()));
     }
-    let x = args[0].as_matrix()?;
-    let y = args[1].as_matrix()?;
+    let x = args[0].to_dense_matrix()?;
+    let y = args[1].to_dense_matrix()?;
     let deg = as_usize(&args[2], "polyfit")?;
     if x.len() != y.len() || x.len() <= deg {
         return Err(MatroError::dimension(
@@ -2007,34 +3015,112 @@ fn fn_polyfit(args: &[Value]) -> Result<Vec<Value>> {
     }
     let n = x.len();
     let cols = deg + 1;
+    let use_scale = nargout >= 3;
+    let mean_x = x.data().iter().sum::<f64>() / (n as f64);
+    let std_x = if n > 1 {
+        (x.data().iter().map(|&v| (v - mean_x).powi(2)).sum::<f64>() / ((n - 1) as f64)).sqrt()
+    } else {
+        1.0
+    };
+    let scale = if use_scale && std_x > 0.0 { std_x } else { 1.0 };
+    let shift = if use_scale { mean_x } else { 0.0 };
+
     let mut vander = Matrix::zeros(n, cols);
     for r in 0..n {
-        let xv = x.data()[r];
+        let xv = (x.data()[r] - shift) / scale;
         for c in 0..cols {
             let p = (deg - c) as i32;
             vander.set(r, c, xv.powi(p));
         }
     }
-    let y_col = Matrix::col_vec(y.data().to_vec());
+    let y_vals: Vec<Complex> = (0..n).map(|i| y.get_linear_c(i)).collect();
+    let y_col = Matrix::complex_col_vec(y_vals).normalize();
     let coeff = vander.solve(&y_col)?;
-    ok1(Value::matrix(coeff.transpose()))
+    let p_row = coeff.transpose().normalize();
+    if nargout <= 1 {
+        return ok1(Value::matrix(p_row));
+    }
+    let (_, r_full) = vander.qr()?;
+    let r_mat = slice_submatrix(&r_full, cols, cols);
+    let resid = vander.matmul(&coeff)?.elementwise_c(&y_col, |a, b| a - b)?;
+    let normr: f64 = (0..resid.len())
+        .map(|i| resid.get_linear_c(i).norm_sq())
+        .sum::<f64>()
+        .sqrt();
+    let mut s_map = BTreeMap::new();
+    s_map.insert("R".to_string(), Value::matrix(r_mat));
+    s_map.insert("df".to_string(), Value::scalar((n.saturating_sub(cols)) as f64));
+    s_map.insert("normr".to_string(), Value::scalar(normr));
+    if nargout >= 3 {
+        let mu = Matrix::col_vec(vec![mean_x, if std_x > 0.0 { std_x } else { 1.0 }]);
+        Ok(vec![
+            Value::matrix(p_row),
+            Value::Struct(s_map),
+            Value::matrix(mu),
+        ])
+    } else {
+        Ok(vec![Value::matrix(p_row), Value::Struct(s_map)])
+    }
 }
 
-fn fn_polyval(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 2 {
-        return Err(MatroError::arity("polyval", "2", args.len()));
+fn fn_polyval(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.len() < 2 || args.len() > 4 {
+        return Err(MatroError::arity("polyval", "2 to 4 (p, x [, S [, mu]])", args.len()));
     }
-    let p = args[0].as_matrix()?;
-    let x = args[1].as_matrix()?;
-    let coeffs = p.data();
-    let out = x.map(|xv| {
-        let mut acc = 0.0;
-        for &c in coeffs {
-            acc = acc * xv + c;
+    let p = args[0].to_dense_matrix()?;
+    let x = args[1].to_dense_matrix()?;
+    let (shift, scale) = if let Some(mu_v) = args.get(3) {
+        let mu = mu_v.to_dense_matrix()?;
+        if mu.len() >= 2 {
+            (mu.data()[0], mu.data()[1])
+        } else {
+            (0.0, 1.0)
         }
-        acc
-    });
-    ok1(Value::matrix(out))
+    } else {
+        (0.0, 1.0)
+    };
+    let n_coeffs = p.len();
+    let out = x
+        .map_c(|xv| {
+            let xhat = (xv - Complex::from_real(shift)) / Complex::from_real(scale);
+            let mut acc = Complex::ZERO;
+            for i in 0..n_coeffs {
+                acc = acc * xhat + p.get_linear_c(i);
+            }
+            acc
+        })
+        .normalize();
+    if nargout >= 2 {
+        let mut delta = Matrix::zeros_nd(x.dims());
+        if let Some(Value::Struct(s_map)) = args.get(2) {
+            if let (Some(r_val), Some(df_val), Some(normr_val)) =
+                (s_map.get("R"), s_map.get("df"), s_map.get("normr"))
+            {
+                let r_mat = r_val.to_dense_matrix()?;
+                let df = df_val.as_scalar()?.max(1.0);
+                let normr = normr_val.as_scalar()?;
+                let deg = n_coeffs.saturating_sub(1);
+                let mut v = Matrix::zeros(x.len(), n_coeffs);
+                for row in 0..x.len() {
+                    let xh = (x.data()[row] - shift) / scale;
+                    for col in 0..n_coeffs {
+                        v.set(row, col, xh.powi((deg - col) as i32));
+                    }
+                }
+                if let Ok(e_mat) = v.rdivide(&r_mat) {
+                    let mut d_vals = Vec::with_capacity(x.len());
+                    for row in 0..x.len() {
+                        let e2: f64 = (0..n_coeffs).map(|c| e_mat.get(row, c).powi(2)).sum();
+                        d_vals.push((normr / df.sqrt()) * (1.0 + e2).sqrt());
+                    }
+                    delta = Matrix::from_nd_col_major(x.dims(), d_vals)?;
+                }
+            }
+        }
+        Ok(vec![Value::matrix(out), Value::matrix(delta)])
+    } else {
+        ok1(Value::matrix(out))
+    }
 }
 
 fn fn_conv(args: &[Value]) -> Result<Vec<Value>> {
@@ -2104,27 +3190,45 @@ fn fn_conv(args: &[Value]) -> Result<Vec<Value>> {
     ok1(Value::matrix(mat.normalize()))
 }
 
-fn fn_ndgrid(args: &[Value]) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 2 {
-        return Err(MatroError::arity("ndgrid", "1 or 2", args.len()));
+fn fn_ndgrid(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.is_empty() {
+        return Err(MatroError::arity("ndgrid", ">= 1", 0));
     }
-    let xv = args[0].to_dense_matrix()?;
-    let yv = if args.len() == 2 {
-        args[1].to_dense_matrix()?
+    let vecs: Vec<Matrix> = if args.len() == 1 {
+        let v = args[0].to_dense_matrix()?;
+        let nd = nargout.max(2);
+        vec![v; nd]
     } else {
-        xv.clone()
+        args.iter()
+            .map(|a| a.to_dense_matrix())
+            .collect::<Result<_>>()?
     };
-    let nx = xv.len();
-    let ny = yv.len();
-    let mut x_out = Matrix::zeros(nx, ny);
-    let mut y_out = Matrix::zeros(nx, ny);
-    for c in 0..ny {
-        for r in 0..nx {
-            x_out.set(r, c, xv.data()[r]);
-            y_out.set(r, c, yv.data()[c]);
+    let nd = vecs.len();
+    let dims: Vec<usize> = vecs.iter().map(Matrix::len).collect();
+    let total: usize = dims.iter().product();
+    let mut results = Vec::with_capacity(nd);
+    for ax in 0..nd {
+        let inner: usize = dims[..ax].iter().product();
+        let axis_len = dims[ax];
+        let outer: usize = dims[ax + 1..].iter().product();
+        let mut re = vec![0.0; total];
+        let mut im = vec![0.0; total];
+        for o in 0..outer {
+            let block = o * axis_len * inner;
+            for k in 0..axis_len {
+                let val = vecs[ax].get_linear_c(k);
+                let base = block + k * inner;
+                for i in 0..inner {
+                    re[base + i] = val.re;
+                    im[base + i] = val.im;
+                }
+            }
         }
+        results.push(Value::matrix(
+            Matrix::from_nd_complex_col_major(dims.clone(), re, im)?.normalize(),
+        ));
     }
-    Ok(vec![Value::matrix(x_out), Value::matrix(y_out)])
+    Ok(results)
 }
 
 fn matlab_f64_cmp(a: f64, b: f64, desc: bool) -> std::cmp::Ordering {
@@ -2503,7 +3607,7 @@ fn fn_trace(args: &[Value]) -> Result<Vec<Value>> {
     if args.len() != 1 {
         return Err(MatroError::arity("trace", "1", args.len()));
     }
-    let m = args[0].as_matrix()?;
+    let m = args[0].to_dense_matrix()?;
     let n = m.rows().min(m.cols());
     let mut s = Complex::ZERO;
     for i in 0..n {
@@ -2513,52 +3617,247 @@ fn fn_trace(args: &[Value]) -> Result<Vec<Value>> {
 }
 
 fn fn_dot(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 2 {
-        return Err(MatroError::arity("dot", "2", args.len()));
+    if args.len() < 2 || args.len() > 3 {
+        return Err(MatroError::arity("dot", "2 or 3 (A, B [, dim])", args.len()));
     }
-    let a = args[0].as_matrix()?;
-    let b = args[1].as_matrix()?;
-    if a.len() != b.len() {
-        return Err(MatroError::dimension("dot: vectors must have the same length"));
+    let a = args[0].to_dense_matrix()?;
+    let b = args[1].to_dense_matrix()?;
+    let a_is_vec = a.ndims() == 2 && (a.rows() == 1 || a.cols() == 1);
+    let b_is_vec = b.ndims() == 2 && (b.rows() == 1 || b.cols() == 1);
+    if args.len() == 2 && a_is_vec && b_is_vec {
+        if a.len() != b.len() {
+            return Err(MatroError::dimension("dot: vectors must have the same length"));
+        }
+        let mut s = Complex::ZERO;
+        for i in 0..a.len() {
+            s = s + a.get_linear_c(i).conj() * b.get_linear_c(i);
+        }
+        return ok1(Value::matrix(Matrix::complex_scalar(s).normalize()));
     }
-    let mut s = Complex::ZERO;
-    for i in 0..a.len() {
-        s = s + a.get_linear_c(i).conj() * b.get_linear_c(i);
+    if a.dims() != b.dims() {
+        return Err(MatroError::dimension("dot: A and B must have the same dimensions"));
     }
-    ok1(Value::matrix(Matrix::complex_scalar(s).normalize()))
+    let dims = a.dims();
+    let dim = if args.len() == 3 {
+        let d = as_usize(&args[2], "dot")?;
+        if d == 0 {
+            return Err(MatroError::runtime("dot: dimension must be >= 1"));
+        }
+        d
+    } else {
+        dims.iter().position(|&d| d != 1).map_or(1, |i| i + 1)
+    };
+    let ax = dim - 1;
+    if ax >= dims.len() {
+        let out = a.elementwise_c(&b, |x, y| x.conj() * y)?;
+        return ok1(Value::matrix(out));
+    }
+    let inner: usize = dims[..ax].iter().product();
+    let axis_len = dims[ax];
+    let outer: usize = dims[ax + 1..].iter().product();
+    let mut out_dims = dims.clone();
+    out_dims[ax] = 1;
+    let out_total = inner * outer;
+    let mut re = vec![0.0; out_total];
+    let mut im = vec![0.0; out_total];
+    for o in 0..outer {
+        let src_block = o * axis_len * inner;
+        let dst_block = o * inner;
+        for i in 0..inner {
+            let mut s = Complex::ZERO;
+            for k in 0..axis_len {
+                let idx = src_block + k * inner + i;
+                s = s + a.get_linear_c(idx).conj() * b.get_linear_c(idx);
+            }
+            re[dst_block + i] = s.re;
+            im[dst_block + i] = s.im;
+        }
+    }
+    ok1(Value::matrix(
+        Matrix::from_nd_complex_col_major(out_dims, re, im)?.normalize(),
+    ))
+}
+
+fn matrix_norm_p(m: &Matrix, p_val: &Value) -> Result<f64> {
+    if m.is_empty() {
+        return Ok(0.0);
+    }
+    let is_vec = m.ndims() == 2 && (m.rows() == 1 || m.cols() == 1);
+    if let Some(s) = value_as_text(p_val) {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fro" => {
+                let sq: f64 = (0..m.len()).map(|i| m.get_linear_c(i).norm_sq()).sum();
+                return Ok(sq.sqrt());
+            }
+            "inf" => {
+                if is_vec {
+                    let mx = (0..m.len())
+                        .map(|i| m.get_linear_c(i).abs())
+                        .fold(0.0_f64, f64::max);
+                    return Ok(mx);
+                }
+                // Matrix Inf-norm = max row sum of |a_ij|
+                let mut mx = 0.0_f64;
+                for r in 0..m.rows() {
+                    let rs: f64 = (0..m.cols()).map(|c| m.get_c(r, c).abs()).sum();
+                    if rs > mx || rs.is_nan() {
+                        mx = rs;
+                    }
+                }
+                return Ok(mx);
+            }
+            other => {
+                return Err(MatroError::runtime(format!(
+                    "norm: unknown norm option '{other}'"
+                )));
+            }
+        }
+    }
+    let p = p_val.as_scalar()?;
+    if is_vec {
+        if p == 2.0 {
+            let sq: f64 = (0..m.len()).map(|i| m.get_linear_c(i).norm_sq()).sum();
+            Ok(sq.sqrt())
+        } else if p == 1.0 {
+            Ok((0..m.len()).map(|i| m.get_linear_c(i).abs()).sum())
+        } else if p == f64::INFINITY {
+            Ok((0..m.len())
+                .map(|i| m.get_linear_c(i).abs())
+                .fold(0.0_f64, f64::max))
+        } else if p == f64::NEG_INFINITY {
+            Ok((0..m.len())
+                .map(|i| m.get_linear_c(i).abs())
+                .fold(f64::INFINITY, f64::min))
+        } else {
+            let s: f64 = (0..m.len())
+                .map(|i| m.get_linear_c(i).abs().powf(p))
+                .sum();
+            Ok(s.powf(1.0 / p))
+        }
+    } else if p == 1.0 {
+        let mut mx = 0.0_f64;
+        for c in 0..m.cols() {
+            let cs: f64 = (0..m.rows()).map(|r| m.get_c(r, c).abs()).sum();
+            if cs > mx || cs.is_nan() {
+                mx = cs;
+            }
+        }
+        Ok(mx)
+    } else if p == f64::INFINITY {
+        let mut mx = 0.0_f64;
+        for r in 0..m.rows() {
+            let rs: f64 = (0..m.cols()).map(|c| m.get_c(r, c).abs()).sum();
+            if rs > mx || rs.is_nan() {
+                mx = rs;
+            }
+        }
+        Ok(mx)
+    } else if p == 2.0 {
+        let (_, s, _) = m.svd()?;
+        let k = s.rows().min(s.cols());
+        Ok(if k == 0 { 0.0 } else { s.get(0, 0) })
+    } else {
+        Err(MatroError::runtime(format!(
+            "norm: matrix norm only supports p = 1, 2, Inf, or 'fro' (got {p})"
+        )))
+    }
 }
 
 fn fn_norm(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("norm", "1", args.len()));
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity("norm", "1 or 2 (A [, p])", args.len()));
     }
-    let m = args[0].as_matrix()?;
-    let s: f64 = (0..m.len()).map(|i| m.get_linear_c(i).norm_sq()).sum();
-    ok1(Value::scalar(s.sqrt()))
+    let m = args[0].to_dense_matrix()?;
+    if args.len() == 2 {
+        return ok1(Value::scalar(matrix_norm_p(&m, &args[1])?));
+    }
+    if m.is_empty() {
+        return ok1(Value::scalar(0.0));
+    }
+    let is_vec = m.ndims() == 2 && (m.rows() == 1 || m.cols() == 1);
+    if is_vec {
+        let sq: f64 = (0..m.len()).map(|i| m.get_linear_c(i).norm_sq()).sum();
+        ok1(Value::scalar(sq.sqrt()))
+    } else {
+        let (_, s, _) = m.svd()?;
+        let k = s.rows().min(s.cols());
+        ok1(Value::scalar(if k == 0 { 0.0 } else { s.get(0, 0) }))
+    }
+}
+
+fn complex_gt(a: Complex, b: Complex) -> bool {
+    if a.im == 0.0 && b.im == 0.0 {
+        a.re > b.re
+    } else {
+        let ma = a.abs();
+        let mb = b.abs();
+        if (ma - mb).abs() > 1e-15 * ma.max(mb).max(1.0) {
+            ma > mb
+        } else {
+            a.arg() > b.arg()
+        }
+    }
+}
+
+fn complex_lt(a: Complex, b: Complex) -> bool {
+    if a.im == 0.0 && b.im == 0.0 {
+        a.re < b.re
+    } else {
+        let ma = a.abs();
+        let mb = b.abs();
+        if (ma - mb).abs() > 1e-15 * ma.max(mb).max(1.0) {
+            ma < mb
+        } else {
+            a.arg() < b.arg()
+        }
+    }
 }
 
 fn fn_minmax(name: &str, args: &[Value], nargout: usize, is_max: bool) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 4 {
-        return Err(MatroError::arity(name, "1 to 4", args.len()));
+    if args.is_empty() || args.len() > 5 {
+        return Err(MatroError::arity(name, "1 to 5", args.len()));
     }
     let m = args[0].to_dense_matrix()?;
-    // Element-wise min(A, B) / max(A, B) when 2nd arg is non-empty numeric and args.len() == 2
-    if args.len() == 2 && value_as_text(&args[1]).is_none() && !args[1].to_dense_matrix()?.is_empty() {
+    // Element-wise min(A, B [, nanflag]) when 2nd arg is non-empty numeric
+    let second_is_data = args.len() >= 2
+        && value_as_text(&args[1]).is_none()
+        && !args[1].to_dense_matrix()?.is_empty();
+    if second_is_data {
         let b = args[1].to_dense_matrix()?;
-        let out = m.elementwise(&b, |x, y| if is_max { x.max(y) } else { x.min(y) })?;
+        let mut omit_nan = true;
+        for a in &args[2..] {
+            if let Some(s) = value_as_text(a) {
+                match s.trim().to_ascii_lowercase().as_str() {
+                    "includenan" | "includemissing" => omit_nan = false,
+                    "omitnan" | "omitmissing" => omit_nan = true,
+                    _ => {}
+                }
+            }
+        }
+        let out = m.elementwise_c(&b, |x, y| {
+            let xn = x.re.is_nan() || x.im.is_nan();
+            let yn = y.re.is_nan() || y.im.is_nan();
+            if xn && yn {
+                return Complex::from_real(f64::NAN);
+            }
+            if xn {
+                return if omit_nan { y } else { Complex::from_real(f64::NAN) };
+            }
+            if yn {
+                return if omit_nan { x } else { Complex::from_real(f64::NAN) };
+            }
+            if (is_max && complex_gt(x, y)) || (!is_max && complex_lt(x, y)) {
+                x
+            } else {
+                y
+            }
+        })?;
         return ok1(Value::matrix(out));
-    }
-    if m.is_empty() {
-        return if nargout >= 2 {
-            Ok(vec![Value::empty(), Value::empty()])
-        } else {
-            ok1(Value::empty())
-        };
     }
 
     let mut all_mode = false;
     let mut omit_nan = true; // MATLAB default for min/max is 'omitnan'
-    let mut dim_opt: Option<usize> = None;
+    let mut vecdim_opt: Option<Vec<usize>> = None;
     for (idx, a) in args.iter().enumerate().skip(1) {
         if let Some(s) = value_as_text(a) {
             match s.trim().to_ascii_lowercase().as_str() {
@@ -2567,150 +3866,232 @@ fn fn_minmax(name: &str, args: &[Value], nargout: usize, is_max: bool) -> Result
                 "includenan" | "includemissing" => omit_nan = false,
                 _ => {}
             }
-        } else if idx >= 2 && !a.as_matrix()?.is_empty() {
-            dim_opt = Some(as_usize(a, name)?);
+        } else if idx >= 2 && !a.to_dense_matrix()?.is_empty() {
+            vecdim_opt = Some(parse_vecdim(a, name)?);
         }
     }
 
-    let best_in_slice = |xs: &[f64]| -> (f64, f64) {
-        if !omit_nan && xs.iter().any(|v| v.is_nan()) {
-            let nan_i = xs.iter().position(|v| v.is_nan()).unwrap_or(0);
-            return (f64::NAN, (nan_i + 1) as f64);
+    if m.is_empty() {
+        return if nargout >= 2 {
+            Ok(vec![Value::matrix(m.clone()), Value::matrix(Matrix::zeros_nd(m.dims()))])
+        } else {
+            ok1(Value::matrix(m))
+        };
+    }
+
+    let best_in_slice = |xs: &[Complex]| -> (Complex, f64) {
+        if !omit_nan {
+            if let Some(nan_i) = xs.iter().position(|c| c.re.is_nan() || c.im.is_nan()) {
+                return (Complex::from_real(f64::NAN), (nan_i + 1) as f64);
+            }
         }
-        let mut best_v = f64::NAN;
+        let mut best_v = Complex::from_real(f64::NAN);
         let mut best_i = 0usize;
+        let mut have = false;
         for (i, &v) in xs.iter().enumerate() {
-            if v.is_nan() {
+            if v.re.is_nan() || v.im.is_nan() {
                 continue;
             }
-            if best_v.is_nan() || (is_max && v > best_v) || (!is_max && v < best_v) {
+            if !have || (is_max && complex_gt(v, best_v)) || (!is_max && complex_lt(v, best_v)) {
                 best_v = v;
                 best_i = i;
+                have = true;
             }
         }
         (best_v, (best_i + 1) as f64)
     };
 
-    if all_mode || (dim_opt.is_none() && (m.rows() == 1 || m.cols() == 1)) {
-        let (v, idx) = best_in_slice(m.data());
+    let m_dims = m.dims();
+    let is_vec = m.ndims() == 2 && (m.rows() == 1 || m.cols() == 1);
+    if all_mode || (vecdim_opt.is_none() && is_vec) {
+        let vals: Vec<Complex> = (0..m.len()).map(|i| m.get_linear_c(i)).collect();
+        let (v, idx) = best_in_slice(&vals);
         return if nargout >= 2 {
-            Ok(vec![Value::scalar(v), Value::scalar(idx)])
+            Ok(vec![
+                Value::matrix(Matrix::complex_scalar(v).normalize()),
+                Value::scalar(idx),
+            ])
         } else {
-            ok1(Value::scalar(v))
+            ok1(Value::matrix(Matrix::complex_scalar(v).normalize()))
         };
     }
-    let dim = dim_opt.unwrap_or(1);
-    if dim == 1 {
-        let mut vals = Vec::with_capacity(m.cols());
-        let mut idxs = Vec::with_capacity(m.cols());
-        for c in 0..m.cols() {
-            let col: Vec<f64> = (0..m.rows()).map(|r| m.get(r, c)).collect();
-            let (v, idx) = best_in_slice(&col);
-            vals.push(v);
-            idxs.push(idx);
+
+    let target_dims = vecdim_opt
+        .unwrap_or_else(|| vec![m_dims.iter().position(|&d| d != 1).map_or(1, |i| i + 1)]);
+    if target_dims.len() == 1 {
+        let dim = target_dims[0];
+        let ax = dim - 1;
+        if ax >= m_dims.len() {
+            return if nargout >= 2 {
+                Ok(vec![
+                    Value::matrix(m),
+                    Value::matrix(Matrix::ones_nd(m_dims)),
+                ])
+            } else {
+                ok1(Value::matrix(m))
+            };
         }
+        let inner: usize = m_dims[..ax].iter().product();
+        let axis_len = m_dims[ax];
+        let outer: usize = m_dims[ax + 1..].iter().product();
+        let mut out_dims = m_dims.clone();
+        out_dims[ax] = 1;
+        let out_total = inner * outer;
+        let mut out_re = Vec::with_capacity(out_total);
+        let mut out_im = Vec::with_capacity(out_total);
+        let mut out_idx = Vec::with_capacity(out_total);
+        let mut buf = Vec::with_capacity(axis_len);
+        for o in 0..outer {
+            let block = o * axis_len * inner;
+            for i in 0..inner {
+                buf.clear();
+                for k in 0..axis_len {
+                    buf.push(m.get_linear_c(block + k * inner + i));
+                }
+                let (v, idx) = best_in_slice(&buf);
+                out_re.push(v.re);
+                out_im.push(v.im);
+                out_idx.push(idx);
+            }
+        }
+        let v_mat = Matrix::from_nd_complex_col_major(out_dims.clone(), out_re, out_im)?.normalize();
         if nargout >= 2 {
-            Ok(vec![
-                Value::matrix(Matrix::row_vec(vals)),
-                Value::matrix(Matrix::row_vec(idxs)),
-            ])
-        } else {
-            ok1(Value::matrix(Matrix::row_vec(vals)))
+            let i_mat = Matrix::from_nd_col_major(out_dims, out_idx)?;
+            return Ok(vec![Value::matrix(v_mat), Value::matrix(i_mat)]);
         }
-    } else if dim == 2 {
-        let mut vals = Vec::with_capacity(m.rows());
-        let mut idxs = Vec::with_capacity(m.rows());
-        for r in 0..m.rows() {
-            let row: Vec<f64> = (0..m.cols()).map(|c| m.get(r, c)).collect();
-            let (v, idx) = best_in_slice(&row);
-            vals.push(v);
-            idxs.push(idx);
-        }
-        if nargout >= 2 {
-            Ok(vec![
-                Value::matrix(Matrix::col_vec(vals)),
-                Value::matrix(Matrix::col_vec(idxs)),
-            ])
-        } else {
-            ok1(Value::matrix(Matrix::col_vec(vals)))
-        }
-    } else {
-        Err(MatroError::runtime(format!("{name}: unsupported dimension {dim}")))
+        return ok1(Value::matrix(v_mat));
     }
+
+    // Multi-axis vecdim reduction
+    let mut cur = m;
+    for dim in target_dims {
+        let cur_dims = cur.dims();
+        let ax = dim - 1;
+        if ax >= cur_dims.len() {
+            continue;
+        }
+        let inner: usize = cur_dims[..ax].iter().product();
+        let axis_len = cur_dims[ax];
+        let outer: usize = cur_dims[ax + 1..].iter().product();
+        let mut out_dims = cur_dims.clone();
+        out_dims[ax] = 1;
+        let out_total = inner * outer;
+        let mut out_re = Vec::with_capacity(out_total);
+        let mut out_im = Vec::with_capacity(out_total);
+        let mut buf = Vec::with_capacity(axis_len);
+        for o in 0..outer {
+            let block = o * axis_len * inner;
+            for i in 0..inner {
+                buf.clear();
+                for k in 0..axis_len {
+                    buf.push(cur.get_linear_c(block + k * inner + i));
+                }
+                let (v, _) = best_in_slice(&buf);
+                out_re.push(v.re);
+                out_im.push(v.im);
+            }
+        }
+        cur = Matrix::from_nd_complex_col_major(out_dims, out_re, out_im)?.normalize();
+    }
+    ok1(Value::matrix(cur))
 }
 
 fn fn_reduce_c(name: &str, args: &[Value], op: impl Fn(&[Complex]) -> Complex) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 3 {
-        return Err(MatroError::arity(name, "1 to 3", args.len()));
+    if args.is_empty() || args.len() > 4 {
+        return Err(MatroError::arity(name, "1 to 4", args.len()));
     }
     let m = args[0].to_dense_matrix()?;
-    if m.is_empty() {
-        return ok1(Value::scalar(0.0));
-    }
     let mut all_mode = false;
     let mut omit_nan = false;
-    let mut dim_opt: Option<usize> = None;
+    let mut vecdim_opt: Option<Vec<usize>> = None;
     for a in &args[1..] {
         if let Some(s) = value_as_text(a) {
             match s.trim().to_ascii_lowercase().as_str() {
                 "all" => all_mode = true,
                 "omitnan" | "omitmissing" => omit_nan = true,
+                "includenan" | "includemissing" => omit_nan = false,
+                "double" | "default" | "native" => {}
                 _ => {}
             }
         } else {
-            dim_opt = Some(as_usize(a, name)?);
+            vecdim_opt = Some(parse_vecdim(a, name)?);
         }
     }
-    let apply = |vals: Vec<Complex>| -> Complex {
+    let apply = |vals: &[Complex]| -> Complex {
         if omit_nan {
             let filtered: Vec<Complex> = vals
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|c| !c.re.is_nan() && !c.im.is_nan())
                 .collect();
             op(&filtered)
         } else {
-            op(&vals)
+            op(vals)
         }
     };
-    if all_mode || (dim_opt.is_none() && (m.rows() == 1 || m.cols() == 1)) {
+    let m_dims = m.dims();
+    if all_mode || (vecdim_opt.is_none() && m.ndims() == 2 && (m.rows() == 1 || m.cols() == 1 || (m.rows() == 0 && m.cols() == 0))) {
         let vals: Vec<Complex> = (0..m.len()).map(|i| m.get_linear_c(i)).collect();
-        return ok1(Value::matrix(Matrix::complex_scalar(apply(vals)).normalize()));
+        return ok1(Value::matrix(Matrix::complex_scalar(apply(&vals)).normalize()));
     }
-    let dim = dim_opt.unwrap_or(1);
-    if dim == 1 {
-        let mut out = Vec::with_capacity(m.cols());
-        for c in 0..m.cols() {
-            let col: Vec<Complex> = (0..m.rows()).map(|r| m.get_c(r, c)).collect();
-            out.push(apply(col));
+    let target_dims = vecdim_opt
+        .unwrap_or_else(|| vec![m_dims.iter().position(|&d| d != 1).map_or(1, |i| i + 1)]);
+    // For mean over multiple axes, compute sum / count in one pass across all reduced axes so empty/omitnan weights stay exact
+    let nd = m_dims.len();
+    let mut reduce_mask = vec![false; nd];
+    for &d in &target_dims {
+        if d >= 1 && d <= nd {
+            reduce_mask[d - 1] = true;
         }
-        ok1(Value::matrix(Matrix::complex_row_vec(out).normalize()))
-    } else if dim == 2 {
-        let mut out = Vec::with_capacity(m.rows());
-        for r in 0..m.rows() {
-            let row: Vec<Complex> = (0..m.cols()).map(|c| m.get_c(r, c)).collect();
-            out.push(apply(row));
+    }
+    let mut out_dims = m_dims.clone();
+    for ax in 0..nd {
+        if reduce_mask[ax] {
+            out_dims[ax] = 1;
         }
-        ok1(Value::matrix(Matrix::complex_col_vec(out).normalize()))
-    } else {
-        Err(MatroError::runtime(format!("{name}: unsupported dimension {dim}")))
     }
-}
-
-fn fn_elem1(name: &str, args: &[Value], f: fn(f64) -> f64) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity(name, "1", args.len()));
+    let out_total: usize = out_dims.iter().product();
+    let mut buckets: Vec<Vec<Complex>> = vec![Vec::new(); out_total];
+    let mut out_strides = vec![1usize; nd];
+    for ax in 1..nd {
+        out_strides[ax] = out_strides[ax - 1] * out_dims[ax - 1];
     }
-    let m = args[0].as_matrix()?;
-    ok1(Value::matrix(m.map(f)))
+    let mut coord = vec![0usize; nd];
+    for lin in 0..m.len() {
+        let mut dst = 0usize;
+        for ax in 0..nd {
+            if !reduce_mask[ax] {
+                dst += coord[ax] * out_strides[ax];
+            }
+        }
+        buckets[dst].push(m.get_linear_c(lin));
+        for ax in 0..nd {
+            coord[ax] += 1;
+            if coord[ax] < m_dims[ax] {
+                break;
+            }
+            coord[ax] = 0;
+        }
+    }
+    let mut out_re = Vec::with_capacity(out_total);
+    let mut out_im = Vec::with_capacity(out_total);
+    for b in &buckets {
+        let v = apply(b);
+        out_re.push(v.re);
+        out_im.push(v.im);
+    }
+    ok1(Value::matrix(
+        Matrix::from_nd_complex_col_major(out_dims, out_re, out_im)?.normalize(),
+    ))
 }
 
 fn fn_elem2(name: &str, args: &[Value], f: fn(f64, f64) -> f64) -> Result<Vec<Value>> {
     if args.len() != 2 {
         return Err(MatroError::arity(name, "2", args.len()));
     }
-    let a = args[0].as_matrix()?;
-    let b = args[1].as_matrix()?;
-    ok1(Value::matrix(a.elementwise(b, f)?))
+    let a = args[0].to_dense_matrix()?;
+    let b = args[1].to_dense_matrix()?;
+    ok1(Value::matrix(a.elementwise(&b, f)?))
 }
 
 fn fn_disp(args: &[Value], stdout: &mut String) -> Result<Vec<Value>> {
@@ -2721,95 +4102,354 @@ fn fn_disp(args: &[Value], stdout: &mut String) -> Result<Vec<Value>> {
     Ok(vec![])
 }
 
-fn fn_fprintf(args: &[Value], stdout: &mut String) -> Result<Vec<Value>> {
+fn fn_fprintf(args: &[Value], nargout: usize, stdout: &mut String) -> Result<Vec<Value>> {
     if args.is_empty() {
         return Err(MatroError::arity("fprintf", ">= 1", 0));
     }
-    stdout.push_str(&format_printf(args)?);
-    Ok(vec![])
+    // Support fprintf(1, fmt, ...) / fprintf(2, fmt, ...)
+    let fmt_args = if args.len() >= 2 && value_as_text(&args[0]).is_none() {
+        let fid = args[0].as_scalar()?;
+        if (fid - 1.0).abs() < 1e-12 || (fid - 2.0).abs() < 1e-12 {
+            &args[1..]
+        } else {
+            return Err(MatroError::runtime(format!(
+                "fprintf: invalid file identifier {fid}"
+            )));
+        }
+    } else {
+        args
+    };
+    let s = format_printf(fmt_args)?;
+    let nbytes = s.len();
+    stdout.push_str(&s);
+    if nargout >= 1 {
+        ok1(Value::scalar(nbytes as f64))
+    } else {
+        Ok(vec![])
+    }
+}
+
+fn format_g_value(v: f64, sig: usize, upper: bool) -> String {
+    if !v.is_finite() {
+        return format!("{v}");
+    }
+    let p = sig.max(1);
+    if v == 0.0 {
+        return "0".to_string();
+    }
+    let exp = v.abs().log10().floor() as i32;
+    let s = if exp < -4 || exp >= (p as i32) {
+        let dec = p.saturating_sub(1);
+        let raw = if upper {
+            format!("{v:.dec$E}")
+        } else {
+            format!("{v:.dec$e}")
+        };
+        // Strip trailing zeros in mantissa before e/E
+        let e_char = if upper { 'E' } else { 'e' };
+        if let Some(pos) = raw.find(e_char) {
+            let mant = raw[..pos].trim_end_matches('0').trim_end_matches('.');
+            let exp_part = &raw[pos + 1..];
+            let exp_num: i32 = exp_part.parse().unwrap_or(0);
+            format!("{mant}{e_char}{exp_num:+03}")
+        } else {
+            raw
+        }
+    } else {
+        let dec = (p as i32 - 1 - exp).max(0) as usize;
+        let raw = format!("{v:.dec$}");
+        if raw.contains('.') {
+            raw.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            raw
+        }
+    };
+    s
+}
+
+enum PrintfAtom {
+    Num(f64),
+    Str(String),
+}
+
+fn flatten_printf_atoms(args: &[Value]) -> Vec<PrintfAtom> {
+    let mut atoms = Vec::new();
+    for v in args {
+        match v {
+            Value::Matrix(m) => {
+                for &x in m.data() {
+                    atoms.push(PrintfAtom::Num(x));
+                }
+            }
+            Value::Sparse(s) => {
+                let d = s.to_dense();
+                for &x in d.data() {
+                    atoms.push(PrintfAtom::Num(x));
+                }
+            }
+            Value::String(s) => atoms.push(PrintfAtom::Str(s.clone())),
+            Value::Object(o) if o.class_name == "string" => {
+                if let Some(Value::Cell(c)) = o.fields.get("Data") {
+                    for item in &c.data {
+                        atoms.push(PrintfAtom::Str(
+                            value_as_text(item).unwrap_or_else(|| format!("{item}")),
+                        ));
+                    }
+                }
+            }
+            other => atoms.push(PrintfAtom::Str(format!("{other}"))),
+        }
+    }
+    atoms
+}
+
+fn apply_width_pad(s: String, width: Option<usize>, left_align: bool, zero_pad: bool) -> String {
+    let Some(w) = width else {
+        return s;
+    };
+    let len = s.chars().count();
+    if len >= w {
+        return s;
+    }
+    let pad = w - len;
+    if left_align {
+        format!("{s}{}", " ".repeat(pad))
+    } else if zero_pad && !s.contains("NaN") && !s.contains("Inf") {
+        if let Some(rest) = s.strip_prefix('-').or_else(|| s.strip_prefix('+')).or_else(|| s.strip_prefix(' ')) {
+            let sign = &s[..1];
+            format!("{sign}{}{rest}", "0".repeat(pad))
+        } else {
+            format!("{}{s}", "0".repeat(pad))
+        }
+    } else {
+        format!("{}{s}", " ".repeat(pad))
+    }
 }
 
 pub fn format_printf(args: &[Value]) -> Result<String> {
-    let fmt_str = args[0].as_str()?;
-    let mut out = String::new();
-    let mut arg_idx = 1usize;
+    let fmt_str = value_as_text(&args[0])
+        .ok_or_else(|| MatroError::runtime("printf: format specifier must be a string"))?;
+    let atoms = flatten_printf_atoms(&args[1..]);
     let chars: Vec<char> = fmt_str.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '\\' && i + 1 < chars.len() {
-            match chars[i + 1] {
-                'n' => out.push('\n'),
-                't' => out.push('\t'),
-                'r' => out.push('\r'),
-                '\\' => out.push('\\'),
-                other => {
-                    out.push('\\');
-                    out.push(other);
+    let mut out = String::new();
+    let mut atom_idx = 0usize;
+
+    loop {
+        let start_atom = atom_idx;
+        let mut i = 0usize;
+        while i < chars.len() {
+            if chars[i] == '\\' && i + 1 < chars.len() {
+                match chars[i + 1] {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    'r' => out.push('\r'),
+                    '\\' => out.push('\\'),
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                    }
                 }
-            }
-            i += 2;
-        } else if chars[i] == '%' && i + 1 < chars.len() {
-            if chars[i + 1] == '%' {
-                out.push('%');
                 i += 2;
-                continue;
-            }
-            let mut j = i + 1;
-            let mut precision: Option<usize> = None;
-            while j < chars.len()
-                && (chars[j].is_ascii_digit() || chars[j] == '.' || chars[j] == '-')
-            {
-                if chars[j] == '.' {
-                    let p_start = j + 1;
-                    let mut p_end = p_start;
-                    while p_end < chars.len() && chars[p_end].is_ascii_digit() {
-                        p_end += 1;
-                    }
-                    if p_end > p_start {
-                        let s: String = chars[p_start..p_end].iter().collect();
-                        precision = s.parse().ok();
-                    }
-                    j = p_end;
-                    break;
+            } else if chars[i] == '%' && i + 1 < chars.len() {
+                if chars[i + 1] == '%' {
+                    out.push('%');
+                    i += 2;
+                    continue;
                 }
-                j += 1;
-            }
-            let spec = chars.get(j).copied().unwrap_or('s');
-            if let Some(val) = args.get(arg_idx) {
-                arg_idx += 1;
-                match spec {
-                    'd' | 'i' => out.push_str(&format!("{}", val.as_scalar()?.round() as i64)),
-                    'f' | 'g' => {
-                        let v = val.as_scalar()?;
-                        if let Some(p) = precision {
-                            out.push_str(&format!("{v:.p$}"));
-                        } else {
-                            out.push_str(&format!("{v}"));
-                        }
+                let mut j = i + 1;
+                let mut left_align = false;
+                let mut plus_sign = false;
+                let mut space_sign = false;
+                let mut zero_pad = false;
+                let mut alt_form = false;
+                while j < chars.len() {
+                    match chars[j] {
+                        '-' => left_align = true,
+                        '+' => plus_sign = true,
+                        ' ' => space_sign = true,
+                        '0' => zero_pad = true,
+                        '#' => alt_form = true,
+                        _ => break,
                     }
-                    'e' => {
-                        let v = val.as_scalar()?;
-                        if let Some(p) = precision {
-                            out.push_str(&format!("{v:.p$e}"));
-                        } else {
-                            out.push_str(&format!("{v:e}"));
-                        }
-                    }
-                    'E' => {
-                        let v = val.as_scalar()?;
-                        if let Some(p) = precision {
-                            out.push_str(&format!("{v:.p$E}"));
-                        } else {
-                            out.push_str(&format!("{v:E}"));
-                        }
-                    }
-                    _ => out.push_str(&format!("{val}")),
+                    j += 1;
                 }
+                let mut width: Option<usize> = None;
+                if j < chars.len() && chars[j] == '*' {
+                    if let Some(PrintfAtom::Num(w)) = atoms.get(atom_idx) {
+                        atom_idx += 1;
+                        let wi = w.round() as isize;
+                        if wi < 0 {
+                            left_align = true;
+                            width = Some((-wi) as usize);
+                        } else {
+                            width = Some(wi as usize);
+                        }
+                    }
+                    j += 1;
+                } else {
+                    let w_start = j;
+                    while j < chars.len() && chars[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if j > w_start {
+                        let s: String = chars[w_start..j].iter().collect();
+                        width = s.parse().ok();
+                    }
+                }
+                let mut precision: Option<usize> = None;
+                if j < chars.len() && chars[j] == '.' {
+                    j += 1;
+                    if j < chars.len() && chars[j] == '*' {
+                        if let Some(PrintfAtom::Num(p)) = atoms.get(atom_idx) {
+                            atom_idx += 1;
+                            precision = Some(p.max(0.0).round() as usize);
+                        }
+                        j += 1;
+                    } else {
+                        let p_start = j;
+                        while j < chars.len() && chars[j].is_ascii_digit() {
+                            j += 1;
+                        }
+                        if j > p_start {
+                            let s: String = chars[p_start..j].iter().collect();
+                            precision = s.parse().ok();
+                        } else {
+                            precision = Some(0);
+                        }
+                    }
+                }
+                // Optional length modifier (l, h, etc.)
+                while j < chars.len() && matches!(chars[j], 'l' | 'h' | 'b' | 't') {
+                    j += 1;
+                }
+                let spec = chars.get(j).copied().unwrap_or('s');
+                if atom_idx >= atoms.len() {
+                    return Ok(out);
+                }
+                let atom = &atoms[atom_idx];
+                atom_idx += 1;
+                let sign_prefix = |v: f64, body: String| -> String {
+                    if v >= 0.0 && !v.is_nan() && !body.starts_with('-') {
+                        if plus_sign {
+                            return format!("+{body}");
+                        } else if space_sign {
+                            return format!(" {body}");
+                        }
+                    }
+                    body
+                };
+                let formatted = match spec {
+                    'd' | 'i' => {
+                        let v = match atom {
+                            PrintfAtom::Num(x) => *x,
+                            PrintfAtom::Str(s) => s.chars().next().map_or(0.0, |c| c as u32 as f64),
+                        };
+                        let iv = v.round() as i64;
+                        let body = sign_prefix(v, format!("{iv}"));
+                        apply_width_pad(body, width, left_align, zero_pad)
+                    }
+                    'u' => {
+                        let v = match atom {
+                            PrintfAtom::Num(x) => *x,
+                            PrintfAtom::Str(s) => s.chars().next().map_or(0.0, |c| c as u32 as f64),
+                        };
+                        apply_width_pad(format!("{}", v.max(0.0).round() as u64), width, left_align, zero_pad)
+                    }
+                    'x' | 'X' => {
+                        let v = match atom {
+                            PrintfAtom::Num(x) => *x,
+                            PrintfAtom::Str(s) => s.chars().next().map_or(0.0, |c| c as u32 as f64),
+                        };
+                        let u = v.max(0.0).round() as u64;
+                        let raw = if spec == 'X' {
+                            if alt_form && u != 0 { format!("0X{u:X}") } else { format!("{u:X}") }
+                        } else if alt_form && u != 0 {
+                            format!("0x{u:x}")
+                        } else {
+                            format!("{u:x}")
+                        };
+                        apply_width_pad(raw, width, left_align, zero_pad)
+                    }
+                    'o' => {
+                        let v = match atom {
+                            PrintfAtom::Num(x) => *x,
+                            PrintfAtom::Str(s) => s.chars().next().map_or(0.0, |c| c as u32 as f64),
+                        };
+                        let u = v.max(0.0).round() as u64;
+                        let raw = if alt_form && u != 0 { format!("0{u:o}") } else { format!("{u:o}") };
+                        apply_width_pad(raw, width, left_align, zero_pad)
+                    }
+                    'f' | 'F' => {
+                        let v = match atom {
+                            PrintfAtom::Num(x) => *x,
+                            PrintfAtom::Str(s) => s.parse().unwrap_or(f64::NAN),
+                        };
+                        let p = precision.unwrap_or(6);
+                        let body = sign_prefix(v, format!("{v:.p$}"));
+                        apply_width_pad(body, width, left_align, zero_pad)
+                    }
+                    'g' | 'G' => {
+                        let v = match atom {
+                            PrintfAtom::Num(x) => *x,
+                            PrintfAtom::Str(s) => s.parse().unwrap_or(f64::NAN),
+                        };
+                        let p = precision.unwrap_or(6);
+                        let body = sign_prefix(v, format_g_value(v, p, spec == 'G'));
+                        apply_width_pad(body, width, left_align, zero_pad)
+                    }
+                    'e' | 'E' => {
+                        let v = match atom {
+                            PrintfAtom::Num(x) => *x,
+                            PrintfAtom::Str(s) => s.parse().unwrap_or(f64::NAN),
+                        };
+                        let p = precision.unwrap_or(6);
+                        let raw = if spec == 'E' {
+                            format!("{v:.p$E}")
+                        } else {
+                            format!("{v:.p$e}")
+                        };
+                        let e_ch = if spec == 'E' { 'E' } else { 'e' };
+                        let nice = if let Some(pos) = raw.find(e_ch) {
+                            let mant = &raw[..pos];
+                            let exp_num: i32 = raw[pos + 1..].parse().unwrap_or(0);
+                            format!("{mant}{e_ch}{exp_num:+03}")
+                        } else {
+                            raw
+                        };
+                        let body = sign_prefix(v, nice);
+                        apply_width_pad(body, width, left_align, zero_pad)
+                    }
+                    'c' => {
+                        let ch = match atom {
+                            PrintfAtom::Num(x) => char::from_u32(x.max(0.0).round() as u32).unwrap_or(' '),
+                            PrintfAtom::Str(s) => s.chars().next().unwrap_or(' '),
+                        };
+                        apply_width_pad(ch.to_string(), width, left_align, false)
+                    }
+                    's' => {
+                        let mut s = match atom {
+                            PrintfAtom::Str(st) => st.clone(),
+                            PrintfAtom::Num(x) => format!("{x}"),
+                        };
+                        if let Some(p) = precision {
+                            s = s.chars().take(p).collect();
+                        }
+                        apply_width_pad(s, width, left_align, false)
+                    }
+                    _ => match atom {
+                        PrintfAtom::Str(st) => st.clone(),
+                        PrintfAtom::Num(x) => format!("{x}"),
+                    },
+                };
+                out.push_str(&formatted);
+                i = j + 1;
+            } else {
+                out.push(chars[i]);
+                i += 1;
             }
-            i = j + 1;
-        } else {
-            out.push(chars[i]);
-            i += 1;
+        }
+        if atom_idx >= atoms.len() || atom_idx == start_atom {
+            break;
         }
     }
     Ok(out)
@@ -2889,19 +4529,41 @@ fn fn_path(args: &[Value], loader: &mut ModuleLoader) -> Result<Vec<Value>> {
 }
 
 fn fn_csvread(args: &[Value], loader: &ModuleLoader) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity("csvread", "1", args.len()));
+    if args.is_empty() || args.len() > 4 {
+        return Err(MatroError::arity("csvread", "1 to 4 (file [, R1, C1 [, range]])", args.len()));
     }
-    let m = loader.read_csv(args[0].as_str()?)?;
-    ok1(Value::matrix(m))
+    if args.len() == 1 {
+        let m = loader.read_csv(args[0].as_str()?)?;
+        return ok1(Value::matrix(m));
+    }
+    let mut dargs = Vec::with_capacity(args.len() + 1);
+    dargs.push(args[0].clone());
+    dargs.push(Value::String(",".to_string()));
+    dargs.extend_from_slice(&args[1..]);
+    fs_media::fn_dlmread(&dargs, loader)
 }
 
 fn fn_csvwrite(args: &[Value], loader: &mut ModuleLoader) -> Result<Vec<Value>> {
-    if args.len() != 2 {
-        return Err(MatroError::arity("csvwrite", "2", args.len()));
+    if args.len() < 2 || args.len() > 4 {
+        return Err(MatroError::arity("csvwrite", "2 to 4 (file, M [, R1, C1])", args.len()));
     }
-    loader.write_csv(args[0].as_str()?, args[1].as_matrix()?)?;
-    Ok(vec![])
+    if args.len() == 2 {
+        loader.write_csv(args[0].as_str()?, &args[1].to_dense_matrix()?)?;
+        return Ok(vec![]);
+    }
+    let mut dargs = vec![
+        args[0].clone(),
+        args[1].clone(),
+        Value::String("delimiter".to_string()),
+        Value::String(",".to_string()),
+        Value::String("roffset".to_string()),
+        args[2].clone(),
+    ];
+    if args.len() >= 4 {
+        dargs.push(Value::String("coffset".to_string()));
+        dargs.push(args[3].clone());
+    }
+    fs_media::fn_dlmwrite(&dargs, loader)
 }
 
 fn fn_fileread(args: &[Value], loader: &ModuleLoader) -> Result<Vec<Value>> {

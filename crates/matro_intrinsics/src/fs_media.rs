@@ -122,6 +122,12 @@ pub fn fn_set(args: &[Value], fig: &mut PlotFigure) -> Result<Vec<Value>> {
                     "displayname" => ser.label = Some(val.as_str()?.to_string()),
                     "xdata" => ser.x = val.to_dense_matrix()?.data().to_vec(),
                     "ydata" => ser.y = val.to_dense_matrix()?.data().to_vec(),
+                    // Accept standard MATLAB Line properties without crashing
+                    "marker" | "markersize" | "markerfacecolor" | "markeredgecolor"
+                    | "visible" | "handlevisibility" | "tag" | "userdata" | "clipping"
+                    | "linewidthstyle" | "alignvertexcenters" | "hittest" | "pickableparts"
+                    | "selected" | "selectionhighlight" | "busyaction" | "interruptible"
+                    | "linejoin" | "zdata" => {}
                     _ => {
                         return Err(MatroError::runtime(format!(
                             "set: unknown Line property '{}'",
@@ -161,6 +167,20 @@ pub fn fn_set(args: &[Value], fig: &mut PlotFigure) -> Result<Vec<Value>> {
                 "xgrid" | "ygrid" | "grid" => {
                     panel.grid = val.as_str()?.eq_ignore_ascii_case("on");
                 }
+                // Accept standard MATLAB Axes properties without crashing
+                "fontsize" | "fontname" | "fontweight" | "fontangle" | "fontunits"
+                | "box" | "tickdir" | "ticklength" | "ticklabelinterpreter"
+                | "xtick" | "ytick" | "ztick" | "xticklabel" | "yticklabel" | "zticklabel"
+                | "xticklabelrotation" | "yticklabelrotation" | "xminortick" | "yminortick"
+                | "zminortick" | "xminorgrid" | "yminorgrid" | "zminorgrid" | "zgrid"
+                | "xdir" | "ydir" | "zdir" | "xcolor" | "ycolor" | "zcolor"
+                | "xaxislocation" | "yaxislocation" | "color" | "colororder"
+                | "linestyleorder" | "linewidth" | "gridcolor" | "gridalpha"
+                | "gridlinestyle" | "minorgridlinestyle" | "minorgridalpha" | "layer"
+                | "position" | "outerposition" | "innerposition" | "units" | "visible"
+                | "nextplot" | "dataaspectratio" | "plotboxaspectratio" | "clim"
+                | "colormap" | "view" | "tag" | "userdata" | "clipping"
+                | "handlevisibility" | "zscale" => {}
                 _ => {
                     return Err(MatroError::runtime(format!(
                         "set: unknown Axes property '{}'",
@@ -273,6 +293,7 @@ pub fn fn_fileparts(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
     }
     let raw = args[0].as_str()?.replace('\\', "/");
     let (dir, file) = match raw.rfind('/') {
+        Some(0) => ("/", &raw[1..]),
         Some(pos) => (&raw[..pos], &raw[pos + 1..]),
         None => ("", raw.as_str()),
     };
@@ -368,10 +389,26 @@ pub fn fn_dir(
     for f in matched {
         let mut entry = BTreeMap::new();
         let bytes = loader.vfs().read_bytes(&f).map_or(0, |b| b.len());
-        entry.insert("name".to_string(), Value::String(f.clone()));
-        entry.insert("folder".to_string(), Value::String(loader.vfs().cwd()));
+        let (parent, base) = match f.rfind('/') {
+            Some(pos) => (&f[..pos], &f[pos + 1..]),
+            None => ("", f.as_str()),
+        };
+        let folder = if parent.is_empty() {
+            loader.vfs().cwd()
+        } else {
+            let cwd = loader.vfs().cwd();
+            if cwd.is_empty() || cwd == "/" {
+                format!("/{parent}")
+            } else {
+                format!("{}/{parent}", cwd.trim_end_matches('/'))
+            }
+        };
+        entry.insert("name".to_string(), Value::String(base.to_string()));
+        entry.insert("folder".to_string(), Value::String(folder));
+        entry.insert("date".to_string(), Value::String("01-Jan-2026 00:00:00".to_string()));
         entry.insert("bytes".to_string(), Value::scalar(bytes as f64));
         entry.insert("isdir".to_string(), Value::bool(loader.vfs().is_dir(&f)));
+        entry.insert("datenum".to_string(), Value::scalar(740000.0));
         items.push(entry);
     }
     let len = items.len();
@@ -420,11 +457,398 @@ pub fn fn_cd(args: &[Value], loader: &mut ModuleLoader) -> Result<Vec<Value>> {
 }
 
 pub fn fn_mkdir(args: &[Value], loader: &mut ModuleLoader) -> Result<Vec<Value>> {
-    if args.is_empty() {
-        return Err(MatroError::arity("mkdir", "1 (folderName)", 0));
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity("mkdir", "1 or 2 ([parent,] folderName)", args.len()));
     }
-    loader.vfs_mut().mkdir(args[0].as_str()?)?;
+    let path = if args.len() == 2 {
+        let p = args[0].as_str()?.trim_end_matches('/');
+        let c = args[1].as_str()?.trim_start_matches('/');
+        format!("{p}/{c}")
+    } else {
+        args[0].as_str()?.to_string()
+    };
+    loader.vfs_mut().mkdir(&path)?;
     ok1(Value::bool(true))
+}
+
+pub fn fn_rmdir(args: &[Value], loader: &mut ModuleLoader) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity("rmdir", "1 or 2 (folderName [, 's'])", args.len()));
+    }
+    let dir = args[0].as_str()?.trim_end_matches('/');
+    let recursive = args
+        .get(1)
+        .and_then(|v| v.as_str().ok())
+        .is_some_and(|s| s.eq_ignore_ascii_case("s"));
+    let prefix = format!("{dir}/");
+    let children: Vec<String> = loader
+        .vfs()
+        .list_files()
+        .into_iter()
+        .filter(|f| f.starts_with(&prefix))
+        .collect();
+    if !children.is_empty() && !recursive {
+        return Err(MatroError::runtime(format!(
+            "rmdir: directory '{dir}' is not empty; pass 's' to remove recursively"
+        )));
+    }
+    for f in children {
+        loader.vfs_mut().remove(&f);
+    }
+    loader.vfs_mut().remove(dir);
+    ok1(Value::bool(true))
+}
+
+fn parse_delimited_matrix(
+    text: &str,
+    delimiter: Option<char>,
+    r1: usize,
+    c1: usize,
+    r2: Option<usize>,
+    c2: Option<usize>,
+) -> Result<Matrix> {
+    let mut rows_data: Vec<Vec<f64>> = Vec::new();
+    let mut max_cols = 0usize;
+    for (line_idx, raw_line) in text.lines().enumerate() {
+        if line_idx < r1 {
+            continue;
+        }
+        if let Some(end_r) = r2 {
+            if line_idx > end_r {
+                break;
+            }
+        }
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let tokens: Vec<&str> = match delimiter {
+            Some(d) => trimmed.split(d).map(str::trim).collect(),
+            None => {
+                if trimmed.contains(',') {
+                    trimmed.split(',').map(str::trim).collect()
+                } else if trimmed.contains('\t') {
+                    trimmed.split('\t').map(str::trim).collect()
+                } else if trimmed.contains(';') {
+                    trimmed.split(';').map(str::trim).collect()
+                } else {
+                    trimmed.split_whitespace().collect()
+                }
+            }
+        };
+        let end_c = c2.map_or(tokens.len(), |c| (c + 1).min(tokens.len()));
+        if c1 >= end_c {
+            continue;
+        }
+        let mut row = Vec::with_capacity(end_c - c1);
+        let mut any_num = false;
+        for tok in &tokens[c1..end_c] {
+            if tok.is_empty() {
+                row.push(f64::NAN);
+            } else if let Ok(v) = tok.parse::<f64>() {
+                any_num = true;
+                row.push(v);
+            } else {
+                row.push(f64::NAN);
+            }
+        }
+        // Skip leading header lines that have zero numeric tokens if we haven't read any data yet
+        if !any_num && rows_data.is_empty() && r1 == 0 {
+            continue;
+        }
+        max_cols = max_cols.max(row.len());
+        rows_data.push(row);
+    }
+    if rows_data.is_empty() || max_cols == 0 {
+        return Ok(Matrix::zeros(0, 0));
+    }
+    let nr = rows_data.len();
+    let mut out = Matrix::zeros(nr, max_cols);
+    for (r, row) in rows_data.iter().enumerate() {
+        for c in 0..max_cols {
+            let v = row.get(c).copied().unwrap_or(0.0);
+            out.set(r, c, v);
+        }
+    }
+    Ok(out)
+}
+
+pub fn fn_readmatrix(args: &[Value], loader: &ModuleLoader) -> Result<Vec<Value>> {
+    if args.is_empty() {
+        return Err(MatroError::arity("readmatrix", ">= 1 (filename [, NV...])", 0));
+    }
+    let path = args[0].as_str()?;
+    let resolved = loader.resolve_path(path).unwrap_or_else(|| path.to_string());
+    let text = loader
+        .vfs()
+        .read_to_string(&resolved)
+        .ok_or_else(|| MatroError::runtime(format!("readmatrix: file not found '{path}'")))?;
+    let mut delim: Option<char> = None;
+    let mut skip_lines = 0usize;
+    let mut i = 1;
+    while i + 1 < args.len() {
+        if let Ok(k) = args[i].as_str() {
+            match k.to_ascii_lowercase().as_str() {
+                "delimiter" => delim = args[i + 1].as_str()?.chars().next(),
+                "numheaderlines" => skip_lines = args[i + 1].as_scalar()?.max(0.0).round() as usize,
+                _ => {}
+            }
+        }
+        i += 2;
+    }
+    ok1(Value::matrix(parse_delimited_matrix(
+        &text, delim, skip_lines, 0, None, None,
+    )?))
+}
+
+pub fn fn_writematrix(args: &[Value], loader: &mut ModuleLoader) -> Result<Vec<Value>> {
+    if args.len() < 2 {
+        return Err(MatroError::arity("writematrix", ">= 2 (A, filename [, NV...])", args.len()));
+    }
+    let m = args[0].to_dense_matrix()?;
+    let path = args[1].as_str()?;
+    let mut delim = ",".to_string();
+    let mut write_mode = "overwrite".to_string();
+    let mut i = 2;
+    while i + 1 < args.len() {
+        if let Ok(k) = args[i].as_str() {
+            match k.to_ascii_lowercase().as_str() {
+                "delimiter" => {
+                    let d = args[i + 1].as_str()?;
+                    delim = match d.to_ascii_lowercase().as_str() {
+                        "tab" => "\t".to_string(),
+                        "space" => " ".to_string(),
+                        "comma" => ",".to_string(),
+                        "semi" => ";".to_string(),
+                        "bar" => "|".to_string(),
+                        _ => d.to_string(),
+                    };
+                }
+                "writemode" => write_mode = args[i + 1].as_str()?.to_ascii_lowercase(),
+                _ => {}
+            }
+        }
+        i += 2;
+    }
+    let mut out = if write_mode == "append" {
+        loader.vfs().read_to_string(path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    for r in 0..m.rows() {
+        for c in 0..m.cols() {
+            if c > 0 {
+                out.push_str(&delim);
+            }
+            out.push_str(&format!("{:.15}", m.get(r, c)).trim_end_matches('0').trim_end_matches('.'));
+        }
+        out.push('\n');
+    }
+    loader.vfs_mut().write_bytes(path, out.as_bytes())?;
+    Ok(vec![])
+}
+
+fn unescape_delim(s: &str) -> String {
+    match s {
+        "\\t" => "\t".to_string(),
+        "\\n" => "\n".to_string(),
+        "\\r" => "\r".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn fn_dlmread(args: &[Value], loader: &ModuleLoader) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 5 {
+        return Err(MatroError::arity(
+            "dlmread",
+            "1 to 5 (filename [, delim [, R1, C1 [, range]]])",
+            args.len(),
+        ));
+    }
+    let path = args[0].as_str()?;
+    let resolved = loader.resolve_path(path).unwrap_or_else(|| path.to_string());
+    let text = loader
+        .vfs()
+        .read_to_string(&resolved)
+        .ok_or_else(|| MatroError::runtime(format!("dlmread: file not found '{path}'")))?;
+    let delim = args
+        .get(1)
+        .and_then(|v| v.as_str().ok())
+        .and_then(|s| unescape_delim(s).chars().next());
+    let (r1, c1, r2, c2) = if args.len() >= 4 {
+        let r1 = args[2].as_scalar()?.max(0.0).round() as usize;
+        let c1 = args[3].as_scalar()?.max(0.0).round() as usize;
+        if let Some(rv) = args.get(4) {
+            let rm = rv.to_dense_matrix()?;
+            if rm.len() >= 4 {
+                (
+                    rm.data()[0].max(0.0).round() as usize,
+                    rm.data()[1].max(0.0).round() as usize,
+                    Some(rm.data()[2].max(0.0).round() as usize),
+                    Some(rm.data()[3].max(0.0).round() as usize),
+                )
+            } else {
+                (r1, c1, None, None)
+            }
+        } else {
+            (r1, c1, None, None)
+        }
+    } else if args.len() == 3 {
+        let rm = args[2].to_dense_matrix()?;
+        if rm.len() >= 4 {
+            (
+                rm.data()[0].max(0.0).round() as usize,
+                rm.data()[1].max(0.0).round() as usize,
+                Some(rm.data()[2].max(0.0).round() as usize),
+                Some(rm.data()[3].max(0.0).round() as usize),
+            )
+        } else {
+            (0, 0, None, None)
+        }
+    } else {
+        (0, 0, None, None)
+    };
+    ok1(Value::matrix(parse_delimited_matrix(
+        &text, delim, r1, c1, r2, c2,
+    )?))
+}
+
+pub fn fn_dlmwrite(args: &[Value], loader: &mut ModuleLoader) -> Result<Vec<Value>> {
+    if args.len() < 2 {
+        return Err(MatroError::arity("dlmwrite", ">= 2 (filename, M [, delim])", args.len()));
+    }
+    let path = args[0].as_str()?;
+    let m = args[1].to_dense_matrix()?;
+    let mut delim = ",".to_string();
+    let mut append = false;
+    let mut r_off = 0usize;
+    let mut c_off = 0usize;
+    if args.len() == 3 {
+        if let Ok(s) = args[2].as_str() {
+            if s.eq_ignore_ascii_case("-append") {
+                append = true;
+            } else {
+                delim = unescape_delim(s);
+            }
+        }
+    } else if args.len() >= 4 {
+        let mut i = 2;
+        if let Ok(s) = args[i].as_str() {
+            if s.eq_ignore_ascii_case("-append") {
+                append = true;
+                i += 1;
+            } else if !s.eq_ignore_ascii_case("delimiter")
+                && !s.eq_ignore_ascii_case("roffset")
+                && !s.eq_ignore_ascii_case("coffset")
+            {
+                delim = unescape_delim(s);
+                i += 1;
+            }
+        }
+        while i + 1 < args.len() {
+            if let Ok(k) = args[i].as_str() {
+                match k.to_ascii_lowercase().as_str() {
+                    "delimiter" => delim = unescape_delim(args[i + 1].as_str()?),
+                    "roffset" => r_off = args[i + 1].as_scalar()?.max(0.0).round() as usize,
+                    "coffset" => c_off = args[i + 1].as_scalar()?.max(0.0).round() as usize,
+                    _ => {}
+                }
+            }
+            i += 2;
+        }
+    }
+    let mut out = if append {
+        loader.vfs().read_to_string(path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    for _ in 0..r_off {
+        out.push('\n');
+    }
+    for r in 0..m.rows() {
+        for _ in 0..c_off {
+            out.push_str(&delim);
+        }
+        for c in 0..m.cols() {
+            if c > 0 {
+                out.push_str(&delim);
+            }
+            out.push_str(&format!("{:.15}", m.get(r, c)).trim_end_matches('0').trim_end_matches('.'));
+        }
+        out.push('\n');
+    }
+    loader.vfs_mut().write_bytes(path, out.as_bytes())?;
+    Ok(vec![])
+}
+
+pub fn fn_importdata(args: &[Value], loader: &ModuleLoader) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity(
+            "importdata",
+            "1 to 3 (filename [, delim [, headerlines]])",
+            args.len(),
+        ));
+    }
+    let path = args[0].as_str()?;
+    let resolved = loader.resolve_path(path).unwrap_or_else(|| path.to_string());
+    let text = loader
+        .vfs()
+        .read_to_string(&resolved)
+        .ok_or_else(|| MatroError::runtime(format!("importdata: file not found '{path}'")))?;
+    let delim = args
+        .get(1)
+        .and_then(|v| v.as_str().ok())
+        .and_then(|s| s.chars().next());
+    let explicit_hdr = args
+        .get(2)
+        .and_then(|v| v.as_scalar().ok())
+        .map(|v| v.max(0.0).round() as usize);
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut header_lines = Vec::new();
+    let mut data_start = 0usize;
+    if let Some(h) = explicit_hdr {
+        data_start = h.min(lines.len());
+        for &l in &lines[..data_start] {
+            header_lines.push(Value::String(l.to_string()));
+        }
+    } else {
+        for (idx, &l) in lines.iter().enumerate() {
+            let trimmed = l.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let toks: Vec<&str> = match delim {
+                Some(d) => trimmed.split(d).map(str::trim).collect(),
+                None => trimmed.split(|c: char| c == ',' || c == '\t' || c.is_whitespace()).filter(|s| !s.is_empty()).collect(),
+            };
+            if toks.iter().all(|t| t.parse::<f64>().is_ok()) {
+                data_start = idx;
+                break;
+            } else {
+                header_lines.push(Value::String(l.to_string()));
+                data_start = idx + 1;
+            }
+        }
+    }
+
+    let mat = parse_delimited_matrix(&text, delim, data_start, 0, None, None)?;
+    if header_lines.is_empty() {
+        ok1(Value::matrix(mat))
+    } else {
+        let mut s = BTreeMap::new();
+        s.insert("data".to_string(), Value::matrix(mat));
+        let nrows = header_lines.len();
+        s.insert(
+            "textdata".to_string(),
+            Value::Cell(matro_types::CellArray {
+                rows: nrows,
+                cols: 1,
+                data: header_lines,
+            }),
+        );
+        ok1(Value::Struct(s))
+    }
 }
 
 pub fn fn_delete(args: &[Value], loader: &mut ModuleLoader) -> Result<Vec<Value>> {

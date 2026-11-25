@@ -202,10 +202,10 @@ fn sort_eig_indices(eigs: &[Complex], mode: EigMode) -> Vec<usize> {
     idxs
 }
 
-/// `d = eigs(A [, k [, sigma]])` or `[V, D] = eigs(A [, k [, sigma]])`.
+/// `d = eigs(A [, k [, sigma [, opts]]])` or `[V, D, flag] = eigs(...)`.
 pub fn fn_eigs(args: &[Value], nargout: usize, rng: &mut Rng) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 3 {
-        return Err(MatroError::arity("eigs", "1 to 3 (A [, k [, sigma]])", args.len()));
+    if args.is_empty() || args.len() > 5 {
+        return Err(MatroError::arity("eigs", "1 to 5 (A [, k [, sigma [, opts]]])", args.len()));
     }
     let op = match &args[0] {
         Value::Sparse(s) => LinOp::Sparse(s),
@@ -221,19 +221,19 @@ pub fn fn_eigs(args: &[Value], nargout: usize, rng: &mut Rng) -> Result<Vec<Valu
     if n != op.cols() || n == 0 {
         return Err(MatroError::dimension("eigs: matrix A must be non-empty square"));
     }
-    let k = if args.len() >= 2 {
+    let k = if args.len() >= 2 && !args[1].to_dense_matrix().is_ok_and(|m| m.is_empty()) {
         (args[1].as_scalar()?.round() as usize).clamp(1, n)
     } else {
         6.min(n)
     };
-    let mode = if args.len() >= 3 {
+    let mode = if args.len() >= 3 && !matches!(&args[2], Value::Struct(_)) {
         parse_eig_mode(&args[2])?
     } else {
         EigMode::LargestAbs
     };
 
-    // For modest sizes (n <= 48), direct dense eig is exact, handles all non-symmetric/complex cases, and is < 1ms
-    if n <= 48 {
+    // For modest sizes (n <= 48) or when k approaches n, direct dense eig is exact and fast
+    if n <= 48 || k >= 50 {
         let a = op.to_dense();
         let (v_full, d_full) = a.eig()?;
         let eigs: Vec<Complex> = (0..n).map(|i| d_full.get_c(i, i)).collect();
@@ -248,7 +248,7 @@ pub fn fn_eigs(args: &[Value], nargout: usize, rng: &mut Rng) -> Result<Vec<Valu
         _ => 0.0,
     };
 
-    let m = n.min((2 * k + 18).max(32).min(60));
+    let m = n.min((2 * k + 18).max(32).max(k + 8));
     let mut v0: Vec<f64> = (0..n).map(|_| rng.next_normal()).collect();
     let mut best_v = Matrix::zeros(n, 1);
     let mut best_eigs: Vec<Complex> = Vec::new();
@@ -386,16 +386,20 @@ fn pack_eig_result(
             }
         }
     }
-    Ok(vec![
+    let mut res = vec![
         Value::matrix(v_out.normalize()),
         Value::matrix(d_out.normalize()),
-    ])
+    ];
+    if nargout >= 3 {
+        res.push(Value::scalar(0.0));
+    }
+    Ok(res)
 }
 
-/// `s = svds(A [, k])` or `[U, S, V] = svds(A [, k])`.
+/// `s = svds(A [, k [, sigma]])` or `[U, S, V, flag] = svds(A [, k [, sigma]])`.
 pub fn fn_svds(args: &[Value], nargout: usize, rng: &mut Rng) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 2 {
-        return Err(MatroError::arity("svds", "1 or 2 (A [, k])", args.len()));
+    if args.is_empty() || args.len() > 4 {
+        return Err(MatroError::arity("svds", "1 to 4 (A [, k [, sigma]])", args.len()));
     }
     let op = match &args[0] {
         Value::Sparse(s) => LinOp::Sparse(s),
@@ -413,20 +417,51 @@ pub fn fn_svds(args: &[Value], nargout: usize, rng: &mut Rng) -> Result<Vec<Valu
     if min_dim == 0 {
         return Err(MatroError::dimension("svds: matrix A cannot be empty"));
     }
-    let k = if args.len() == 2 {
+    let k = if args.len() >= 2 && !args[1].to_dense_matrix().is_ok_and(|mm| mm.is_empty()) {
         (args[1].as_scalar()?.round() as usize).clamp(1, min_dim)
     } else {
         6.min(min_dim)
     };
+    let want_smallest = args.get(2).and_then(crate::value_as_text).is_some_and(|s| {
+        let low = s.to_ascii_lowercase();
+        low == "smallest" || low == "smallestnz"
+    });
 
-    // Modest dense size -> exact SVD sliced to top k
-    if m.max(n) <= 48 {
+    // Modest dense size, smallest singular values, or large k -> exact SVD sliced to k
+    if m.max(n) <= 48 || want_smallest || k >= 40 {
         let (u_full, s_full, v_full) = op.to_dense().svd()?;
-        return slice_svd(&u_full, &s_full, &v_full, k, nargout);
+        if want_smallest {
+            let start = min_dim.saturating_sub(k);
+            let mut u = Matrix::zeros(m, k);
+            let mut s = Matrix::zeros(k, k);
+            let mut v = Matrix::zeros(n, k);
+            for c in 0..k {
+                let src = start + c;
+                s.set(c, c, s_full.get(src, src));
+                for r in 0..m {
+                    u.set_c(r, c, u_full.get_c(r, src));
+                }
+                for r in 0..n {
+                    v.set_c(r, c, v_full.get_c(r, src));
+                }
+            }
+            return if nargout <= 1 {
+                Ok(vec![Value::matrix(Matrix::col_vec((0..k).map(|i| s.get(i, i)).collect()))])
+            } else if nargout >= 4 {
+                Ok(vec![Value::matrix(u.normalize()), Value::matrix(s), Value::matrix(v.normalize()), Value::scalar(0.0)])
+            } else {
+                Ok(vec![Value::matrix(u.normalize()), Value::matrix(s), Value::matrix(v.normalize())])
+            };
+        }
+        let mut res = slice_svd(&u_full, &s_full, &v_full, k, nargout)?;
+        if nargout >= 4 {
+            res.push(Value::scalar(0.0));
+        }
+        return Ok(res);
     }
 
     // Subspace iteration on range of A (Halko-Martinsson-Tropp with power iterations)
-    let ell = min_dim.min((k + 16).max(2 * k + 10).min(48));
+    let ell = min_dim.min((k + 16).max(2 * k + 10));
     let mut q_cols: Vec<Vec<f64>> = Vec::with_capacity(ell);
     for _ in 0..ell {
         let omega: Vec<f64> = (0..n).map(|_| rng.next_normal()).collect();

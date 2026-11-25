@@ -292,29 +292,51 @@ pub fn fn_linprog(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
     let fval: f64 = f_vec.iter().zip(x.iter()).map(|(&c, &xi)| c * xi).sum();
     let _ = const_obj_shift;
 
+    let mut out = vec![Value::matrix(Matrix::col_vec(x))];
     if nargout >= 2 {
-        Ok(vec![
-            Value::matrix(Matrix::col_vec(x)),
-            Value::scalar(fval),
-        ])
-    } else {
-        ok1(Value::matrix(Matrix::col_vec(x)))
+        out.push(Value::scalar(fval));
     }
+    if nargout >= 3 {
+        out.push(Value::scalar(1.0));
+    }
+    Ok(out)
 }
 
-/// `sys = tf(num, den)` — continuous-time transfer function `num(s) / den(s)`.
+/// `sys = tf(num, den [, Ts])` or `s = tf('s')` / `z = tf('z', Ts)`.
 pub fn fn_tf(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 2 {
-        return Err(MatroError::arity("tf", "2 (num, den)", args.len()));
+    if args.is_empty() || args.len() > 3 {
+        return Err(MatroError::arity("tf", "1 to 3 (num, den [, Ts]) or ('s'|'z' [, Ts])", args.len()));
     }
-    let num = args[0].as_matrix()?.data().to_vec();
-    let den = args[1].as_matrix()?.data().to_vec();
+    if let Some(var) = crate::value_as_text(&args[0]) {
+        let low = var.to_ascii_lowercase();
+        let ts = if low == "z" {
+            args.get(1).map(|v| v.as_scalar()).transpose()?.unwrap_or(-1.0)
+        } else {
+            0.0
+        };
+        let mut fields = BTreeMap::new();
+        fields.insert("Numerator".to_string(), Value::matrix(Matrix::row_vec(vec![1.0, 0.0])));
+        fields.insert("Denominator".to_string(), Value::matrix(Matrix::row_vec(vec![1.0])));
+        fields.insert("Ts".to_string(), Value::scalar(ts));
+        fields.insert("Variable".to_string(), Value::String(var));
+        return ok1(Value::Object(ObjectInstance {
+            class_name: "tf".to_string(),
+            fields,
+        }));
+    }
+    if args.len() < 2 {
+        return Err(MatroError::arity("tf", "2 or 3 (num, den [, Ts])", args.len()));
+    }
+    let num = args[0].to_dense_matrix()?.data().to_vec();
+    let den = args[1].to_dense_matrix()?.data().to_vec();
+    let ts = args.get(2).map(|v| v.as_scalar()).transpose()?.unwrap_or(0.0);
     if den.is_empty() || den.iter().all(|&c| c == 0.0) {
         return Err(MatroError::runtime("tf: denominator polynomial cannot be zero"));
     }
     let mut fields = BTreeMap::new();
     fields.insert("Numerator".to_string(), Value::matrix(Matrix::row_vec(num)));
     fields.insert("Denominator".to_string(), Value::matrix(Matrix::row_vec(den)));
+    fields.insert("Ts".to_string(), Value::scalar(ts));
     ok1(Value::Object(ObjectInstance {
         class_name: "tf".to_string(),
         fields,

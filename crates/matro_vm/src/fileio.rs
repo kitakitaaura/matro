@@ -286,6 +286,86 @@ impl FileTable {
         Ok(vec![])
     }
 
+    pub fn fseek(&mut self, args: &[Value]) -> Result<Vec<Value>> {
+        if args.len() != 3 {
+            return Err(MatroError::arity("fseek", "3 (fid, offset, origin)", args.len()));
+        }
+        let fid = args[0].as_scalar()?.round() as i32;
+        let offset = args[1].as_scalar()?.round() as isize;
+        let origin_code = if let Ok(s) = args[2].as_str() {
+            match s.to_ascii_lowercase().as_str() {
+                "bof" => -1,
+                "cof" => 0,
+                "eof" => 1,
+                _ => return Err(MatroError::runtime(format!("fseek: unknown origin '{s}'"))),
+            }
+        } else {
+            args[2].as_scalar()?.round() as i32
+        };
+        let f = self.get_mut(fid)?;
+        let base = match origin_code {
+            -1 => 0isize,
+            0 => f.pos as isize,
+            1 => f.buf.len() as isize,
+            _ => return Ok(vec![Value::scalar(-1.0)]),
+        };
+        let target = base + offset;
+        if target < 0 || (target as usize) > f.buf.len() {
+            Ok(vec![Value::scalar(-1.0)])
+        } else {
+            f.pos = target as usize;
+            Ok(vec![Value::scalar(0.0)])
+        }
+    }
+
+    pub fn ferror(&self, args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+        if args.is_empty() || args.len() > 2 {
+            return Err(MatroError::arity("ferror", "1 or 2", args.len()));
+        }
+        if nargout >= 2 {
+            Ok(vec![Value::String(String::new()), Value::scalar(0.0)])
+        } else {
+            Ok(vec![Value::String(String::new())])
+        }
+    }
+
+    pub fn fscanf(&mut self, args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+        if args.len() < 2 || args.len() > 3 {
+            return Err(MatroError::arity("fscanf", "2 or 3 (fid, fmt [, sizeA])", args.len()));
+        }
+        let fid = args[0].as_scalar()?.round() as i32;
+        let fmt = args[1].as_str()?.to_string();
+        let f = self.get_mut(fid)?;
+        let remaining = String::from_utf8_lossy(&f.buf[f.pos..]).into_owned();
+        let (mat, count, consumed) = scan_formatted_text(&remaining, &fmt, args.get(2))?;
+        f.pos = (f.pos + consumed).min(f.buf.len());
+        if nargout >= 2 {
+            Ok(vec![mat, Value::scalar(count as f64)])
+        } else {
+            Ok(vec![mat])
+        }
+    }
+
+    pub fn sscanf(&self, args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+        if args.len() < 2 || args.len() > 3 {
+            return Err(MatroError::arity("sscanf", "2 or 3 (str, fmt [, sizeA])", args.len()));
+        }
+        let text = args[0].as_str()?;
+        let fmt = args[1].as_str()?;
+        let (mat, count, consumed) = scan_formatted_text(text, fmt, args.get(2))?;
+        let mut out = vec![mat];
+        if nargout >= 2 {
+            out.push(Value::scalar(count as f64));
+        }
+        if nargout >= 3 {
+            out.push(Value::String(String::new()));
+        }
+        if nargout >= 4 {
+            out.push(Value::scalar((consumed + 1) as f64));
+        }
+        Ok(out)
+    }
+
     pub fn fwrite(&mut self, args: &[Value]) -> Result<Vec<Value>> {
         if args.len() < 2 || args.len() > 3 {
             return Err(MatroError::arity("fwrite", "2 or 3", args.len()));
@@ -621,4 +701,384 @@ fn decode_elem(bytes: &[u8], prec: &str) -> f64 {
         ]) as f64,
         _ => 0.0,
     }
+}
+
+#[derive(Clone, Debug)]
+enum ScanToken {
+    Whitespace,
+    Literal(char),
+    Spec {
+        suppress: bool,
+        width: Option<usize>,
+        conv: char,
+    },
+}
+
+fn parse_scan_format(fmt: &str) -> Vec<ScanToken> {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' && i + 1 < chars.len() {
+            match chars[i + 1] {
+                'n' | 'r' | 't' => {
+                    out.push(ScanToken::Whitespace);
+                    i += 2;
+                    continue;
+                }
+                '\\' => {
+                    out.push(ScanToken::Literal('\\'));
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if ch.is_whitespace() {
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            out.push(ScanToken::Whitespace);
+        } else if ch == '%' {
+            i += 1;
+            if i < chars.len() && chars[i] == '%' {
+                out.push(ScanToken::Literal('%'));
+                i += 1;
+                continue;
+            }
+            let mut suppress = false;
+            if i < chars.len() && chars[i] == '*' {
+                suppress = true;
+                i += 1;
+            }
+            let w_start = i;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            let width = if i > w_start {
+                chars[w_start..i].iter().collect::<String>().parse::<usize>().ok()
+            } else {
+                None
+            };
+            // Skip length modifiers like l, h, ll
+            while i < chars.len() && matches!(chars[i], 'l' | 'h' | 'z' | 't') {
+                i += 1;
+            }
+            if i < chars.len() {
+                let conv = chars[i];
+                i += 1;
+                out.push(ScanToken::Spec { suppress, width, conv });
+            }
+        } else {
+            out.push(ScanToken::Literal(ch));
+            i += 1;
+        }
+    }
+    out
+}
+
+fn scan_formatted_text(
+    text: &str,
+    fmt: &str,
+    size_arg: Option<&Value>,
+) -> Result<(Value, usize, usize)> {
+    let tokens = parse_scan_format(fmt);
+    if tokens.is_empty() {
+        return Ok((Value::matrix(Matrix::zeros(0, 0)), 0, 0));
+    }
+
+    let (max_items, shape): (usize, Option<(usize, Option<usize>)>) = match size_arg {
+        None => (usize::MAX, None),
+        Some(v) => {
+            let m = v.to_dense_matrix()?;
+            if m.is_empty() {
+                (0, None)
+            } else if m.len() == 1 {
+                let n = m.data()[0];
+                if n.is_infinite() && n > 0.0 {
+                    (usize::MAX, None)
+                } else {
+                    (n.max(0.0).round() as usize, None)
+                }
+            } else {
+                let r = m.data()[0].max(0.0).round() as usize;
+                let c_raw = m.data()[1];
+                if c_raw.is_infinite() && c_raw > 0.0 {
+                    (usize::MAX, Some((r, None)))
+                } else {
+                    let c = c_raw.max(0.0).round() as usize;
+                    (r.saturating_mul(c), Some((r, Some(c))))
+                }
+            }
+        }
+    };
+
+    let all_char_specs = tokens.iter().all(|t| match t {
+        ScanToken::Spec { suppress: false, conv, .. } => matches!(conv, 's' | 'c'),
+        _ => true,
+    }) && tokens
+        .iter()
+        .any(|t| matches!(t, ScanToken::Spec { suppress: false, .. }));
+
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut pos = 0usize;
+    let mut nums: Vec<f64> = Vec::new();
+    let mut out_str = String::new();
+    let mut count = 0usize;
+
+    'outer: while pos < len && count < max_items {
+        let iter_start = pos;
+        let mut matched_any = false;
+        for tok in &tokens {
+            if count >= max_items {
+                break 'outer;
+            }
+            match tok {
+                ScanToken::Whitespace => {
+                    while pos < len && (bytes[pos] as char).is_whitespace() {
+                        pos += 1;
+                    }
+                }
+                ScanToken::Literal(expected) => {
+                    let rem = &text[pos..];
+                    if let Some(ch) = rem.chars().next() {
+                        if ch == *expected {
+                            pos += ch.len_utf8();
+                        } else {
+                            break 'outer;
+                        }
+                    } else {
+                        break 'outer;
+                    }
+                }
+                ScanToken::Spec { suppress, width, conv } => {
+                    let max_w = width.unwrap_or(usize::MAX);
+                    match conv {
+                        'c' => {
+                            let w = width.unwrap_or(1);
+                            let mut taken = String::new();
+                            for _ in 0..w {
+                                if pos >= len {
+                                    break;
+                                }
+                                let ch = text[pos..].chars().next().unwrap();
+                                pos += ch.len_utf8();
+                                taken.push(ch);
+                            }
+                            if taken.is_empty() {
+                                break 'outer;
+                            }
+                            matched_any = true;
+                            if !*suppress {
+                                if all_char_specs {
+                                    out_str.push_str(&taken);
+                                    count += taken.chars().count();
+                                } else {
+                                    for ch in taken.chars() {
+                                        nums.push(ch as u32 as f64);
+                                        count += 1;
+                                    }
+                                }
+                            }
+                        }
+                        's' => {
+                            while pos < len && (bytes[pos] as char).is_whitespace() {
+                                pos += 1;
+                            }
+                            let mut taken = String::new();
+                            while pos < len && taken.chars().count() < max_w {
+                                let ch = text[pos..].chars().next().unwrap();
+                                if ch.is_whitespace() {
+                                    break;
+                                }
+                                pos += ch.len_utf8();
+                                taken.push(ch);
+                            }
+                            if taken.is_empty() {
+                                break 'outer;
+                            }
+                            matched_any = true;
+                            if !*suppress {
+                                if all_char_specs {
+                                    out_str.push_str(&taken);
+                                    count += 1;
+                                } else {
+                                    for ch in taken.chars() {
+                                        nums.push(ch as u32 as f64);
+                                    }
+                                    count += 1;
+                                }
+                            }
+                        }
+                        'd' | 'i' | 'u' | 'x' | 'X' | 'o' => {
+                            while pos < len && (bytes[pos] as char).is_whitespace() {
+                                pos += 1;
+                            }
+                            if pos >= len {
+                                break 'outer;
+                            }
+                            let start = pos;
+                            let limit = len.min(start.saturating_add(max_w));
+                            if pos < limit && matches!(bytes[pos], b'+' | b'-') && *conv != 'u' {
+                                pos += 1;
+                            }
+                            let radix: u32 = match conv {
+                                'x' | 'X' => {
+                                    if pos + 1 < limit
+                                        && bytes[pos] == b'0'
+                                        && matches!(bytes[pos + 1], b'x' | b'X')
+                                    {
+                                        pos += 2;
+                                    }
+                                    16
+                                }
+                                'o' => 8,
+                                'i' => {
+                                    if pos + 1 < limit
+                                        && bytes[pos] == b'0'
+                                        && matches!(bytes[pos + 1], b'x' | b'X')
+                                    {
+                                        pos += 2;
+                                        16
+                                    } else {
+                                        10
+                                    }
+                                }
+                                _ => 10,
+                            };
+                            let d_start = pos;
+                            while pos < limit && (bytes[pos] as char).is_digit(radix) {
+                                pos += 1;
+                            }
+                            if pos == d_start {
+                                pos = start;
+                                break 'outer;
+                            }
+                            let neg = bytes[start] == b'-';
+                            let digits = &text[d_start..pos];
+                            let parsed = if radix == 10 {
+                                text[start..pos].parse::<f64>().ok()
+                            } else {
+                                i64::from_str_radix(digits, radix)
+                                    .ok()
+                                    .map(|v| if neg { -(v as f64) } else { v as f64 })
+                            };
+                            let Some(val) = parsed else {
+                                pos = start;
+                                break 'outer;
+                            };
+                            matched_any = true;
+                            if !*suppress {
+                                nums.push(val);
+                                count += 1;
+                            }
+                        }
+                        'f' | 'e' | 'E' | 'g' | 'G' => {
+                            while pos < len && (bytes[pos] as char).is_whitespace() {
+                                pos += 1;
+                            }
+                            if pos >= len {
+                                break 'outer;
+                            }
+                            let start = pos;
+                            let limit = len.min(start.saturating_add(max_w));
+                            if pos < limit && matches!(bytes[pos], b'+' | b'-') {
+                                pos += 1;
+                            }
+                            // Check Inf / NaN
+                            let rem_low = text[pos..limit].to_ascii_lowercase();
+                            if rem_low.starts_with("inf") {
+                                pos += 3;
+                                let val = if bytes[start] == b'-' {
+                                    f64::NEG_INFINITY
+                                } else {
+                                    f64::INFINITY
+                                };
+                                matched_any = true;
+                                if !*suppress {
+                                    nums.push(val);
+                                    count += 1;
+                                }
+                                continue;
+                            } else if rem_low.starts_with("nan") {
+                                pos += 3;
+                                matched_any = true;
+                                if !*suppress {
+                                    nums.push(f64::NAN);
+                                    count += 1;
+                                }
+                                continue;
+                            }
+                            let mut has_digit = false;
+                            while pos < limit && bytes[pos].is_ascii_digit() {
+                                has_digit = true;
+                                pos += 1;
+                            }
+                            if pos < limit && bytes[pos] == b'.' {
+                                pos += 1;
+                                while pos < limit && bytes[pos].is_ascii_digit() {
+                                    has_digit = true;
+                                    pos += 1;
+                                }
+                            }
+                            if !has_digit {
+                                pos = start;
+                                break 'outer;
+                            }
+                            if pos < limit && matches!(bytes[pos], b'e' | b'E') {
+                                let exp_pos = pos;
+                                pos += 1;
+                                if pos < limit && matches!(bytes[pos], b'+' | b'-') {
+                                    pos += 1;
+                                }
+                                let ed_start = pos;
+                                while pos < limit && bytes[pos].is_ascii_digit() {
+                                    pos += 1;
+                                }
+                                if pos == ed_start {
+                                    pos = exp_pos;
+                                }
+                            }
+                            let Ok(val) = text[start..pos].parse::<f64>() else {
+                                pos = start;
+                                break 'outer;
+                            };
+                            matched_any = true;
+                            if !*suppress {
+                                nums.push(val);
+                                count += 1;
+                            }
+                        }
+                        _ => break 'outer,
+                    }
+                }
+            }
+        }
+        if !matched_any || pos == iter_start {
+            break;
+        }
+    }
+
+    if all_char_specs {
+        return Ok((Value::String(out_str), count, pos));
+    }
+
+    let val = if let Some((rows, cols_opt)) = shape {
+        if rows == 0 || nums.is_empty() {
+            Value::matrix(Matrix::zeros(0, 0))
+        } else {
+            let cols = cols_opt.unwrap_or_else(|| nums.len().div_ceil(rows));
+            let mut padded = nums;
+            padded.resize(rows * cols, 0.0);
+            Value::matrix(Matrix::from_col_major(rows, cols, padded)?)
+        }
+    } else if nums.is_empty() {
+        Value::matrix(Matrix::zeros(0, 1))
+    } else {
+        Value::matrix(Matrix::col_vec(nums))
+    };
+
+    Ok((val, count, pos))
 }

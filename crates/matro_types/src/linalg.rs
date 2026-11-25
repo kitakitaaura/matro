@@ -147,8 +147,96 @@ impl Matrix {
         Ok((q.normalize(), r.normalize()))
     }
 
-    /// Upper-triangular Cholesky factorization `R' * R = A` for symmetric/Hermitian positive definite matrices.
-    pub fn chol(&self) -> Result<Matrix> {
+    /// Column-pivoted Householder QR: `A(:, p) = Q * R` (with 0-based permutation vector `p`).
+    pub fn qr_pivoted(&self) -> Result<(Matrix, Matrix, Vec<usize>)> {
+        let m = self.rows();
+        let n = self.cols();
+        let mut r = self.clone();
+        let mut perm: Vec<usize> = (0..n).collect();
+        let mut q = if self.is_complex() {
+            let mut e = Matrix::complex_zeros(m, m);
+            for i in 0..m {
+                e.set_c(i, i, Complex::ONE);
+            }
+            e
+        } else {
+            Matrix::eye(m, m)
+        };
+        for k in 0..m.min(n) {
+            // Find remaining column with largest 2-norm in rows k..m
+            let mut best_j = k;
+            let mut best_norm_sq = -1.0_f64;
+            for j in k..n {
+                let mut nsq = 0.0;
+                for i in k..m {
+                    nsq += r.get_c(i, j).norm_sq();
+                }
+                if nsq > best_norm_sq {
+                    best_norm_sq = nsq;
+                    best_j = j;
+                }
+            }
+            if best_j != k {
+                perm.swap(k, best_j);
+                for i in 0..m {
+                    let tmp = r.get_c(i, k);
+                    r.set_c(i, k, r.get_c(i, best_j));
+                    r.set_c(i, best_j, tmp);
+                }
+            }
+            let norm = best_norm_sq.max(0.0).sqrt();
+            if norm < 1e-15 {
+                continue;
+            }
+            let x0 = r.get_c(k, k);
+            let alpha = if x0.abs() > 1e-15 {
+                let phase = x0 / Complex::from_real(x0.abs());
+                -phase * Complex::from_real(norm)
+            } else {
+                Complex::from_real(-norm)
+            };
+            let mut v = vec![Complex::ZERO; m - k];
+            v[0] = x0 - alpha;
+            for i in (k + 1)..m {
+                v[i - k] = r.get_c(i, k);
+            }
+            let v_norm_sq: f64 = v.iter().map(|c| c.norm_sq()).sum();
+            if v_norm_sq < 1e-30 {
+                continue;
+            }
+            let beta = Complex::from_real(2.0 / v_norm_sq);
+            for j in k..n {
+                let mut dot = Complex::ZERO;
+                for i in k..m {
+                    dot = dot + v[i - k].conj() * r.get_c(i, j);
+                }
+                let scale = beta * dot;
+                for i in k..m {
+                    let cur = r.get_c(i, j);
+                    r.set_c(i, j, cur - scale * v[i - k]);
+                }
+            }
+            for i in (k + 1)..m {
+                r.set_c(i, k, Complex::ZERO);
+            }
+            for i in 0..m {
+                let mut dot = Complex::ZERO;
+                for j in k..m {
+                    dot = dot + q.get_c(i, j) * v[j - k];
+                }
+                let scale = beta * dot;
+                for j in k..m {
+                    let cur = q.get_c(i, j);
+                    q.set_c(i, j, cur - scale * v[j - k].conj());
+                }
+            }
+        }
+        Ok((q.normalize(), r.normalize(), perm))
+    }
+
+    /// Cholesky factorization returning `(factor, flag)` where `flag == 0` on success,
+    /// or 1-based leading minor index `p` if not positive definite (MATLAB `[R, flag] = chol(A, ...)`).
+    pub fn chol_with_flag(&self, lower: bool) -> Result<(Matrix, usize)> {
         if self.rows() != self.cols() {
             return Err(MatroError::dimension("chol() requires a square matrix"));
         }
@@ -165,10 +253,25 @@ impl Matrix {
                     sum = sum - r.get_c(k, i).conj() * r.get_c(k, j);
                 }
                 if i == j {
-                    if sum.re <= 0.0 || sum.im.abs() > 1e-10 {
-                        return Err(MatroError::runtime(
-                            "Matrix is not positive definite for chol()",
-                        ));
+                    if sum.re <= 0.0 || !sum.re.is_finite() || sum.im.abs() > 1e-10 {
+                        // Return leading (i)x(i) factor like MATLAB when flag > 0
+                        let q = i;
+                        let mut partial = if self.is_complex() {
+                            Matrix::complex_zeros(q, q)
+                        } else {
+                            Matrix::zeros(q, q)
+                        };
+                        for rr in 0..q {
+                            for cc in rr..q {
+                                partial.set_c(rr, cc, r.get_c(rr, cc));
+                            }
+                        }
+                        let factor = if lower {
+                            partial.ctranspose()
+                        } else {
+                            partial
+                        };
+                        return Ok((factor.normalize(), i + 1));
                     }
                     r.set_c(i, i, Complex::from_real(sum.re.sqrt()));
                 } else {
@@ -176,7 +279,19 @@ impl Matrix {
                 }
             }
         }
-        Ok(r.normalize())
+        let factor = if lower { r.ctranspose() } else { r };
+        Ok((factor.normalize(), 0))
+    }
+
+    /// Upper-triangular Cholesky factorization `R' * R = A` for symmetric/Hermitian positive definite matrices.
+    pub fn chol(&self) -> Result<Matrix> {
+        let (r, flag) = self.chol_with_flag(false)?;
+        if flag != 0 {
+            return Err(MatroError::runtime(
+                "Matrix is not positive definite for chol()",
+            ));
+        }
+        Ok(r)
     }
 
     /// Singular Value Decomposition `A = U * S * V'` using one-sided Jacobi rotations (real & complex).
@@ -669,75 +784,110 @@ impl Matrix {
         Ok((v_mat.normalize(), d_mat.normalize()))
     }
 
-    /// 1D Discrete Fourier Transform (`fft`) — radix-2 Cooley-Tukey for powers of 2, exact DFT fallback otherwise.
-    pub fn fft(&self) -> Matrix {
-        let is_row = self.rows() == 1 && self.cols() > 1;
-        let vals: Vec<Complex> = (0..self.len()).map(|i| self.get_linear_c(i)).collect();
-        let out = fft_1d(&vals, false);
-        if is_row {
-            Matrix::complex_row_vec(out)
-        } else {
-            Matrix::complex_col_vec(out)
+    /// Full MATLAB N-D `fft(X, n, dim)` / `ifft(X, n, dim, 'symmetric')`.
+    /// Defaults to the first non-singleton dimension (column-wise on 2D matrices).
+    pub fn fft_along_dim(
+        &self,
+        n_opt: Option<usize>,
+        dim_opt: Option<usize>,
+        inverse: bool,
+        symmetric: bool,
+    ) -> Result<Matrix> {
+        let mut dims = self.dims();
+        let dim = dim_opt.unwrap_or_else(|| {
+            dims.iter().position(|&d| d != 1).map_or(1, |i| i + 1)
+        });
+        if dim == 0 {
+            return Err(MatroError::runtime("fft/ifft: dimension must be >= 1"));
         }
+        let ax = dim - 1;
+        while dims.len() <= ax {
+            dims.push(1);
+        }
+        let axis_len = dims[ax];
+        let out_len = n_opt.unwrap_or(axis_len);
+        let mut out_dims = dims.clone();
+        out_dims[ax] = out_len;
+
+        let inner: usize = dims[..ax].iter().product();
+        let outer: usize = dims[ax + 1..].iter().product();
+        let out_total = inner * out_len * outer;
+        let mut out_re = vec![0.0; out_total];
+        let mut out_im = vec![0.0; out_total];
+
+        if out_len > 0 && inner > 0 && outer > 0 {
+            let mut buf = vec![Complex::ZERO; out_len];
+            for o in 0..outer {
+                let src_block = o * axis_len * inner;
+                let dst_block = o * out_len * inner;
+                for i in 0..inner {
+                    let copy_n = axis_len.min(out_len);
+                    for k in 0..copy_n {
+                        buf[k] = self.get_linear_c(src_block + k * inner + i);
+                    }
+                    for k in copy_n..out_len {
+                        buf[k] = Complex::ZERO;
+                    }
+                    let transformed = fft_1d(&buf, inverse);
+                    for (k, val) in transformed.into_iter().enumerate() {
+                        let dst = dst_block + k * inner + i;
+                        out_re[dst] = val.re;
+                        out_im[dst] = if symmetric { 0.0 } else { val.im };
+                    }
+                }
+            }
+        }
+        let res = Matrix::from_nd_complex_col_major(out_dims, out_re, out_im)?;
+        Ok(if inverse || symmetric { res.normalize() } else { res })
     }
 
-    /// 1D Inverse Discrete Fourier Transform (`ifft`).
+    /// 1D Discrete Fourier Transform (`fft`) along first non-singleton dimension.
+    pub fn fft(&self) -> Matrix {
+        self.fft_along_dim(None, None, false, false).unwrap()
+    }
+
+    /// 1D Inverse Discrete Fourier Transform (`ifft`) along first non-singleton dimension.
     pub fn ifft(&self) -> Matrix {
-        let is_row = self.rows() == 1 && self.cols() > 1;
-        let vals: Vec<Complex> = (0..self.len()).map(|i| self.get_linear_c(i)).collect();
-        let out = fft_1d(&vals, true);
-        let res = if is_row {
-            Matrix::complex_row_vec(out)
-        } else {
-            Matrix::complex_col_vec(out)
-        };
-        res.normalize()
+        self.fft_along_dim(None, None, true, false).unwrap()
+    }
+
+    /// 2D FFT/IFFT with optional target `(m, n)` dimensions and N-D slice support.
+    pub fn fft2_sized(
+        &self,
+        m_opt: Option<usize>,
+        n_opt: Option<usize>,
+        inverse: bool,
+        symmetric: bool,
+    ) -> Result<Matrix> {
+        let step1 = self.fft_along_dim(m_opt, Some(1), inverse, false)?;
+        step1.fft_along_dim(n_opt, Some(2), inverse, symmetric)
+    }
+
+    /// N-D FFT/IFFT (`fftn` / `ifftn`) with optional target dimension vector.
+    pub fn fftn_sized(
+        &self,
+        target_dims: Option<&[usize]>,
+        inverse: bool,
+        symmetric: bool,
+    ) -> Result<Matrix> {
+        let nd = target_dims.map_or_else(|| self.ndims(), |d| d.len().max(self.ndims()));
+        let mut cur = self.clone();
+        for ax in 0..nd {
+            let n_opt = target_dims.and_then(|d| d.get(ax).copied());
+            let is_last = ax + 1 == nd;
+            cur = cur.fft_along_dim(n_opt, Some(ax + 1), inverse, is_last && symmetric)?;
+        }
+        Ok(cur)
     }
 
     /// 2D Discrete Fourier Transform (`fft2`).
     pub fn fft2(&self) -> Matrix {
-        let r = self.rows();
-        let c = self.cols();
-        let mut tmp = Matrix::complex_zeros(r, c);
-        for j in 0..c {
-            let col: Vec<Complex> = (0..r).map(|i| self.get_c(i, j)).collect();
-            let fcol = fft_1d(&col, false);
-            for (i, val) in fcol.into_iter().enumerate() {
-                tmp.set_c(i, j, val);
-            }
-        }
-        let mut out = Matrix::complex_zeros(r, c);
-        for i in 0..r {
-            let row: Vec<Complex> = (0..c).map(|j| tmp.get_c(i, j)).collect();
-            let frow = fft_1d(&row, false);
-            for (j, val) in frow.into_iter().enumerate() {
-                out.set_c(i, j, val);
-            }
-        }
-        out.normalize()
+        self.fft2_sized(None, None, false, false).unwrap().normalize()
     }
 
     /// 2D Inverse Discrete Fourier Transform (`ifft2`).
     pub fn ifft2(&self) -> Matrix {
-        let r = self.rows();
-        let c = self.cols();
-        let mut tmp = Matrix::complex_zeros(r, c);
-        for j in 0..c {
-            let col: Vec<Complex> = (0..r).map(|i| self.get_c(i, j)).collect();
-            let fcol = fft_1d(&col, true);
-            for (i, val) in fcol.into_iter().enumerate() {
-                tmp.set_c(i, j, val);
-            }
-        }
-        let mut out = Matrix::complex_zeros(r, c);
-        for i in 0..r {
-            let row: Vec<Complex> = (0..c).map(|j| tmp.get_c(i, j)).collect();
-            let frow = fft_1d(&row, true);
-            for (j, val) in frow.into_iter().enumerate() {
-                out.set_c(i, j, val);
-            }
-        }
-        out.normalize()
+        self.fft2_sized(None, None, true, false).unwrap().normalize()
     }
 
     /// Matrix exponential `expm(A)` via scaling-and-squaring with Taylor series (accurate to ~1e-14).
@@ -776,6 +926,98 @@ impl Matrix {
             acc = acc.matmul(&acc)?;
         }
         Ok(acc.normalize())
+    }
+
+    /// Principal matrix square root `sqrtm(A)` via Denman-Beavers iteration with eigendecomposition fallback.
+    pub fn sqrtm(&self) -> Result<Matrix> {
+        if self.rows() != self.cols() {
+            return Err(MatroError::dimension("sqrtm() requires a square matrix"));
+        }
+        let n = self.rows();
+        if n == 0 {
+            return Ok(Matrix::empty());
+        }
+        if n == 1 {
+            return Ok(Matrix::complex_scalar(self.get_c(0, 0).sqrt()).normalize());
+        }
+        let mut y = self.clone();
+        let mut z = Matrix::eye(n, n);
+        let mut converged = false;
+        for _ in 0..60 {
+            let Ok(y_inv) = y.inv() else { break; };
+            let Ok(z_inv) = z.inv() else { break; };
+            let y_next = y.elementwise_c(&z_inv, |a, b| (a + b) * Complex::from_real(0.5))?;
+            let z_next = z.elementwise_c(&y_inv, |a, b| (a + b) * Complex::from_real(0.5))?;
+            let mut diff = 0.0f64;
+            for i in 0..y.len() {
+                diff = diff.max((y_next.get_linear_c(i) - y.get_linear_c(i)).abs());
+            }
+            y = y_next;
+            z = z_next;
+            if diff < 1e-13 {
+                converged = true;
+                break;
+            }
+        }
+        if converged {
+            return Ok(y.normalize());
+        }
+        // Fallback: eigendecomposition V * diag(sqrt(lambda)) * V^{-1}
+        let (v, d) = self.eig()?;
+        let mut sd = Matrix::zeros(n, n);
+        for i in 0..n {
+            sd.set_c(i, i, d.get_c(i, i).sqrt());
+        }
+        let vsd = v.matmul(&sd)?;
+        let res = vsd.matmul(&v.inv()?)?;
+        Ok(res.normalize())
+    }
+
+    /// Principal matrix logarithm `logm(A)` via inverse scaling-and-squaring (`sqrtm`) + Gregory series.
+    pub fn logm(&self) -> Result<Matrix> {
+        if self.rows() != self.cols() {
+            return Err(MatroError::dimension("logm() requires a square matrix"));
+        }
+        let n = self.rows();
+        if n == 0 {
+            return Ok(Matrix::empty());
+        }
+        if n == 1 {
+            return Ok(Matrix::complex_scalar(self.get_c(0, 0).ln()).normalize());
+        }
+        let eye = Matrix::eye(n, n);
+        let mut a = self.clone();
+        let mut s = 0u32;
+        for _ in 0..16 {
+            let diff = a.elementwise_c(&eye, |x, y| x - y)?;
+            let norm_inf = (0..n)
+                .map(|r| (0..n).map(|c| diff.get_c(r, c).abs()).sum::<f64>())
+                .fold(0.0f64, f64::max);
+            if norm_inf < 0.25 {
+                break;
+            }
+            a = a.sqrtm()?;
+            s += 1;
+        }
+        // Gregory series: log(A) = 2 * sum_{k=0..} Y^{2k+1} / (2k + 1), Y = (A - I)(A + I)^{-1}
+        let num = a.elementwise_c(&eye, |x, y| x - y)?;
+        let den = a.elementwise_c(&eye, |x, y| x + y)?;
+        let y = num.matmul(&den.inv()?)?;
+        let y2 = y.matmul(&y)?;
+        let mut pow = y.clone();
+        let mut acc = y;
+        for k in 1..=32 {
+            pow = pow.matmul(&y2)?;
+            let denom = (2 * k + 1) as f64;
+            let term = pow.map_c(|c| c / Complex::from_real(denom));
+            acc = acc.elementwise_c(&term, |u, v| u + v)?;
+            let tnorm: f64 = (0..term.len()).map(|i| term.get_linear_c(i).abs()).sum();
+            if tnorm < 1e-15 {
+                break;
+            }
+        }
+        let scale = 2.0 * 2.0f64.powi(s as i32);
+        Ok(acc.map_c(|c| c * Complex::from_real(scale)).normalize())
     }
 }
 

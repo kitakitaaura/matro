@@ -37,6 +37,7 @@ pub enum TokenKind {
     Slash,
     DotSlash,
     Backslash,
+    DotBackslash,
     Caret,
     DotCaret,
     CTranspose, // '
@@ -276,6 +277,12 @@ impl<'a> Lexer<'a> {
                     self.bump();
                     self.can_transpose = false;
                     TokenKind::DotSlash
+                }
+                Some(b'\\') => {
+                    self.bump();
+                    self.bump();
+                    self.can_transpose = false;
+                    TokenKind::DotBackslash
                 }
                 Some(b'^') => {
                     self.bump();

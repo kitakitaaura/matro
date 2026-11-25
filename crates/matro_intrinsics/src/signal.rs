@@ -10,53 +10,85 @@ fn ok1(v: Value) -> Result<Vec<Value>> {
     Ok(vec![v])
 }
 
-/// `fftshift(x)` / `ifftshift(x)` — shifts zero-frequency component to center (1D or 2D).
+/// `fftshift(x [, dim])` / `ifftshift(x [, dim])` — N-D zero-frequency shift.
 pub fn fn_fftshift(args: &[Value], inverse: bool) -> Result<Vec<Value>> {
     let fname = if inverse { "ifftshift" } else { "fftshift" };
-    if args.len() != 1 {
-        return Err(MatroError::arity(fname, "1", args.len()));
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity(fname, "1 or 2 (X [, dim])", args.len()));
     }
-    let m = args[0].as_matrix()?;
+    let m = args[0].to_dense_matrix()?;
     if m.is_empty() {
-        return ok1(Value::matrix(m.clone()));
+        return ok1(Value::matrix(m));
     }
+    let dims = m.dims();
     let shift_1d = |n: usize| -> usize { if inverse { (n + 1) / 2 } else { n / 2 } };
-    if m.rows() == 1 || m.cols() == 1 {
-        let n = m.len();
-        let sh = shift_1d(n);
-        let vals: Vec<Complex> = (0..n).map(|i| m.get_linear_c((i + n - sh) % n)).collect();
-        let out = if m.rows() == 1 {
-            Matrix::complex_row_vec(vals)
-        } else {
-            Matrix::complex_col_vec(vals)
-        };
-        return ok1(Value::matrix(out.normalize()));
-    }
-    let (rows, cols) = (m.rows(), m.cols());
-    let sr = shift_1d(rows);
-    let sc = shift_1d(cols);
-    let mut out = Matrix::zeros(rows, cols);
-    for c in 0..cols {
-        for r in 0..rows {
-            out.set_c(r, c, m.get_c((r + rows - sr) % rows, (c + cols - sc) % cols));
+    let axes: Vec<usize> = if args.len() == 2 {
+        let d = args[1].as_scalar()?.round() as isize;
+        if d < 1 {
+            return Err(MatroError::runtime(format!("{fname}: dim must be >= 1")));
         }
+        let ax = (d - 1) as usize;
+        if ax >= dims.len() {
+            return ok1(Value::matrix(m));
+        }
+        vec![ax]
+    } else {
+        (0..dims.len()).collect()
+    };
+
+    let mut cur_re = m.data().to_vec();
+    let mut cur_im = m.imag_data().map(|s| s.to_vec());
+    let total = cur_re.len();
+    for ax in axes {
+        let axis_len = dims[ax];
+        if axis_len <= 1 {
+            continue;
+        }
+        let sh = shift_1d(axis_len);
+        let inner: usize = dims[..ax].iter().product();
+        let outer: usize = dims[ax + 1..].iter().product();
+        let mut next_re = vec![0.0; total];
+        let mut next_im = cur_im.as_ref().map(|_| vec![0.0; total]);
+        for o in 0..outer {
+            let block = o * axis_len * inner;
+            for k in 0..axis_len {
+                let src_k = (k + axis_len - sh) % axis_len;
+                let dst = block + k * inner;
+                let src = block + src_k * inner;
+                next_re[dst..dst + inner].copy_from_slice(&cur_re[src..src + inner]);
+                if let (Some(si), Some(di)) = (cur_im.as_ref(), next_im.as_mut()) {
+                    di[dst..dst + inner].copy_from_slice(&si[src..src + inner]);
+                }
+            }
+        }
+        cur_re = next_re;
+        cur_im = next_im;
     }
-    ok1(Value::matrix(out.normalize()))
+    let out = if let Some(im) = cur_im {
+        Matrix::from_nd_complex_col_major(dims, cur_re, im)?.normalize()
+    } else {
+        Matrix::from_nd_col_major(dims, cur_re)?
+    };
+    ok1(Value::matrix(out))
 }
 
-/// Symmetric window functions: `hann(N)`, `hamming(N)`, `blackman(N)`.
+/// Window functions: `hann(N [, 'symmetric'|'periodic'])`, `hamming(...)`, `blackman(...)`.
 pub fn fn_window(name: &str, args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 1 {
-        return Err(MatroError::arity(name, "1 (N)", args.len()));
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity(name, "1 or 2 (N [, sflag])", args.len()));
     }
     let n = args[0].as_scalar()?.max(0.0).round() as usize;
+    let periodic = args
+        .get(1)
+        .and_then(crate::value_as_text)
+        .is_some_and(|s| s.eq_ignore_ascii_case("periodic"));
     if n == 0 {
         return ok1(Value::empty());
     }
     if n == 1 {
         return ok1(Value::scalar(1.0));
     }
-    let denom = (n - 1) as f64;
+    let denom = if periodic { n as f64 } else { (n - 1) as f64 };
     let w: Vec<f64> = (0..n)
         .map(|k| {
             let phase = 2.0 * PI * (k as f64) / denom;
@@ -71,41 +103,103 @@ pub fn fn_window(name: &str, args: &[Value]) -> Result<Vec<Value>> {
     ok1(Value::matrix(Matrix::col_vec(w)))
 }
 
-/// `[r, lags] = xcorr(x [, y])` — raw cross-correlation / autocorrelation.
-pub fn fn_xcorr(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
-    if args.is_empty() || args.len() > 2 {
-        return Err(MatroError::arity("xcorr", "1 or 2", args.len()));
+/// `[r, lags] = xcorr(x [, y] [, maxlag] [, scaleopt])` and `xcov(...)`.
+pub fn fn_xcorr_or_xcov(args: &[Value], nargout: usize, subtract_mean: bool) -> Result<Vec<Value>> {
+    let fname = if subtract_mean { "xcov" } else { "xcorr" };
+    if args.is_empty() || args.len() > 4 {
+        return Err(MatroError::arity(fname, "1 to 4", args.len()));
     }
-    let x = args[0].as_matrix()?.data();
-    let y = if args.len() == 2 {
-        args[1].as_matrix()?.data()
-    } else {
-        x
+    let xm = args[0].to_dense_matrix()?;
+    let is_row = xm.rows() == 1 && xm.cols() > 1;
+    let mut y_opt: Option<Matrix> = None;
+    let mut maxlag_opt: Option<usize> = None;
+    let mut scaleopt = "none".to_string();
+
+    for (idx, a) in args[1..].iter().enumerate() {
+        if let Some(s) = crate::value_as_text(a) {
+            scaleopt = s.to_ascii_lowercase();
+        } else {
+            let m = a.to_dense_matrix()?;
+            if idx == 0 && m.len() == 1 && xm.len() > 1 && args.len() <= 3 {
+                // `xcorr(x, maxlag)` or `xcorr(x, maxlag, scaleopt)`
+                let next_is_num = args.get(2).is_some_and(|v| crate::value_as_text(v).is_none());
+                if !next_is_num {
+                    maxlag_opt = Some(m.data()[0].max(0.0).round() as usize);
+                    continue;
+                }
+            }
+            if y_opt.is_none() && idx == 0 {
+                y_opt = Some(m);
+            } else if maxlag_opt.is_none() && !m.is_empty() {
+                maxlag_opt = Some(m.data()[0].max(0.0).round() as usize);
+            }
+        }
+    }
+
+    let mut x_c: Vec<Complex> = (0..xm.len()).map(|i| xm.get_linear_c(i)).collect();
+    let mut y_c: Vec<Complex> = match &y_opt {
+        Some(ym) => (0..ym.len()).map(|i| ym.get_linear_c(i)).collect(),
+        None => x_c.clone(),
     };
-    let n = x.len().max(y.len());
+    let n = x_c.len().max(y_c.len());
     if n == 0 {
         return ok1(Value::empty());
     }
-    let m = 2 * n - 1;
-    let mut r = vec![0.0; m];
+    if subtract_mean {
+        let mx = x_c.iter().fold(Complex::ZERO, |a, &b| a + b) * Complex::from_real(1.0 / x_c.len().max(1) as f64);
+        let my = y_c.iter().fold(Complex::ZERO, |a, &b| a + b) * Complex::from_real(1.0 / y_c.len().max(1) as f64);
+        for v in &mut x_c { *v = *v - mx; }
+        for v in &mut y_c { *v = *v - my; }
+    }
+    let maxlag = maxlag_opt.unwrap_or(n - 1);
+    let m = 2 * maxlag + 1;
+    let mut r = vec![Complex::ZERO; m];
     let mut lags = Vec::with_capacity(m);
     for idx in 0..m {
-        let lag = idx as isize - (n as isize - 1);
+        let lag = idx as isize - maxlag as isize;
         lags.push(lag as f64);
-        let mut sum = 0.0;
-        for i in 0..x.len() {
+        let mut sum = Complex::ZERO;
+        for i in 0..x_c.len() {
             let j = i as isize - lag;
-            if j >= 0 && (j as usize) < y.len() {
-                sum += x[i] * y[j as usize];
+            if j >= 0 && (j as usize) < y_c.len() {
+                sum = sum + x_c[i] * y_c[j as usize].conj();
             }
         }
         r[idx] = sum;
     }
-    let is_row = args[0].as_matrix()?.rows() == 1;
+
+    match scaleopt.as_str() {
+        "biased" => {
+            let inv = 1.0 / n as f64;
+            for v in &mut r { *v = *v * Complex::from_real(inv); }
+        }
+        "unbiased" => {
+            for (idx, v) in r.iter_mut().enumerate() {
+                let abslag = (idx as isize - maxlag as isize).unsigned_abs();
+                let denom = n.saturating_sub(abslag);
+                if denom > 0 {
+                    *v = *v * Complex::from_real(1.0 / denom as f64);
+                } else {
+                    *v = Complex::ZERO;
+                }
+            }
+        }
+        "normalized" | "coeff" => {
+            let ex: f64 = x_c.iter().map(|z| z.norm_sq()).sum();
+            let ey: f64 = y_c.iter().map(|z| z.norm_sq()).sum();
+            let denom = (ex * ey).sqrt();
+            if denom > 0.0 {
+                let inv = 1.0 / denom;
+                for v in &mut r { *v = *v * Complex::from_real(inv); }
+            }
+        }
+        _ => {}
+    }
+
     let r_mat = if is_row {
-        Matrix::row_vec(r)
+        Matrix::complex_row_vec(r).normalize()
     } else {
-        Matrix::col_vec(r)
+        Matrix::complex_col_vec(r).normalize()
     };
     if nargout >= 2 {
         Ok(vec![Value::matrix(r_mat), Value::matrix(Matrix::row_vec(lags))])
@@ -114,72 +208,186 @@ pub fn fn_xcorr(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
     }
 }
 
-/// `[pks, locs] = findpeaks(x [, 'MinPeakHeight', h [, 'MinPeakDistance', d]])`
+/// `[pks, locs, w, p] = findpeaks(y [, x|Fs] [, NV...])`
 pub fn fn_findpeaks(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
     if args.is_empty() {
         return Err(MatroError::arity("findpeaks", ">= 1", 0));
     }
-    let x = args[0].as_matrix()?;
-    let data = x.data();
-    let mut min_height = f64::NEG_INFINITY;
-    let mut min_dist: usize = 1;
+    let xm = args[0].to_dense_matrix()?;
+    let data = xm.data();
+    let n = data.len();
+    let mut x_coords: Vec<f64> = (1..=n).map(|i| i as f64).collect();
     let mut i = 1;
+    if i < args.len() && crate::value_as_text(&args[i]).is_none() {
+        let loc_m = args[i].to_dense_matrix()?;
+        if loc_m.len() == 1 {
+            let fs = loc_m.data()[0];
+            if fs > 0.0 {
+                x_coords = (0..n).map(|k| k as f64 / fs).collect();
+            }
+        } else if loc_m.len() == n {
+            x_coords = loc_m.data().to_vec();
+        }
+        i += 1;
+    }
+
+    let mut min_height = f64::NEG_INFINITY;
+    let mut min_dist = 0.0f64;
+    let mut min_prom = 0.0f64;
+    let mut threshold = 0.0f64;
+    let mut npeaks: Option<usize> = None;
+    let mut sort_str = "none".to_string();
+
     while i + 1 < args.len() {
         let key = args[i].as_str()?.to_ascii_lowercase();
         match key.as_str() {
             "minpeakheight" => min_height = args[i + 1].as_scalar()?,
-            "minpeakdistance" => min_dist = args[i + 1].as_scalar()?.max(1.0).round() as usize,
+            "minpeakdistance" => min_dist = args[i + 1].as_scalar()?.max(0.0),
+            "minpeakprominence" => min_prom = args[i + 1].as_scalar()?.max(0.0),
+            "threshold" => threshold = args[i + 1].as_scalar()?.max(0.0),
+            "npeaks" => npeaks = Some(args[i + 1].as_scalar()?.max(0.0).round() as usize),
+            "sortstr" => sort_str = args[i + 1].as_str()?.to_ascii_lowercase(),
             _ => {}
         }
         i += 2;
     }
 
-    let mut cands: Vec<(usize, f64)> = Vec::new();
-    if data.len() >= 3 {
-        for k in 1..(data.len() - 1) {
-            if data[k] > data[k - 1] && data[k] >= data[k + 1] && data[k] >= min_height {
-                cands.push((k, data[k]));
+    // Detect true local maxima, properly handling flat plateaus (no rising-stair false peaks!)
+    let mut raw_peaks: Vec<usize> = Vec::new();
+    if n >= 3 {
+        let mut k = 1usize;
+        while k < n - 1 {
+            if data[k] > data[k - 1] {
+                let mut end_k = k;
+                while end_k + 1 < n - 1 && data[end_k + 1] == data[k] {
+                    end_k += 1;
+                }
+                if data[end_k] > data[end_k + 1] {
+                    let diff_l = data[k] - data[k - 1];
+                    let diff_r = data[end_k] - data[end_k + 1];
+                    if data[k] >= min_height && diff_l >= threshold && diff_r >= threshold {
+                        raw_peaks.push(k);
+                    }
+                }
+                k = end_k + 1;
+            } else {
+                k += 1;
             }
         }
     }
 
-    // Enforce MinPeakDistance greedily in descending peak height order (MATLAB convention)
-    let mut kept: Vec<(usize, f64)> = if min_dist > 1 {
-        let mut by_height = cands.clone();
-        by_height.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let mut chosen: Vec<(usize, f64)> = Vec::new();
-        for (pos, val) in by_height {
-            if chosen
-                .iter()
-                .all(|&(cpos, _)| pos.abs_diff(cpos) >= min_dist)
-            {
-                chosen.push((pos, val));
+    // Compute prominence and half-prominence width for each candidate peak
+    struct PeakInfo {
+        idx: usize,
+        val: f64,
+        loc: f64,
+        prom: f64,
+        width: f64,
+    }
+    let mut cands: Vec<PeakInfo> = Vec::with_capacity(raw_peaks.len());
+    for &idx in &raw_peaks {
+        let val = data[idx];
+        // Scan left until a higher sample or start of signal
+        let mut min_l = val;
+        let mut j = idx;
+        while j > 0 {
+            j -= 1;
+            if data[j] < min_l {
+                min_l = data[j];
+            }
+            if data[j] > val {
+                break;
             }
         }
-        chosen.sort_by_key(|&(pos, _)| pos);
+        // Scan right until a higher sample or end of signal
+        let mut min_r = val;
+        let mut j = idx;
+        while j + 1 < n {
+            j += 1;
+            if data[j] < min_r {
+                min_r = data[j];
+            }
+            if data[j] > val {
+                break;
+            }
+        }
+        let ref_base = min_l.max(min_r);
+        let prom = (val - ref_base).max(0.0);
+        if prom < min_prom {
+            continue;
+        }
+        // Half-prominence width via linear interpolation
+        let half_lvl = val - 0.5 * prom;
+        let mut x_left = x_coords[0];
+        for jl in (0..idx).rev() {
+            if data[jl] <= half_lvl {
+                let d = data[jl + 1] - data[jl];
+                let frac = if d.abs() > 1e-15 { (half_lvl - data[jl]) / d } else { 0.0 };
+                x_left = x_coords[jl] + frac * (x_coords[jl + 1] - x_coords[jl]);
+                break;
+            }
+        }
+        let mut x_right = x_coords[n - 1];
+        for jr in (idx + 1)..n {
+            if data[jr] <= half_lvl {
+                let d = data[jr - 1] - data[jr];
+                let frac = if d.abs() > 1e-15 { (half_lvl - data[jr]) / d } else { 0.0 };
+                x_right = x_coords[jr] - frac * (x_coords[jr] - x_coords[jr - 1]);
+                break;
+            }
+        }
+        cands.push(PeakInfo {
+            idx,
+            val,
+            loc: x_coords[idx],
+            prom,
+            width: (x_right - x_left).max(0.0),
+        });
+    }
+
+    // Enforce MinPeakDistance greedily in descending peak height order
+    let mut kept: Vec<PeakInfo> = if min_dist > 0.0 {
+        cands.sort_by(|a, b| b.val.total_cmp(&a.val));
+        let mut chosen: Vec<PeakInfo> = Vec::new();
+        for p in cands {
+            if chosen.iter().all(|c| (p.loc - c.loc).abs() >= min_dist) {
+                chosen.push(p);
+            }
+        }
+        chosen.sort_by_key(|p| p.idx);
         chosen
     } else {
         cands
     };
 
-    let pks: Vec<f64> = kept.iter().map(|&(_, v)| v).collect();
-    let locs: Vec<f64> = kept.drain(..).map(|(p, _)| (p + 1) as f64).collect();
-    let is_row = x.rows() == 1;
-    let pks_mat = if is_row {
-        Matrix::row_vec(pks)
-    } else {
-        Matrix::col_vec(pks)
-    };
-    let locs_mat = if is_row {
-        Matrix::row_vec(locs)
-    } else {
-        Matrix::col_vec(locs)
-    };
-    if nargout >= 2 {
-        Ok(vec![Value::matrix(pks_mat), Value::matrix(locs_mat)])
-    } else {
-        ok1(Value::matrix(pks_mat))
+    match sort_str.as_str() {
+        "descend" => kept.sort_by(|a, b| b.val.total_cmp(&a.val)),
+        "ascend" => kept.sort_by(|a, b| a.val.total_cmp(&b.val)),
+        _ => {}
     }
+    if let Some(np) = npeaks {
+        kept.truncate(np);
+    }
+
+    let is_row = xm.rows() == 1;
+    let pack = |v: Vec<f64>| {
+        if is_row {
+            Value::matrix(Matrix::row_vec(v))
+        } else {
+            Value::matrix(Matrix::col_vec(v))
+        }
+    };
+    let mut out = vec![pack(kept.iter().map(|p| p.val).collect())];
+    if nargout >= 2 {
+        out.push(pack(kept.iter().map(|p| p.loc).collect()));
+    }
+    if nargout >= 3 {
+        out.push(pack(kept.iter().map(|p| p.width).collect()));
+    }
+    if nargout >= 4 {
+        out.push(pack(kept.iter().map(|p| p.prom).collect()));
+    }
+    Ok(out)
 }
 
 /// Multiply polynomial `p` (descending or ascending powers in `z^-1`) by `(1 - r * z^-1)`.
@@ -206,27 +414,35 @@ fn eval_poly_at(coeffs: &[f64], z: Complex) -> Complex {
     acc
 }
 
-/// `[b, a] = butter(n, Wn [, 'low'|'high'|'bandpass'])` — digital Butterworth IIR filter design.
-pub fn fn_butter(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() < 2 || args.len() > 3 {
-        return Err(MatroError::arity("butter", "2 or 3 (n, Wn [, ftype])", args.len()));
+/// `[b, a]` or `[z, p, k] = butter(n, Wn [, ftype] [, 's'])` — Butterworth filter design.
+pub fn fn_butter(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.len() < 2 || args.len() > 4 {
+        return Err(MatroError::arity("butter", "2 to 4 (n, Wn [, ftype [, 's']])", args.len()));
     }
     let n = args[0].as_scalar()?.round() as usize;
-    if n == 0 || n > 12 {
-        return Err(MatroError::runtime("butter: filter order n must be in 1..=12"));
+    if n == 0 || n > 16 {
+        return Err(MatroError::runtime("butter: filter order n must be in 1..=16"));
     }
-    let wn_mat = args[1].as_matrix()?;
-    let ftype = args
-        .get(2)
-        .map(|v| v.as_str().map(str::to_ascii_lowercase))
-        .transpose()?
-        .unwrap_or_else(|| {
-            if wn_mat.len() == 2 {
-                "bandpass".to_string()
+    let wn_mat = args[1].to_dense_matrix()?;
+    let mut ftype: Option<String> = None;
+    let mut analog = false;
+    for a in &args[2..] {
+        if let Some(s) = crate::value_as_text(a) {
+            let low = s.to_ascii_lowercase();
+            if low == "s" {
+                analog = true;
             } else {
-                "low".to_string()
+                ftype = Some(low);
             }
-        });
+        }
+    }
+    let ftype = ftype.unwrap_or_else(|| {
+        if wn_mat.len() == 2 {
+            "bandpass".to_string()
+        } else {
+            "low".to_string()
+        }
+    });
 
     // Analog normalized Butterworth poles in left half-plane
     let proto_poles: Vec<Complex> = (0..n)
@@ -235,6 +451,33 @@ pub fn fn_butter(args: &[Value]) -> Result<Vec<Value>> {
             Complex::new(theta.cos(), theta.sin())
         })
         .collect();
+
+    if analog {
+        let (zs, ps, k_gain) = crate::signal_ext::transform_analog_zpk(
+            &[],
+            &proto_poles,
+            1.0,
+            wn_mat.data(),
+            &ftype,
+            true,
+        )?;
+        if nargout >= 3 {
+            return Ok(vec![
+                Value::matrix(Matrix::complex_col_vec(zs).normalize()),
+                Value::matrix(Matrix::complex_col_vec(ps).normalize()),
+                Value::scalar(k_gain),
+            ]);
+        }
+        let a = poly_from_roots_c(&ps);
+        let mut b = poly_from_roots_c(&zs);
+        for bi in &mut b {
+            *bi *= k_gain;
+        }
+        return Ok(vec![
+            Value::matrix(Matrix::row_vec(b)),
+            Value::matrix(Matrix::row_vec(a)),
+        ]);
+    }
 
     let (z_zeros, z_poles, norm_z): (Vec<Complex>, Vec<Complex>, Complex) = match ftype.as_str() {
         "low" => {
@@ -251,7 +494,7 @@ pub fn fn_butter(args: &[Value]) -> Result<Vec<Value>> {
                 })
                 .collect();
             let zz = vec![Complex::from_real(-1.0); n];
-            (zz, zp, Complex::ONE) // unity at DC (z = 1)
+            (zz, zp, Complex::ONE)
         }
         "high" => {
             let wn = wn_mat.data()[0];
@@ -267,7 +510,7 @@ pub fn fn_butter(args: &[Value]) -> Result<Vec<Value>> {
                 })
                 .collect();
             let zz = vec![Complex::ONE; n];
-            (zz, zp, Complex::from_real(-1.0)) // unity at Nyquist (z = -1)
+            (zz, zp, Complex::from_real(-1.0))
         }
         "bandpass" => {
             if wn_mat.len() != 2 {
@@ -275,8 +518,7 @@ pub fn fn_butter(args: &[Value]) -> Result<Vec<Value>> {
                     "butter bandpass requires 2-element Wn = [w1, w2]",
                 ));
             }
-            let w1 = wn_mat.data()[0];
-            let w2 = wn_mat.data()[1];
+            let (w1, w2) = (wn_mat.data()[0], wn_mat.data()[1]);
             if !(0.0..1.0).contains(&w1) || !(0.0..1.0).contains(&w2) || w1 >= w2 {
                 return Err(MatroError::runtime(
                     "butter: bandpass requires 0 < Wn(1) < Wn(2) < 1",
@@ -302,6 +544,45 @@ pub fn fn_butter(args: &[Value]) -> Result<Vec<Value>> {
             let w_mid = 0.5 * (w1 + w2) * PI;
             (zz, zp, Complex::new(w_mid.cos(), -w_mid.sin()))
         }
+        "stop" => {
+            if wn_mat.len() != 2 {
+                return Err(MatroError::dimension(
+                    "butter stop requires 2-element Wn = [w1, w2]",
+                ));
+            }
+            let (w1, w2) = (wn_mat.data()[0], wn_mat.data()[1]);
+            if !(0.0..1.0).contains(&w1) || !(0.0..1.0).contains(&w2) || w1 >= w2 {
+                return Err(MatroError::runtime(
+                    "butter: stop requires 0 < Wn(1) < Wn(2) < 1",
+                ));
+            }
+            let o1 = 2.0 * (PI * w1 * 0.5).tan();
+            let o2 = 2.0 * (PI * w2 * 0.5).tan();
+            let bw = o2 - o1;
+            let w0_sq = o1 * o2;
+            let mut sp = Vec::with_capacity(2 * n);
+            for &p in &proto_poles {
+                let half_b = Complex::from_real(0.5 * bw) / p;
+                let disc = (half_b * half_b - Complex::from_real(w0_sq)).sqrt();
+                sp.push(half_b + disc);
+                sp.push(half_b - disc);
+            }
+            let zp: Vec<Complex> = sp
+                .into_iter()
+                .map(|s| (Complex::from_real(2.0) + s) / (Complex::from_real(2.0) - s))
+                .collect();
+            let w0 = w0_sq.sqrt();
+            let sz_pos = Complex::new(0.0, w0);
+            let sz_neg = Complex::new(0.0, -w0);
+            let z_pos = (Complex::from_real(2.0) + sz_pos) / (Complex::from_real(2.0) - sz_pos);
+            let z_neg = (Complex::from_real(2.0) + sz_neg) / (Complex::from_real(2.0) - sz_neg);
+            let mut zz = Vec::with_capacity(2 * n);
+            for _ in 0..n {
+                zz.push(z_pos);
+                zz.push(z_neg);
+            }
+            (zz, zp, Complex::ONE) // unity at DC
+        }
         other => {
             return Err(MatroError::runtime(format!(
                 "butter: unsupported filter type '{other}'"
@@ -311,10 +592,16 @@ pub fn fn_butter(args: &[Value]) -> Result<Vec<Value>> {
 
     let a = poly_from_roots_c(&z_poles);
     let mut b = poly_from_roots_c(&z_zeros);
-    // Normalize gain at `norm_z` (note eval_poly_at uses z^-1 powers)
     let h_num = eval_poly_at(&b, norm_z);
     let h_den = eval_poly_at(&a, norm_z);
     let gain = (h_den / h_num).norm_sq().sqrt();
+    if nargout >= 3 {
+        return Ok(vec![
+            Value::matrix(Matrix::complex_col_vec(z_zeros).normalize()),
+            Value::matrix(Matrix::complex_col_vec(z_poles).normalize()),
+            Value::scalar(gain),
+        ]);
+    }
     for bi in &mut b {
         *bi *= gain;
     }
@@ -326,7 +613,7 @@ pub fn fn_butter(args: &[Value]) -> Result<Vec<Value>> {
 }
 
 /// Direct Form II Transposed filter helper over a raw `f64` slice.
-fn apply_iir(b: &[f64], a: &[f64], x: &[f64]) -> Vec<f64> {
+pub fn apply_iir(b: &[f64], a: &[f64], x: &[f64]) -> Vec<f64> {
     let a0 = a[0];
     let nb = b.len();
     let na = a.len();
@@ -346,23 +633,11 @@ fn apply_iir(b: &[f64], a: &[f64], x: &[f64]) -> Vec<f64> {
     y
 }
 
-/// `y = filtfilt(b, a, x)` — zero-phase forward-backward digital IIR/FIR filtering.
-pub fn fn_filtfilt(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() != 3 {
-        return Err(MatroError::arity("filtfilt", "3 (b, a, x)", args.len()));
-    }
-    let b = args[0].as_matrix()?.data();
-    let a = args[1].as_matrix()?.data();
-    let xm = args[2].as_matrix()?;
-    let x = xm.data();
-    if b.is_empty() || a.is_empty() || a[0] == 0.0 {
-        return Err(MatroError::runtime("filtfilt: invalid filter coefficients"));
-    }
+fn filtfilt_1d(b: &[f64], a: &[f64], x: &[f64]) -> Vec<f64> {
     if x.is_empty() {
-        return ok1(Value::empty());
+        return vec![];
     }
     let edge = (3 * (b.len().max(a.len()).saturating_sub(1))).min(x.len().saturating_sub(1));
-    // Odd-reflected padding at both ends to suppress edge transients
     let mut padded = Vec::with_capacity(x.len() + 2 * edge);
     for i in (1..=edge).rev() {
         padded.push(2.0 * x[0] - x[i]);
@@ -371,18 +646,92 @@ pub fn fn_filtfilt(args: &[Value]) -> Result<Vec<Value>> {
     for i in 1..=edge {
         padded.push(2.0 * x[x.len() - 1] - x[x.len() - 1 - i]);
     }
-    // Forward pass, reverse, backward pass, reverse, unpad
     let mut y = apply_iir(b, a, &padded);
     y.reverse();
     y = apply_iir(b, a, &y);
     y.reverse();
-    let trimmed = y[edge..edge + x.len()].to_vec();
-    let out = if xm.rows() == 1 {
-        Matrix::row_vec(trimmed)
+    y[edge..edge + x.len()].to_vec()
+}
+
+/// `y = filtfilt(b, a, x)` or `y = filtfilt(sos, g, x)` — zero-phase forward-backward digital IIR/FIR filtering.
+pub fn fn_filtfilt(args: &[Value]) -> Result<Vec<Value>> {
+    if args.len() != 3 {
+        return Err(MatroError::arity("filtfilt", "3 (b, a, x) or (sos, g, x)", args.len()));
+    }
+    let bm = args[0].to_dense_matrix()?;
+    let am = args[1].to_dense_matrix()?;
+    let xm = args[2].to_dense_matrix()?;
+    if xm.is_empty() {
+        return ok1(Value::matrix(xm));
+    }
+
+    // SOS overload: `filtfilt(sos, g, x)` when `sos` is L x 6 and `g` is scalar or gain vector
+    let is_sos = bm.cols() == 6 && (bm.rows() > 1 || (am.len() == 1 && bm.rows() == 1 && bm.get(0, 3) != 0.0));
+    let (b_vec, a_vec): (Vec<f64>, Vec<f64>) = if is_sos {
+        let (mut b_sos, a_sos) = crate::signal_ext::sos_to_tf(&bm)?;
+        let g = am.data().iter().product::<f64>();
+        for bi in &mut b_sos {
+            *bi *= g;
+        }
+        (b_sos, a_sos)
     } else {
-        Matrix::col_vec(trimmed)
+        (bm.data().to_vec(), am.data().to_vec())
     };
+    if b_vec.is_empty() || a_vec.is_empty() || a_vec[0] == 0.0 {
+        return Err(MatroError::runtime("filtfilt: invalid filter coefficients"));
+    }
+
+    if xm.rows() == 1 || xm.cols() == 1 {
+        let trimmed = filtfilt_1d(&b_vec, &a_vec, xm.data());
+        let out = if xm.rows() == 1 {
+            Matrix::row_vec(trimmed)
+        } else {
+            Matrix::col_vec(trimmed)
+        };
+        return ok1(Value::matrix(out));
+    }
+
+    let (nr, nc) = (xm.rows(), xm.cols());
+    let mut out = Matrix::zeros(nr, nc);
+    for c in 0..nc {
+        let col: Vec<f64> = (0..nr).map(|r| xm.get(r, c)).collect();
+        let filtered = filtfilt_1d(&b_vec, &a_vec, &col);
+        for r in 0..nr {
+            out.set(r, c, filtered[r]);
+        }
+    }
     ok1(Value::matrix(out))
+}
+
+/// `[pxx, f] = periodogram(x [, win [, nfft [, fs]]])` — Periodogram PSD estimator.
+pub fn fn_periodogram(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 4 {
+        return Err(MatroError::arity("periodogram", "1 to 4 (x [, win [, nfft [, fs]]])", args.len()));
+    }
+    let xm = args[0].to_dense_matrix()?;
+    let n = xm.len();
+    if n == 0 {
+        return Err(MatroError::dimension("periodogram: input signal cannot be empty"));
+    }
+    let win: Vec<f64> = match args.get(1) {
+        Some(v) if !v.to_dense_matrix()?.is_empty() => v.to_dense_matrix()?.data().to_vec(),
+        _ => vec![1.0; n],
+    };
+    // Delegate directly to pwelch with single full-length segment (noverlap = 0)
+    let mut pw_args = vec![
+        Value::matrix(xm),
+        Value::matrix(Matrix::col_vec(win)),
+        Value::scalar(0.0),
+    ];
+    if let Some(nfft) = args.get(2) {
+        pw_args.push(nfft.clone());
+    } else {
+        pw_args.push(Value::scalar(n.next_power_of_two().max(256) as f64));
+    }
+    if let Some(fs) = args.get(3) {
+        pw_args.push(fs.clone());
+    }
+    fn_pwelch(&pw_args, nargout)
 }
 
 /// `[pxx, f] = pwelch(x [, win_len [, noverlap [, nfft [, fs]]]])` — Welch PSD estimator.

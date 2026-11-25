@@ -92,6 +92,76 @@ impl Complex {
         self.sin() / self.cos()
     }
 
+    pub fn log10(self) -> Self {
+        if self.im == 0.0 && self.re >= 0.0 {
+            return Self::new(self.re.log10(), 0.0);
+        }
+        let l = self.ln();
+        let inv = 1.0 / std::f64::consts::LN_10;
+        Self::new(l.re * inv, l.im * inv)
+    }
+
+    pub fn log2(self) -> Self {
+        if self.im == 0.0 && self.re >= 0.0 {
+            return Self::new(self.re.log2(), 0.0);
+        }
+        let l = self.ln();
+        let inv = 1.0 / std::f64::consts::LN_2;
+        Self::new(l.re * inv, l.im * inv)
+    }
+
+    /// Principal complex arcsin: `-i * ln(i*z + sqrt(1 - z^2))`
+    pub fn asin(self) -> Self {
+        if self.im == 0.0 && self.re.abs() <= 1.0 {
+            return Self::new(self.re.asin(), 0.0);
+        }
+        let iz = Self::new(-self.im, self.re);
+        let root = (Self::ONE - self * self).sqrt();
+        let w = (iz + root).ln();
+        Self::new(w.im, -w.re)
+    }
+
+    /// Principal complex arccos: `pi/2 - asin(z)`
+    pub fn acos(self) -> Self {
+        if self.im == 0.0 && self.re.abs() <= 1.0 {
+            return Self::new(self.re.acos(), 0.0);
+        }
+        Self::from_real(std::f64::consts::FRAC_PI_2) - self.asin()
+    }
+
+    /// Principal complex arctan: `(i/2) * ln((1 - i*z) / (1 + i*z))`
+    pub fn atan(self) -> Self {
+        if self.im == 0.0 {
+            return Self::new(self.re.atan(), 0.0);
+        }
+        let iz = Self::new(-self.im, self.re);
+        let w = ((Self::ONE - iz) / (Self::ONE + iz)).ln();
+        Self::new(-0.5 * w.im, 0.5 * w.re)
+    }
+
+    /// MATLAB `sign(z)`: `NaN` stays `NaN`, real `0` stays `0`, otherwise `z / |z|`.
+    pub fn sign(self) -> Self {
+        if self.re.is_nan() || self.im.is_nan() {
+            return Self::new(f64::NAN, 0.0);
+        }
+        if self.im == 0.0 {
+            if self.re > 0.0 {
+                Self::ONE
+            } else if self.re < 0.0 {
+                Self::from_real(-1.0)
+            } else {
+                Self::ZERO
+            }
+        } else {
+            let r = self.abs();
+            if r == 0.0 {
+                Self::ZERO
+            } else {
+                Self::new(self.re / r, self.im / r)
+            }
+        }
+    }
+
     pub fn powc(self, exp: Self) -> Self {
         if exp.im == 0.0 && self.im == 0.0 && (self.re >= 0.0 || exp.re.fract() == 0.0) {
             return Self::new(self.re.powf(exp.re), 0.0);

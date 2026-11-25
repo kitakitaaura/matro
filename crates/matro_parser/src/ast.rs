@@ -207,6 +207,7 @@ pub enum BinaryOp {
     Div,
     ElemDiv,
     LeftDiv,
+    ElemLeftDiv,
     Pow,
     ElemPow,
     Eq,

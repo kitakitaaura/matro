@@ -105,10 +105,27 @@ pub fn make_duration_from_secs(secs: Vec<f64>) -> Value {
     })
 }
 
+fn parse_month_abbrev(s: &str) -> Option<i64> {
+    match s.to_ascii_lowercase().as_str() {
+        "jan" | "january" => Some(1),
+        "feb" | "february" => Some(2),
+        "mar" | "march" => Some(3),
+        "apr" | "april" => Some(4),
+        "may" => Some(5),
+        "jun" | "june" => Some(6),
+        "jul" | "july" => Some(7),
+        "aug" | "august" => Some(8),
+        "sep" | "sept" | "september" => Some(9),
+        "oct" | "october" => Some(10),
+        "nov" | "november" => Some(11),
+        "dec" | "december" => Some(12),
+        _ => None,
+    }
+}
+
 fn parse_iso_datetime(s: &str) -> Result<f64> {
     let trimmed = s.trim();
     if trimmed.eq_ignore_ascii_case("now") || trimmed.eq_ignore_ascii_case("today") {
-        // Deterministic epoch fallback on wasm32; real wall-clock on native
         #[cfg(not(target_arch = "wasm32"))]
         {
             let secs = std::time::SystemTime::now()
@@ -128,16 +145,33 @@ fn parse_iso_datetime(s: &str) -> Result<f64> {
     let (date_part, time_part) = trimmed
         .split_once([' ', 'T'])
         .unwrap_or((trimmed, "00:00:00"));
-    let dparts: Vec<i64> = date_part
-        .split(['-', '/'])
-        .map(|p| p.parse::<i64>())
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|_| MatroError::runtime(format!("datetime: invalid date string '{s}'")))?;
-    if dparts.len() != 3 {
+    let raw_parts: Vec<&str> = date_part.split(['-', '/']).collect();
+    if raw_parts.len() != 3 {
         return Err(MatroError::runtime(format!(
-            "datetime: expected YYYY-MM-DD, got '{s}'"
+            "datetime: invalid date string '{s}'"
         )));
     }
+    let (y, m, d) = if let Some(mo) = parse_month_abbrev(raw_parts[1]) {
+        // MATLAB format: `15-Jan-2026`
+        let day = raw_parts[0]
+            .parse::<i64>()
+            .map_err(|_| MatroError::runtime(format!("datetime: invalid day in '{s}'")))?;
+        let yr = raw_parts[2]
+            .parse::<i64>()
+            .map_err(|_| MatroError::runtime(format!("datetime: invalid year in '{s}'")))?;
+        (yr, mo, day)
+    } else {
+        let p0 = raw_parts[0]
+            .parse::<i64>()
+            .map_err(|_| MatroError::runtime(format!("datetime: invalid date string '{s}'")))?;
+        let p1 = raw_parts[1]
+            .parse::<i64>()
+            .map_err(|_| MatroError::runtime(format!("datetime: invalid date string '{s}'")))?;
+        let p2 = raw_parts[2]
+            .parse::<i64>()
+            .map_err(|_| MatroError::runtime(format!("datetime: invalid date string '{s}'")))?;
+        (p0, p1, p2)
+    };
     let tparts: Vec<f64> = time_part
         .trim_end_matches('Z')
         .split(':')
@@ -146,11 +180,11 @@ fn parse_iso_datetime(s: &str) -> Result<f64> {
     let h = tparts.first().copied().unwrap_or(0.0);
     let mi = tparts.get(1).copied().unwrap_or(0.0);
     let sec = tparts.get(2).copied().unwrap_or(0.0);
-    let days = days_from_civil(dparts[0], dparts[1], dparts[2]);
+    let days = days_from_civil(y, m, d);
     Ok((days as f64) * 86400.0 + h * 3600.0 + mi * 60.0 + sec)
 }
 
-/// `datetime('2026-01-15')` | `datetime(Y, M, D [, H, MI, S])` | `datetime('now')`
+/// `datetime('2026-01-15')` | `datetime('15-Jan-2026')` | `datetime([Y M D])` | `datetime(Y, M, D [, H, MI, S])`
 pub fn fn_datetime(args: &[Value]) -> Result<Vec<Value>> {
     if args.is_empty() {
         return ok1(make_datetime_from_epochs(vec![parse_iso_datetime("now")?]));
@@ -158,6 +192,22 @@ pub fn fn_datetime(args: &[Value]) -> Result<Vec<Value>> {
     if args.len() == 1 {
         match &args[0] {
             Value::String(s) => return ok1(make_datetime_from_epochs(vec![parse_iso_datetime(s)?])),
+            Value::Matrix(mat) => {
+                // `datetime([Y, M, D])` or `datetime([Y, M, D, H, MI, S])` (N x 3 or N x 6)
+                if mat.cols() == 3 || mat.cols() == 6 {
+                    let mut epochs = Vec::with_capacity(mat.rows());
+                    for r in 0..mat.rows() {
+                        let y = mat.get(r, 0).round() as i64;
+                        let mo = mat.get(r, 1).round() as i64;
+                        let d = mat.get(r, 2).round() as i64;
+                        let h = if mat.cols() == 6 { mat.get(r, 3) } else { 0.0 };
+                        let mi = if mat.cols() == 6 { mat.get(r, 4) } else { 0.0 };
+                        let s = if mat.cols() == 6 { mat.get(r, 5) } else { 0.0 };
+                        epochs.push(days_from_civil(y, mo, d) as f64 * 86400.0 + h * 3600.0 + mi * 60.0 + s);
+                    }
+                    return ok1(make_datetime_from_epochs(epochs));
+                }
+            }
             Value::Cell(c) => {
                 let mut epochs = Vec::with_capacity(c.data.len());
                 for item in &c.data {
@@ -455,15 +505,43 @@ pub fn fn_split(args: &[Value]) -> Result<Vec<Value>> {
         return Err(MatroError::arity("split", "1 or 2", args.len()));
     }
     let strs = extract_strings(&args[0])?;
-    let s = strs.first().map(String::as_str).unwrap_or("");
-    let parts: Vec<String> = if let Some(d) = args.get(1) {
+    let delim_opt: Option<String> = if let Some(d) = args.get(1) {
         let ds = extract_strings(d)?;
-        let delim = ds.first().map(String::as_str).unwrap_or(" ");
-        s.split(delim).map(ToString::to_string).collect()
+        Some(ds.first().cloned().unwrap_or_else(|| " ".to_string()))
     } else {
-        s.split_whitespace().map(ToString::to_string).collect()
+        None
     };
-    ok1(make_string_array(parts)?)
+    let split_one = |s: &str| -> Vec<String> {
+        match &delim_opt {
+            Some(delim) => s.split(delim.as_str()).map(ToString::to_string).collect(),
+            None => s.split_whitespace().map(ToString::to_string).collect(),
+        }
+    };
+    if strs.len() <= 1 {
+        let s = strs.first().map(String::as_str).unwrap_or("");
+        return ok1(make_string_array(split_one(s))?);
+    }
+    // Multi-element string array: build N x K cell matrix (pad short rows with "")
+    let rows_parts: Vec<Vec<String>> = strs.iter().map(|s| split_one(s)).collect();
+    let max_k = rows_parts.iter().map(Vec::len).max().unwrap_or(0);
+    let rows_vals: Vec<Vec<Value>> = rows_parts
+        .into_iter()
+        .map(|mut r| {
+            r.resize(max_k, String::new());
+            r.into_iter().map(Value::String).collect()
+        })
+        .collect();
+    let cell = if rows_vals.is_empty() || max_k == 0 {
+        CellArray::empty()
+    } else {
+        CellArray::from_rows(rows_vals)?
+    };
+    let mut fields = BTreeMap::new();
+    fields.insert("Data".to_string(), Value::Cell(cell));
+    ok1(Value::Object(ObjectInstance {
+        class_name: "string".to_string(),
+        fields,
+    }))
 }
 
 pub fn fn_join(args: &[Value]) -> Result<Vec<Value>> {

@@ -9,23 +9,36 @@ fn ok1(v: Value) -> Result<Vec<Value>> {
 }
 
 /// `table(col1, col2, ..., 'VariableNames', {'A', 'B'})`
+/// or `table('Size', [nr nc], 'VariableTypes', {...}, 'VariableNames', {...})`
 pub fn fn_table(args: &[Value]) -> Result<Vec<Value>> {
     let mut cols = Vec::new();
     let mut custom_names: Option<Vec<String>> = None;
+    let mut prealloc_size: Option<(usize, usize)> = None;
+    let mut var_types: Option<Vec<String>> = None;
     let mut i = 0;
     while i < args.len() {
         if let Ok(s) = args[i].as_str() {
-            if s.eq_ignore_ascii_case("VariableNames") && i + 1 < args.len() {
-                let Value::Cell(c) = &args[i + 1] else {
-                    return Err(MatroError::runtime(
-                        "table: 'VariableNames' must be a cell array of strings",
-                    ));
-                };
-                let mut names = Vec::with_capacity(c.data.len());
-                for item in &c.data {
-                    names.push(item.as_str()?.to_string());
-                }
+            let low = s.to_ascii_lowercase();
+            if low == "variablenames" && i + 1 < args.len() {
+                let names = extract_name_list(&args[i + 1])?;
                 custom_names = Some(names);
+                i += 2;
+                continue;
+            } else if low == "size" && i + 1 < args.len() {
+                let sz = args[i + 1].to_dense_matrix()?;
+                if sz.len() >= 2 {
+                    prealloc_size = Some((
+                        sz.data()[0].max(0.0).round() as usize,
+                        sz.data()[1].max(0.0).round() as usize,
+                    ));
+                }
+                i += 2;
+                continue;
+            } else if low == "variabletypes" && i + 1 < args.len() {
+                var_types = Some(extract_name_list(&args[i + 1])?);
+                i += 2;
+                continue;
+            } else if low == "rownames" && i + 1 < args.len() {
                 i += 2;
                 continue;
             }
@@ -33,11 +46,47 @@ pub fn fn_table(args: &[Value]) -> Result<Vec<Value>> {
         cols.push(args[i].clone());
         i += 1;
     }
+    if let Some((nr, nc)) = prealloc_size {
+        if cols.is_empty() {
+            for c in 0..nc {
+                let vt = var_types
+                    .as_ref()
+                    .and_then(|v| v.get(c))
+                    .map(|s| s.to_ascii_lowercase())
+                    .unwrap_or_else(|| "double".to_string());
+                let col = match vt.as_str() {
+                    "string" | "cell" | "cellstr" | "char" => {
+                        let data = vec![Value::String(String::new()); nr];
+                        Value::Cell(CellArray {
+                            rows: nr,
+                            cols: if nr == 0 { 0 } else { 1 },
+                            data,
+                        })
+                    }
+                    "logical" => Value::matrix(Matrix::zeros(nr, 1).with_logical(true)),
+                    _ => Value::matrix(Matrix::zeros(nr, 1)),
+                };
+                cols.push(col);
+            }
+        }
+    }
     let names = match custom_names {
         Some(n) => n,
         None => (1..=cols.len()).map(|k| format!("Var{k}")).collect(),
     };
     ok1(Value::Table(TableData::new(names, cols)?))
+}
+
+fn extract_name_list(v: &Value) -> Result<Vec<String>> {
+    match v {
+        Value::String(s) => Ok(vec![s.clone()]),
+        Value::Cell(c) => c.data.iter().map(|x| Ok(x.as_str()?.to_string())).collect(),
+        Value::Object(o) if o.class_name == "string" => match o.fields.get("Data") {
+            Some(Value::Cell(c)) => c.data.iter().map(|x| Ok(x.as_str()?.to_string())).collect(),
+            _ => Ok(Vec::new()),
+        },
+        _ => Err(MatroError::runtime("Expected string, cellstr, or string array")),
+    }
 }
 
 pub fn fn_height(args: &[Value]) -> Result<Vec<Value>> {
@@ -132,54 +181,91 @@ pub fn fn_sortrows(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
     if args.is_empty() || args.len() > 3 {
         return Err(MatroError::arity("sortrows", "1 to 3", args.len()));
     }
-    let desc = args
-        .get(2)
-        .and_then(|v| v.as_str().ok())
-        .is_some_and(|s| s.eq_ignore_ascii_case("descend"));
+    // Handle `sortrows(A, 'descend')` / `sortrows(A, 'ascend')` where 2nd arg is direction!
+    let (col_spec, dir_arg) = if args.len() == 2 {
+        if let Some(s) = crate::value_as_text(&args[1]) {
+            if s.eq_ignore_ascii_case("ascend") || s.eq_ignore_ascii_case("descend") {
+                (None, Some(args[1].clone()))
+            } else {
+                (Some(&args[1]), None)
+            }
+        } else {
+            (Some(&args[1]), None)
+        }
+    } else {
+        (args.get(1), args.get(2).cloned())
+    };
+    let dir_list: Vec<bool> = match &dir_arg {
+        None => vec![false],
+        Some(v) => {
+            if let Ok(names) = extract_name_list(v) {
+                names.iter().map(|s| s.eq_ignore_ascii_case("descend")).collect()
+            } else {
+                vec![false]
+            }
+        }
+    };
+    let dir_for = |k: usize| -> bool {
+        if dir_list.len() == 1 {
+            dir_list[0]
+        } else {
+            dir_list.get(k).copied().unwrap_or(false)
+        }
+    };
 
     match &args[0] {
         Value::Table(t) => {
-            let col_idx = match args.get(1) {
-                None => 0usize,
-                Some(Value::String(name)) => t.col_index(name).ok_or_else(|| {
-                    MatroError::runtime(format!("sortrows: unknown table variable '{name}'"))
-                })?,
-                Some(v) => {
-                    let s = v.as_scalar()?.round() as isize;
-                    if s == 0 {
-                        return Err(MatroError::index("sortrows: column index must be non-zero"));
+            let mut key_cols: Vec<(usize, bool)> = Vec::new();
+            match col_spec {
+                None => {
+                    for c in 0..t.width() {
+                        key_cols.push((c, dir_for(c)));
                     }
-                    let idx = (s.unsigned_abs()) - 1;
-                    if idx >= t.width() {
-                        return Err(MatroError::index("sortrows: column index out of bounds"));
-                    }
-                    idx
                 }
-            };
-            let neg_col = args
-                .get(1)
-                .and_then(|v| v.as_scalar().ok())
-                .is_some_and(|s| s < 0.0);
-            let descending = desc ^ neg_col;
+                Some(Value::String(name)) => {
+                    let idx = t.col_index(name).ok_or_else(|| {
+                        MatroError::runtime(format!("sortrows: unknown table variable '{name}'"))
+                    })?;
+                    key_cols.push((idx, dir_for(0)));
+                }
+                Some(Value::Cell(_)) | Some(Value::Object(_)) => {
+                    let names = extract_name_list(col_spec.unwrap())?;
+                    for (k, name) in names.iter().enumerate() {
+                        let idx = t.col_index(name).ok_or_else(|| {
+                            MatroError::runtime(format!("sortrows: unknown table variable '{name}'"))
+                        })?;
+                        key_cols.push((idx, dir_for(k)));
+                    }
+                }
+                Some(v) => {
+                    for (k, &val) in v.to_dense_matrix()?.data().iter().enumerate() {
+                        let s = val.round() as isize;
+                        if s == 0 {
+                            return Err(MatroError::index("sortrows: column index must be non-zero"));
+                        }
+                        let idx = s.unsigned_abs() - 1;
+                        if idx >= t.width() {
+                            return Err(MatroError::index("sortrows: column index out of bounds"));
+                        }
+                        key_cols.push((idx, (s < 0) ^ dir_for(k)));
+                    }
+                }
+            }
 
             let mut order: Vec<usize> = (0..t.nrows).collect();
-            match &t.columns[col_idx] {
-                Value::Matrix(m) => {
-                    order.sort_by(|&a, &b| {
-                        let cmp = m.get(a, 0).total_cmp(&m.get(b, 0));
-                        if descending { cmp.reverse() } else { cmp }
-                    });
+            order.sort_by(|&a, &b| {
+                for &(c, descending) in &key_cols {
+                    let cmp = match &t.columns[c] {
+                        Value::Matrix(m) => m.get(a, 0).total_cmp(&m.get(b, 0)),
+                        Value::Cell(cell) => format!("{}", cell.data[a]).cmp(&format!("{}", cell.data[b])),
+                        _ => std::cmp::Ordering::Equal,
+                    };
+                    if cmp != std::cmp::Ordering::Equal {
+                        return if descending { cmp.reverse() } else { cmp };
+                    }
                 }
-                Value::Cell(c) => {
-                    order.sort_by(|&a, &b| {
-                        let sa = format!("{}", c.data[a]);
-                        let sb = format!("{}", c.data[b]);
-                        let cmp = sa.cmp(&sb);
-                        if descending { cmp.reverse() } else { cmp }
-                    });
-                }
-                _ => {}
-            }
+                std::cmp::Ordering::Equal
+            });
             let all_cols: Vec<usize> = (0..t.width()).collect();
             let sorted = t.slice(&order, &all_cols)?;
             if nargout >= 2 {
@@ -194,18 +280,18 @@ pub fn fn_sortrows(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
         }
         Value::Matrix(m) => {
             let mut key_cols: Vec<(usize, bool)> = Vec::new();
-            if let Some(col_arg) = args.get(1) {
-                for &v in col_arg.as_matrix()?.data() {
+            if let Some(col_arg) = col_spec {
+                for (k, &v) in col_arg.to_dense_matrix()?.data().iter().enumerate() {
                     let i = v.round() as isize;
                     let idx = i.unsigned_abs().saturating_sub(1);
                     if idx >= m.cols() {
                         return Err(MatroError::index("sortrows: column index out of bounds"));
                     }
-                    key_cols.push((idx, (i < 0) ^ desc));
+                    key_cols.push((idx, (i < 0) ^ dir_for(k)));
                 }
             } else {
                 for c in 0..m.cols() {
-                    key_cols.push((c, desc));
+                    key_cols.push((c, dir_for(c)));
                 }
             }
             let mut order: Vec<usize> = (0..m.rows()).collect();
@@ -642,30 +728,45 @@ pub fn fn_table_join(args: &[Value], kind: JoinKind) -> Result<Vec<Value>> {
     let (Value::Table(t1), Value::Table(t2)) = (&args[0], &args[1]) else {
         return Err(MatroError::runtime("join: first two arguments must be tables"));
     };
-    let mut key_name: Option<String> = None;
+    let mut left_key_name: Option<String> = None;
+    let mut right_key_name: Option<String> = None;
+    let mut outer_type = "full".to_string();
     let mut i = 2;
     while i + 1 < args.len() {
         if let Ok(k) = args[i].as_str() {
-            if k.eq_ignore_ascii_case("Keys") {
-                key_name = Some(args[i + 1].as_str()?.to_string());
+            match k.to_ascii_lowercase().as_str() {
+                "keys" => {
+                    let kn = args[i + 1].as_str()?.to_string();
+                    left_key_name = Some(kn.clone());
+                    right_key_name = Some(kn);
+                }
+                "leftkeys" => left_key_name = Some(args[i + 1].as_str()?.to_string()),
+                "rightkeys" => right_key_name = Some(args[i + 1].as_str()?.to_string()),
+                "type" => outer_type = args[i + 1].as_str()?.to_ascii_lowercase(),
+                _ => {}
             }
         }
         i += 2;
     }
-    let key = match key_name {
-        Some(k) => k,
-        None => t1
-            .col_names
-            .iter()
-            .find(|n| t2.col_names.contains(*n))
-            .cloned()
-            .ok_or_else(|| MatroError::runtime("join: no common key variable between tables"))?,
+    let (lkey, rkey) = match (left_key_name, right_key_name) {
+        (Some(lk), Some(rk)) => (lk, rk),
+        (Some(lk), None) => (lk.clone(), lk),
+        (None, Some(rk)) => (rk.clone(), rk),
+        (None, None) => {
+            let common = t1
+                .col_names
+                .iter()
+                .find(|n| t2.col_names.contains(*n))
+                .cloned()
+                .ok_or_else(|| MatroError::runtime("join: no common key variable between tables"))?;
+            (common.clone(), common)
+        }
     };
-    let k1 = t1.col_index(&key).ok_or_else(|| {
-        MatroError::runtime(format!("join: key '{key}' not found in left table"))
+    let k1 = t1.col_index(&lkey).ok_or_else(|| {
+        MatroError::runtime(format!("join: key '{lkey}' not found in left table"))
     })?;
-    let k2 = t2.col_index(&key).ok_or_else(|| {
-        MatroError::runtime(format!("join: key '{key}' not found in right table"))
+    let k2 = t2.col_index(&rkey).ok_or_else(|| {
+        MatroError::runtime(format!("join: key '{rkey}' not found in right table"))
     })?;
 
     let mut pairs: Vec<(Option<usize>, Option<usize>)> = Vec::new();
@@ -691,12 +792,14 @@ pub fn fn_table_join(args: &[Value], kind: JoinKind) -> Result<Vec<Value>> {
                         "join: key '{kv}' in left table not found in right table (use outerjoin or innerjoin)"
                     )));
                 }
-                JoinKind::Outer => pairs.push((Some(r1), None)),
-                JoinKind::Inner => {}
+                JoinKind::Outer if outer_type == "full" || outer_type == "left" => {
+                    pairs.push((Some(r1), None));
+                }
+                _ => {}
             }
         }
     }
-    if kind == JoinKind::Outer {
+    if kind == JoinKind::Outer && (outer_type == "full" || outer_type == "right") {
         for (r2, &m) in matched_r2.iter().enumerate() {
             if !m {
                 pairs.push((None, Some(r2)));
@@ -710,8 +813,7 @@ pub fn fn_table_join(args: &[Value], kind: JoinKind) -> Result<Vec<Value>> {
     let mut out_names = Vec::new();
     let mut out_cols = Vec::new();
 
-    // Key column (merge left/right for outerjoin)
-    out_names.push(key.clone());
+    out_names.push(lkey.clone());
     match &t1.columns[k1] {
         Value::Matrix(_) => {
             let mut vals = Vec::with_capacity(pairs.len());
@@ -750,7 +852,7 @@ pub fn fn_table_join(args: &[Value], kind: JoinKind) -> Result<Vec<Value>> {
         if c == k1 {
             continue;
         }
-        let col_name = if t2.col_names.contains(cname) {
+        let col_name = if t2.col_names.contains(cname) && cname != &rkey {
             format!("{cname}_left")
         } else {
             cname.clone()
@@ -762,7 +864,7 @@ pub fn fn_table_join(args: &[Value], kind: JoinKind) -> Result<Vec<Value>> {
         if c == k2 {
             continue;
         }
-        let col_name = if t1.col_names.contains(cname) {
+        let col_name = if t1.col_names.contains(cname) && cname != &lkey {
             format!("{cname}_right")
         } else {
             cname.clone()
@@ -774,22 +876,49 @@ pub fn fn_table_join(args: &[Value], kind: JoinKind) -> Result<Vec<Value>> {
     ok1(Value::Table(TableData::new(out_names, out_cols)?))
 }
 
-/// `groupsummary(T, groupvar, method [, datavars])`
+#[derive(Clone, PartialEq)]
+enum GroupKeyAtom {
+    Num(f64),
+    Str(String),
+}
+impl Eq for GroupKeyAtom {}
+impl PartialOrd for GroupKeyAtom {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for GroupKeyAtom {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Self::Num(a), Self::Num(b)) => a.total_cmp(b),
+            (Self::Str(a), Self::Str(b)) => a.cmp(b),
+            (Self::Num(_), Self::Str(_)) => std::cmp::Ordering::Less,
+            (Self::Str(_), Self::Num(_)) => std::cmp::Ordering::Greater,
+        }
+    }
+}
+
+/// `groupsummary(T, groupvars, method [, datavars])`
 pub fn fn_groupsummary(args: &[Value]) -> Result<Vec<Value>> {
     if args.len() < 2 || args.len() > 4 {
         return Err(MatroError::arity(
             "groupsummary",
-            "2 to 4 (T, groupvar [, method [, datavars]])",
+            "2 to 4 (T, groupvars [, method [, datavars]])",
             args.len(),
         ));
     }
     let Value::Table(t) = &args[0] else {
         return Err(MatroError::runtime("groupsummary: first argument must be a table"));
     };
-    let gvar = args[1].as_str()?;
-    let g_idx = t.col_index(gvar).ok_or_else(|| {
-        MatroError::runtime(format!("groupsummary: unknown grouping variable '{gvar}'"))
-    })?;
+    let gvars = extract_name_list(&args[1])?;
+    let g_idxs: Vec<usize> = gvars
+        .iter()
+        .map(|gvar| {
+            t.col_index(gvar).ok_or_else(|| {
+                MatroError::runtime(format!("groupsummary: unknown grouping variable '{gvar}'"))
+            })
+        })
+        .collect::<Result<_>>()?;
     let method = args
         .get(2)
         .and_then(|v| v.as_str().ok())
@@ -797,11 +926,7 @@ pub fn fn_groupsummary(args: &[Value]) -> Result<Vec<Value>> {
         .to_ascii_lowercase();
 
     let data_cols: Vec<usize> = if let Some(dv) = args.get(3) {
-        let names: Vec<String> = match dv {
-            Value::String(s) => vec![s.clone()],
-            Value::Cell(c) => c.data.iter().map(|v| Ok(v.as_str()?.to_string())).collect::<Result<_>>()?,
-            _ => return Err(MatroError::runtime("groupsummary: datavars must be string or cellstr")),
-        };
+        let names = extract_name_list(dv)?;
         names
             .iter()
             .map(|n| {
@@ -812,25 +937,33 @@ pub fn fn_groupsummary(args: &[Value]) -> Result<Vec<Value>> {
             .collect::<Result<_>>()?
     } else {
         (0..t.width())
-            .filter(|&c| c != g_idx && matches!(t.columns[c], Value::Matrix(_)))
+            .filter(|&c| !g_idxs.contains(&c) && matches!(t.columns[c], Value::Matrix(_)))
             .collect()
     };
 
-    // Group row indices preserving sorted unique key order
-    let mut groups: std::collections::BTreeMap<String, Vec<usize>> = std::collections::BTreeMap::new();
+    let mut groups: std::collections::BTreeMap<Vec<GroupKeyAtom>, Vec<usize>> =
+        std::collections::BTreeMap::new();
     for r in 0..t.nrows {
-        let k = table_cell_key(&t.columns[g_idx], r);
-        groups.entry(k).or_default().push(r);
+        let key: Vec<GroupKeyAtom> = g_idxs
+            .iter()
+            .map(|&gi| match &t.columns[gi] {
+                Value::Matrix(m) => GroupKeyAtom::Num(m.get(r, 0)),
+                other => GroupKeyAtom::Str(table_cell_key(other, r)),
+            })
+            .collect();
+        groups.entry(key).or_default().push(r);
     }
 
     let first_rows: Vec<Option<usize>> = groups.values().map(|rs| rs.first().copied()).collect();
     let counts: Vec<f64> = groups.values().map(|rs| rs.len() as f64).collect();
 
-    let mut out_names = vec![gvar.to_string(), "GroupCount".to_string()];
-    let mut out_cols = vec![
-        build_col_from_rows(&t.columns[g_idx], &first_rows)?,
-        Value::matrix(Matrix::col_vec(counts)),
-    ];
+    let mut out_names = gvars.clone();
+    let mut out_cols: Vec<Value> = g_idxs
+        .iter()
+        .map(|&gi| build_col_from_rows(&t.columns[gi], &first_rows))
+        .collect::<Result<_>>()?;
+    out_names.push("GroupCount".to_string());
+    out_cols.push(Value::matrix(Matrix::col_vec(counts)));
 
     if method != "count" && method != "none" {
         for &dc in &data_cols {
@@ -843,14 +976,20 @@ pub fn fn_groupsummary(args: &[Value]) -> Result<Vec<Value>> {
                     "sum" => vals.iter().sum::<f64>(),
                     "min" => vals.iter().copied().fold(f64::INFINITY, f64::min),
                     "max" => vals.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-                    "std" => {
+                    "median" => {
+                        let mut s = vals;
+                        s.sort_by(f64::total_cmp);
+                        let n = s.len();
+                        if n % 2 == 1 { s[n / 2] } else { 0.5 * (s[n / 2 - 1] + s[n / 2]) }
+                    }
+                    "std" | "var" => {
                         if vals.len() <= 1 {
                             0.0
                         } else {
                             let mu = vals.iter().sum::<f64>() / (vals.len() as f64);
                             let var = vals.iter().map(|&x| (x - mu).powi(2)).sum::<f64>()
                                 / ((vals.len() - 1) as f64);
-                            var.sqrt()
+                            if method == "std" { var.sqrt() } else { var }
                         }
                     }
                     other => {
@@ -867,5 +1006,261 @@ pub fn fn_groupsummary(args: &[Value]) -> Result<Vec<Value>> {
     }
 
     ok1(Value::Table(TableData::new(out_names, out_cols)?))
+}
+
+pub fn fn_addvars(args: &[Value]) -> Result<Vec<Value>> {
+    if args.len() < 2 {
+        return Err(MatroError::arity("addvars", ">= 2 (T, var1, ...)", args.len()));
+    }
+    let Value::Table(t) = &args[0] else {
+        return Err(MatroError::runtime("addvars: first argument must be a table"));
+    };
+    let mut new_cols = Vec::new();
+    let mut new_names: Option<Vec<String>> = None;
+    let mut before: Option<String> = None;
+    let mut after: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        if let Ok(k) = args[i].as_str() {
+            if i + 1 < args.len() {
+                match k.to_ascii_lowercase().as_str() {
+                    "newvariablenames" => {
+                        new_names = Some(extract_name_list(&args[i + 1])?);
+                        i += 2;
+                        continue;
+                    }
+                    "before" => {
+                        before = Some(args[i + 1].as_str()?.to_string());
+                        i += 2;
+                        continue;
+                    }
+                    "after" => {
+                        after = Some(args[i + 1].as_str()?.to_string());
+                        i += 2;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        new_cols.push(args[i].clone());
+        i += 1;
+    }
+    let mut names = t.col_names.clone();
+    let mut cols = t.columns.clone();
+    let insert_idx = if let Some(b) = before {
+        t.col_index(&b).unwrap_or(cols.len())
+    } else if let Some(a) = after {
+        t.col_index(&a).map(|idx| idx + 1).unwrap_or(cols.len())
+    } else {
+        cols.len()
+    };
+    let add_names: Vec<String> = match new_names {
+        Some(ns) if ns.len() == new_cols.len() => ns,
+        _ => (1..=new_cols.len())
+            .map(|k| format!("Var{}", t.width() + k))
+            .collect(),
+    };
+    for (offset, (nm, col)) in add_names.into_iter().zip(new_cols.into_iter()).enumerate() {
+        names.insert(insert_idx + offset, nm);
+        cols.insert(insert_idx + offset, col);
+    }
+    ok1(Value::Table(TableData::new(names, cols)?))
+}
+
+pub fn fn_movevars(args: &[Value]) -> Result<Vec<Value>> {
+    if args.len() < 4 {
+        return Err(MatroError::arity("movevars", "4 (T, vars, 'Before'|'After', loc)", args.len()));
+    }
+    let Value::Table(t) = &args[0] else {
+        return Err(MatroError::runtime("movevars: first argument must be a table"));
+    };
+    let to_move = extract_name_list(&args[1])?;
+    let rel = args[2].as_str()?.to_ascii_lowercase();
+    let loc_name = args[3].as_str()?;
+
+    let mut moved_names = Vec::new();
+    let mut moved_cols = Vec::new();
+    let mut rem_names = Vec::new();
+    let mut rem_cols = Vec::new();
+    for (nm, col) in t.col_names.iter().zip(t.columns.iter()) {
+        if to_move.contains(nm) {
+            moved_names.push(nm.clone());
+            moved_cols.push(col.clone());
+        } else {
+            rem_names.push(nm.clone());
+            rem_cols.push(col.clone());
+        }
+    }
+    let pos = rem_names
+        .iter()
+        .position(|n| n == loc_name)
+        .map(|idx| if rel == "after" { idx + 1 } else { idx })
+        .unwrap_or(rem_names.len());
+    for (off, (nm, col)) in moved_names.into_iter().zip(moved_cols.into_iter()).enumerate() {
+        rem_names.insert(pos + off, nm);
+        rem_cols.insert(pos + off, col);
+    }
+    ok1(Value::Table(TableData::new(rem_names, rem_cols)?))
+}
+
+pub fn fn_table2struct(args: &[Value]) -> Result<Vec<Value>> {
+    if args.is_empty() {
+        return Err(MatroError::arity("table2struct", ">= 1 (T [, 'ToScalar', tf])", 0));
+    }
+    let Value::Table(t) = &args[0] else {
+        return Err(MatroError::runtime("table2struct: expected a table"));
+    };
+    let mut to_scalar = false;
+    let mut i = 1;
+    while i + 1 < args.len() {
+        if let Ok(k) = args[i].as_str() {
+            if k.eq_ignore_ascii_case("ToScalar") {
+                to_scalar = args[i + 1].is_truthy();
+            }
+        }
+        i += 2;
+    }
+    if to_scalar {
+        let mut st = std::collections::BTreeMap::new();
+        for (nm, col) in t.col_names.iter().zip(t.columns.iter()) {
+            st.insert(nm.clone(), col.clone());
+        }
+        return ok1(Value::Struct(st));
+    }
+    let mut items = Vec::with_capacity(t.nrows);
+    for r in 0..t.nrows {
+        let mut st = std::collections::BTreeMap::new();
+        for (nm, col) in t.col_names.iter().zip(t.columns.iter()) {
+            st.insert(nm.clone(), table_col_elem_opt(col, Some(r)));
+        }
+        items.push(st);
+    }
+    ok1(Value::StructArray(matro_types::StructArray {
+        rows: t.nrows,
+        cols: if t.nrows == 0 { 0 } else { 1 },
+        items,
+    }))
+}
+
+pub fn fn_struct2table(args: &[Value]) -> Result<Vec<Value>> {
+    if args.is_empty() {
+        return Err(MatroError::arity("struct2table", "1 (S)", 0));
+    }
+    match &args[0] {
+        Value::Struct(map) => {
+            let mut names = Vec::with_capacity(map.len());
+            let mut cols = Vec::with_capacity(map.len());
+            for (k, v) in map {
+                names.push(k.clone());
+                cols.push(v.clone());
+            }
+            ok1(Value::Table(TableData::new(names, cols)?))
+        }
+        Value::StructArray(sa) => {
+            if sa.items.is_empty() {
+                return ok1(Value::Table(TableData::new(vec![], vec![])?));
+            }
+            let names: Vec<String> = sa.items[0].keys().cloned().collect();
+            let mut cols = Vec::with_capacity(names.len());
+            for nm in &names {
+                let all_scalar = sa
+                    .items
+                    .iter()
+                    .all(|st| st.get(nm).and_then(|v| v.as_scalar().ok()).is_some());
+                if all_scalar {
+                    let vals: Vec<f64> = sa
+                        .items
+                        .iter()
+                        .map(|st| st[nm].as_scalar().unwrap_or(f64::NAN))
+                        .collect();
+                    cols.push(Value::matrix(Matrix::col_vec(vals)));
+                } else {
+                    let data: Vec<Value> = sa
+                        .items
+                        .iter()
+                        .map(|st| st.get(nm).cloned().unwrap_or_else(Value::empty))
+                        .collect();
+                    cols.push(Value::Cell(CellArray {
+                        rows: data.len(),
+                        cols: if data.is_empty() { 0 } else { 1 },
+                        data,
+                    }));
+                }
+            }
+            ok1(Value::Table(TableData::new(names, cols)?))
+        }
+        other => Err(MatroError::runtime(format!(
+            "struct2table: expected struct or struct array, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+pub fn fn_cell2table(args: &[Value]) -> Result<Vec<Value>> {
+    if args.is_empty() {
+        return Err(MatroError::arity("cell2table", ">= 1 (C [, 'VariableNames', {...}])", 0));
+    }
+    let Value::Cell(c) = &args[0] else {
+        return Err(MatroError::runtime("cell2table: first argument must be a cell array"));
+    };
+    let mut names: Vec<String> = (1..=c.cols).map(|k| format!("Var{k}")).collect();
+    let mut i = 1;
+    while i + 1 < args.len() {
+        if let Ok(k) = args[i].as_str() {
+            if k.eq_ignore_ascii_case("VariableNames") {
+                names = extract_name_list(&args[i + 1])?;
+            }
+        }
+        i += 2;
+    }
+    let mut cols = Vec::with_capacity(c.cols);
+    for col in 0..c.cols {
+        let mut all_num = c.rows > 0;
+        let mut nums = Vec::with_capacity(c.rows);
+        let mut vals = Vec::with_capacity(c.rows);
+        for row in 0..c.rows {
+            let v = c.get(row, col).clone();
+            if let Ok(sc) = v.as_scalar() {
+                nums.push(sc);
+            } else {
+                all_num = false;
+            }
+            vals.push(v);
+        }
+        if all_num {
+            cols.push(Value::matrix(Matrix::col_vec(nums)));
+        } else {
+            cols.push(Value::Cell(CellArray {
+                rows: c.rows,
+                cols: if c.rows == 0 { 0 } else { 1 },
+                data: vals,
+            }));
+        }
+    }
+    ok1(Value::Table(TableData::new(names, cols)?))
+}
+
+pub fn fn_table2cell(args: &[Value]) -> Result<Vec<Value>> {
+    if args.len() != 1 {
+        return Err(MatroError::arity("table2cell", "1 (T)", args.len()));
+    }
+    let Value::Table(t) = &args[0] else {
+        return Err(MatroError::runtime("table2cell: expected a table"));
+    };
+    let mut rows = Vec::with_capacity(t.nrows);
+    for r in 0..t.nrows {
+        let mut row = Vec::with_capacity(t.width());
+        for c in 0..t.width() {
+            row.push(table_col_elem_opt(&t.columns[c], Some(r)));
+        }
+        rows.push(row);
+    }
+    let cell = if rows.is_empty() {
+        CellArray::empty()
+    } else {
+        CellArray::from_rows(rows)?
+    };
+    ok1(Value::Cell(cell))
 }
 

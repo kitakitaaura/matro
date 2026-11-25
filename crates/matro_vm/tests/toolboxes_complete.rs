@@ -115,7 +115,7 @@ fn toolbox_statistics_and_ml_complete() {
         [z, mu, sd] = zscore([2, 4, 6, 8]);
         assert(abs(mu - 5) < 1e-12 && abs(mean(z)) < 1e-12 && abs(std(z) - 1) < 1e-12);
         assert(abs(skewness([-2, -1, 0, 1, 2])) < 1e-12);
-        assert(iqr([1, 2, 3, 4, 5, 6, 7, 8, 9]) == 4);
+        assert(abs(iqr([1, 2, 3, 4, 5, 6, 7, 8, 9]) - 4.5) < 1e-12);
 
         % 2. fitlm, regress, anova1, ttest2
         X = [1; 2; 3; 4; 5; 6];

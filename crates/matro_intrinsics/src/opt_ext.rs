@@ -244,14 +244,17 @@ pub fn fn_quadprog(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
         lb.as_ref(),
         ub.as_ref(),
     )?;
+    let mut out = vec![Value::matrix(x)];
     if nargout >= 2 {
-        Ok(vec![Value::matrix(x), Value::scalar(fval)])
-    } else {
-        Ok(vec![Value::matrix(x)])
+        out.push(Value::scalar(fval));
     }
+    if nargout >= 3 {
+        out.push(Value::scalar(1.0));
+    }
+    Ok(out)
 }
 
-/// `[x, resnorm] = lsqlin(C, d [, A, b [, Aeq, beq [, lb, ub]]])`
+/// `[x, resnorm, residual, exitflag] = lsqlin(C, d [, A, b [, Aeq, beq [, lb, ub]]])`
 pub fn fn_lsqlin(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
     if args.len() < 2 {
         return Err(MatroError::arity(
@@ -284,9 +287,15 @@ pub fn fn_lsqlin(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
     )?;
     let resid = c.matmul(&x)?.elementwise(&d_col, |a, b| a - b)?;
     let resnorm: f64 = resid.data().iter().map(|v| v * v).sum();
+    let mut out = vec![Value::matrix(x)];
     if nargout >= 2 {
-        Ok(vec![Value::matrix(x), Value::scalar(resnorm)])
-    } else {
-        Ok(vec![Value::matrix(x)])
+        out.push(Value::scalar(resnorm));
     }
+    if nargout >= 3 {
+        out.push(Value::matrix(resid));
+    }
+    if nargout >= 4 {
+        out.push(Value::scalar(1.0));
+    }
+    Ok(out)
 }

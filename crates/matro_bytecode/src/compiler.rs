@@ -391,6 +391,12 @@ impl Compiler {
                                 | "stem"
                                 | "dir"
                                 | "ls"
+                                | "load"
+                                | "save"
+                                | "margin"
+                                | "rlocus"
+                                | "initial"
+                                | "imhist"
                         )
                 ) {
                     self.compile_expr(expr, 0, false)?;
@@ -1338,6 +1344,7 @@ impl Compiler {
                         BinaryOp::Div => OpCode::Div,
                         BinaryOp::ElemDiv => OpCode::ElemDiv,
                         BinaryOp::LeftDiv => OpCode::LeftDiv,
+                        BinaryOp::ElemLeftDiv => OpCode::ElemLeftDiv,
                         BinaryOp::Pow => OpCode::Pow,
                         BinaryOp::ElemPow => OpCode::ElemPow,
                         BinaryOp::Eq => OpCode::Eq,
@@ -1515,7 +1522,7 @@ fn try_fold_const(expr: &Expr) -> Option<f64> {
                 BinaryOp::Sub => Some(a - b),
                 BinaryOp::Mul | BinaryOp::ElemMul => Some(a * b),
                 BinaryOp::Div | BinaryOp::ElemDiv => Some(a / b),
-                BinaryOp::LeftDiv => Some(b / a),
+                BinaryOp::LeftDiv | BinaryOp::ElemLeftDiv => Some(b / a),
                 BinaryOp::Pow | BinaryOp::ElemPow if a >= 0.0 || b.fract() == 0.0 => Some(a.powf(b)),
                 _ => None,
             }

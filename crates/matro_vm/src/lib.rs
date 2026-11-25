@@ -10,6 +10,7 @@ use matro_types::{
 };
 
 mod fileio;
+mod krylov;
 mod oop;
 mod opt_solvers;
 mod solvers;
@@ -71,8 +72,209 @@ impl StackItem {
 
 #[derive(Debug, Clone)]
 enum ForLoopState {
-    Matrix { matrix: Matrix, col_idx: usize },
+    Matrix { matrix: Matrix, col_idx: usize, eff_cols: usize },
     Range { start: f64, step: f64, idx: usize, count: usize },
+    Values { items: Vec<Value>, idx: usize },
+}
+
+#[inline(never)]
+fn exec_build_row(stack: &mut Vec<StackItem>, n: usize) -> Result<()> {
+    let raw = pop_items(stack, n)?;
+    let items = flatten_call_args(raw)?;
+    if items.is_empty() {
+        stack.push(StackItem::Val(Value::empty()));
+    } else if items.iter().all(|v| matches!(v, Value::String(_))) {
+        let mut s = String::new();
+        for v in items {
+            if let Value::String(part) = v {
+                s.push_str(&part);
+            }
+        }
+        stack.push(StackItem::Val(Value::String(s)));
+    } else if items.iter().any(|v| matches!(v, Value::Sparse(_))) {
+        let mut sps: Vec<SparseMatrix> = Vec::with_capacity(items.len());
+        for v in &items {
+            match v {
+                Value::Sparse(s) => {
+                    if s.rows() > 0 || s.cols() > 0 {
+                        sps.push((**s).clone());
+                    }
+                }
+                other => {
+                    let m = other.to_dense_matrix()?;
+                    if m.rows() > 0 || m.cols() > 0 {
+                        sps.push(SparseMatrix::from_dense(&m));
+                    }
+                }
+            }
+        }
+        let refs: Vec<&SparseMatrix> = sps.iter().collect();
+        let row = SparseMatrix::horzcat(&refs)?;
+        stack.push(StackItem::Val(Value::sparse(row)));
+    } else {
+        let mats: Vec<Matrix> = items
+            .iter()
+            .map(|v| v.to_dense_matrix())
+            .collect::<Result<_>>()?;
+        let refs: Vec<&Matrix> = mats.iter().collect();
+        let row = Matrix::hcat(&refs)?;
+        stack.push(StackItem::Val(Value::matrix(row)));
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn exec_build_matrix(stack: &mut Vec<StackItem>, n: usize) -> Result<()> {
+    let items = pop_vals(stack, n)?;
+    if items.len() == 1 && matches!(items[0], Value::String(_)) {
+        stack.push(StackItem::Val(items.into_iter().next().unwrap()));
+    } else if items.iter().any(|v| matches!(v, Value::Sparse(_))) {
+        let mut sps: Vec<SparseMatrix> = Vec::with_capacity(items.len());
+        for v in &items {
+            match v {
+                Value::Sparse(s) => {
+                    if s.rows() > 0 || s.cols() > 0 {
+                        sps.push((**s).clone());
+                    }
+                }
+                other => {
+                    let m = other.to_dense_matrix()?;
+                    if m.rows() > 0 || m.cols() > 0 {
+                        sps.push(SparseMatrix::from_dense(&m));
+                    }
+                }
+            }
+        }
+        let refs: Vec<&SparseMatrix> = sps.iter().collect();
+        let mat = SparseMatrix::vertcat(&refs)?;
+        stack.push(StackItem::Val(Value::sparse(mat)));
+    } else {
+        let mats: Vec<Matrix> = items
+            .iter()
+            .map(|v| v.to_dense_matrix())
+            .collect::<Result<_>>()?;
+        let refs: Vec<&Matrix> = mats.iter().collect();
+        let mat = Matrix::vcat(&refs)?;
+        stack.push(StackItem::Val(Value::matrix(mat)));
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn init_for_loop(val: Value) -> Result<Option<(Value, ForLoopState)>> {
+    match val {
+        Value::Matrix(m) => {
+            let mat = (*m).clone();
+            let eff_cols = if mat.rows() == 0 {
+                0
+            } else if mat.ndims() > 2 {
+                mat.len() / mat.rows()
+            } else {
+                mat.cols()
+            };
+            if eff_cols == 0 {
+                Ok(None)
+            } else {
+                let first = extract_col(&mat, 0);
+                Ok(Some((
+                    Value::matrix(first),
+                    ForLoopState::Matrix {
+                        matrix: mat,
+                        col_idx: 1,
+                        eff_cols,
+                    },
+                )))
+            }
+        }
+        Value::Sparse(s) => {
+            let mat = s.to_dense();
+            let eff_cols = mat.cols();
+            if eff_cols == 0 {
+                Ok(None)
+            } else {
+                let first = extract_col(&mat, 0);
+                Ok(Some((
+                    Value::matrix(first),
+                    ForLoopState::Matrix {
+                        matrix: mat,
+                        col_idx: 1,
+                        eff_cols,
+                    },
+                )))
+            }
+        }
+        Value::Cell(c) => {
+            if c.cols == 0 {
+                return Ok(None);
+            }
+            let mut items = Vec::with_capacity(c.cols);
+            for col in 0..c.cols {
+                let mut rows = Vec::with_capacity(c.rows);
+                for row in 0..c.rows {
+                    rows.push(vec![c.get(row, col).clone()]);
+                }
+                items.push(Value::Cell(CellArray::from_rows(rows)?));
+            }
+            let first = items[0].clone();
+            Ok(Some((first, ForLoopState::Values { items, idx: 1 })))
+        }
+        Value::StructArray(sa) => {
+            if sa.cols == 0 {
+                return Ok(None);
+            }
+            let mut items = Vec::with_capacity(sa.cols);
+            for col in 0..sa.cols {
+                if sa.rows == 1 {
+                    items.push(Value::Struct(sa.items[col].clone()));
+                } else {
+                    let mut col_items = Vec::with_capacity(sa.rows);
+                    for row in 0..sa.rows {
+                        col_items.push(sa.items[col * sa.rows + row].clone());
+                    }
+                    items.push(Value::StructArray(matro_types::StructArray {
+                        rows: sa.rows,
+                        cols: 1,
+                        items: col_items,
+                    }));
+                }
+            }
+            let first = items[0].clone();
+            Ok(Some((first, ForLoopState::Values { items, idx: 1 })))
+        }
+        Value::Struct(s) => Ok(Some((
+            Value::Struct(s),
+            ForLoopState::Values {
+                items: Vec::new(),
+                idx: 1,
+            },
+        ))),
+        Value::String(s) => {
+            let chars: Vec<Value> = s.chars().map(|ch| Value::String(ch.to_string())).collect();
+            if chars.is_empty() {
+                Ok(None)
+            } else {
+                let first = chars[0].clone();
+                Ok(Some((first, ForLoopState::Values { items: chars, idx: 1 })))
+            }
+        }
+        other => {
+            let mat = other.to_dense_matrix()?;
+            let eff_cols = mat.cols();
+            if eff_cols == 0 {
+                Ok(None)
+            } else {
+                let first = extract_col(&mat, 0);
+                Ok(Some((
+                    Value::matrix(first),
+                    ForLoopState::Matrix {
+                        matrix: mat,
+                        col_idx: 1,
+                        eff_cols,
+                    },
+                )))
+            }
+        }
+    }
 }
 
 fn range_count(start: f64, step: f64, stop: f64) -> usize {
@@ -815,43 +1017,8 @@ impl Vm {
                 );
                 format_assignment(stdout, "ans", &val);
             }
-            OpCode::BuildRow(n) => {
-                let raw = pop_items(stack, n as usize)?;
-                let items = flatten_call_args(raw)?;
-                if items.is_empty() {
-                    stack.push(StackItem::Val(Value::empty()));
-                } else if items.iter().all(|v| matches!(v, Value::String(_))) {
-                    let mut s = String::new();
-                    for v in items {
-                        if let Value::String(part) = v {
-                            s.push_str(&part);
-                        }
-                    }
-                    stack.push(StackItem::Val(Value::String(s)));
-                } else {
-                    let mats: Vec<Matrix> = items
-                        .iter()
-                        .map(|v| v.to_dense_matrix())
-                        .collect::<Result<_>>()?;
-                    let refs: Vec<&Matrix> = mats.iter().collect();
-                    let row = Matrix::hcat(&refs)?;
-                    stack.push(StackItem::Val(Value::matrix(row)));
-                }
-            }
-            OpCode::BuildMatrix(n) => {
-                let items = pop_vals(stack, n as usize)?;
-                if items.len() == 1 && matches!(items[0], Value::String(_)) {
-                    stack.push(StackItem::Val(items.into_iter().next().unwrap()));
-                } else {
-                    let mats: Vec<Matrix> = items
-                        .iter()
-                        .map(|v| v.to_dense_matrix())
-                        .collect::<Result<_>>()?;
-                    let refs: Vec<&Matrix> = mats.iter().collect();
-                    let mat = Matrix::vcat(&refs)?;
-                    stack.push(StackItem::Val(Value::matrix(mat)));
-                }
-            }
+            OpCode::BuildRow(n) => exec_build_row(stack, n as usize)?,
+            OpCode::BuildMatrix(n) => exec_build_matrix(stack, n as usize)?,
             OpCode::BuildCell { rows, cols } => {
                 let total = (rows as usize) * (cols as usize);
                 let raw = pop_items(stack, total)?;
@@ -897,7 +1064,20 @@ impl Vm {
                 }
             }
             OpCode::Pos => {
-                // unary `+` is a no-op on numeric scalars/matrices
+                if !matches!(stack.last(), Some(StackItem::Scalar(_))) {
+                    let v = pop_val(stack)?;
+                    let out = match v {
+                        Value::String(s) => {
+                            let codes: Vec<f64> = s.chars().map(|c| c as u32 as f64).collect();
+                            Value::matrix(Matrix::row_vec(codes))
+                        }
+                        Value::Matrix(m) if m.is_logical() => {
+                            Value::matrix(m.as_ref().clone().with_logical(false))
+                        }
+                        other => other,
+                    };
+                    stack.push(StackItem::Val(out));
+                }
             }
             OpCode::Not => {
                 self.exec_unop_slow(op, stack, stdout)?;
@@ -907,7 +1087,13 @@ impl Vm {
                     self.exec_unop_slow(op, stack, stdout)?;
                 }
             }
-            OpCode::Add | OpCode::Sub | OpCode::ElemMul | OpCode::ElemDiv | OpCode::Mul | OpCode::Div => {
+            OpCode::Add
+            | OpCode::Sub
+            | OpCode::ElemMul
+            | OpCode::ElemDiv
+            | OpCode::ElemLeftDiv
+            | OpCode::Mul
+            | OpCode::Div => {
                 let b_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
                 let a_item = stack.pop().ok_or_else(|| MatroError::runtime("VM stack underflow"))?;
                 if let (Some(x), Some(y)) = (a_item.as_fast_scalar(), b_item.as_fast_scalar()) {
@@ -915,6 +1101,7 @@ impl Vm {
                         OpCode::Add => x + y,
                         OpCode::Sub => x - y,
                         OpCode::ElemMul | OpCode::Mul => x * y,
+                        OpCode::ElemLeftDiv => y / x,
                         _ => x / y,
                     };
                     stack.push(StackItem::Scalar(v));
@@ -993,22 +1180,13 @@ impl Vm {
                 try_stack.pop();
             }
             OpCode::ForInit { var_idx, exit_ip } => {
-                let iter_mat = pop_val(stack)?.to_dense_matrix()?;
-                if iter_mat.cols() == 0 {
-                    *ip = exit_ip as usize;
-                } else {
-                    let col = extract_col(&iter_mat, 0);
+                let iter_val = pop_val(stack)?;
+                if let Some((first, state)) = init_for_loop(iter_val)? {
                     let name = chunk.names[var_idx as usize].clone();
-                    store_var(
-                        name,
-                        Value::matrix(col),
-                        frame.as_deref_mut(),
-                        &mut self.globals,
-                    );
-                    for_loops.push(ForLoopState::Matrix {
-                        matrix: iter_mat,
-                        col_idx: 1,
-                    });
+                    store_var(name, first, frame.as_deref_mut(), &mut self.globals);
+                    for_loops.push(state);
+                } else {
+                    *ip = exit_ip as usize;
                 }
             }
             OpCode::ForRangeInit {
@@ -1061,11 +1239,24 @@ impl Vm {
                             None
                         }
                     }
-                    ForLoopState::Matrix { matrix, col_idx } => {
-                        if *col_idx < matrix.cols() {
+                    ForLoopState::Matrix {
+                        matrix,
+                        col_idx,
+                        eff_cols,
+                    } => {
+                        if *col_idx < *eff_cols {
                             let col = extract_col(matrix, *col_idx);
                             *col_idx += 1;
                             Some(Value::matrix(col))
+                        } else {
+                            None
+                        }
+                    }
+                    ForLoopState::Values { items, idx } => {
+                        if *idx < items.len() {
+                            let v = items[*idx].clone();
+                            *idx += 1;
+                            Some(v)
                         } else {
                             None
                         }
@@ -1080,19 +1271,15 @@ impl Vm {
                 }
             }
             OpCode::ForInitLocal { slot, exit_ip } => {
-                let iter_mat = pop_val(stack)?.to_dense_matrix()?;
-                if iter_mat.cols() == 0 {
-                    *ip = exit_ip as usize;
-                } else {
-                    let col = extract_col(&iter_mat, 0);
+                let iter_val = pop_val(stack)?;
+                if let Some((first, state)) = init_for_loop(iter_val)? {
                     let f = frame
                         .as_deref_mut()
                         .ok_or_else(|| MatroError::runtime("ForInitLocal outside function"))?;
-                    f.set(slot, Value::matrix(col));
-                    for_loops.push(ForLoopState::Matrix {
-                        matrix: iter_mat,
-                        col_idx: 1,
-                    });
+                    f.set(slot, first);
+                    for_loops.push(state);
+                } else {
+                    *ip = exit_ip as usize;
                 }
             }
             OpCode::ForRangeInitLocal {
@@ -1146,14 +1333,31 @@ impl Vm {
                             for_loops.pop();
                         }
                     }
-                    ForLoopState::Matrix { matrix, col_idx } => {
-                        if *col_idx < matrix.cols() {
+                    ForLoopState::Matrix {
+                        matrix,
+                        col_idx,
+                        eff_cols,
+                    } => {
+                        if *col_idx < *eff_cols {
                             let col = extract_col(matrix, *col_idx);
                             *col_idx += 1;
                             let f = frame.as_deref_mut().ok_or_else(|| {
                                 MatroError::runtime("ForNextLocal outside function")
                             })?;
                             f.set(slot, Value::matrix(col));
+                            *ip = loop_ip as usize;
+                        } else {
+                            for_loops.pop();
+                        }
+                    }
+                    ForLoopState::Values { items, idx } => {
+                        if *idx < items.len() {
+                            let v = items[*idx].clone();
+                            *idx += 1;
+                            let f = frame.as_deref_mut().ok_or_else(|| {
+                                MatroError::runtime("ForNextLocal outside function")
+                            })?;
+                            f.set(slot, v);
                             *ip = loop_ip as usize;
                         } else {
                             for_loops.pop();
@@ -1498,25 +1702,7 @@ impl Vm {
                     .cloned()
                     .unwrap_or_else(Value::empty);
                 remove_var(&name, frame.as_deref_mut(), &mut self.globals);
-                if let Value::Map(ref mut map) = val {
-                    if raw_args.len() != 1 {
-                        return Err(MatroError::index("containers.Map indexing expects 1 key"));
-                    }
-                    let key = MapData::key_of(&raw_args[0].clone().into_val()?)?;
-                    map.entries.insert(key, rhs);
-                } else if let Value::Sparse(ref mut sp) = val {
-                    assign_sparse_index(
-                        std::sync::Arc::make_mut(sp),
-                        &raw_args,
-                        &rhs.to_dense_matrix()?,
-                    )?;
-                } else if let Some(updated) =
-                    self.try_subsasgn(&val, "()", &raw_args, rhs.clone(), stdout)?
-                {
-                    val = updated;
-                } else {
-                    assign_matrix_index(val.as_matrix_mut()?, &raw_args, &rhs.to_dense_matrix()?)?;
-                }
+                self.assign_value_index(&mut val, &raw_args, rhs, stdout)?;
                 *last_value = Some(val.clone());
                 store_var(name, val, frame.as_deref_mut(), &mut self.globals);
             }
@@ -1528,25 +1714,7 @@ impl Vm {
                     .ok_or_else(|| MatroError::runtime("StoreIndexLocal outside function"))?
                     .take(slot)
                     .unwrap_or_else(Value::empty);
-                if let Value::Map(ref mut map) = val {
-                    if raw_args.len() != 1 {
-                        return Err(MatroError::index("containers.Map indexing expects 1 key"));
-                    }
-                    let key = MapData::key_of(&raw_args[0].clone().into_val()?)?;
-                    map.entries.insert(key, rhs);
-                } else if let Value::Sparse(ref mut sp) = val {
-                    assign_sparse_index(
-                        std::sync::Arc::make_mut(sp),
-                        &raw_args,
-                        &rhs.to_dense_matrix()?,
-                    )?;
-                } else if let Some(updated) =
-                    self.try_subsasgn(&val, "()", &raw_args, rhs.clone(), stdout)?
-                {
-                    val = updated;
-                } else {
-                    assign_matrix_index(val.as_matrix_mut()?, &raw_args, &rhs.to_dense_matrix()?)?;
-                }
+                self.assign_value_index(&mut val, &raw_args, rhs, stdout)?;
                 *last_value = Some(val.clone());
                 if let Some(f) = frame.as_deref_mut() {
                     f.set(slot, val);
@@ -2364,6 +2532,7 @@ impl Vm {
             OpCode::Sub => "minus",
             OpCode::ElemMul => "times",
             OpCode::ElemDiv => "rdivide",
+            OpCode::ElemLeftDiv => "ldivide",
             OpCode::ElemPow => "power",
             OpCode::Mul => "mtimes",
             OpCode::Div => "mrdivide",
@@ -2405,10 +2574,39 @@ impl Vm {
                         .elementwise_c(&b.to_dense_matrix()?, |x, y| x * y)?,
                 ),
             },
-            OpCode::ElemDiv => Value::matrix(
-                a.to_dense_matrix()?
-                    .elementwise_c(&b.to_dense_matrix()?, |x, y| x / y)?,
-            ),
+            OpCode::ElemDiv => match (&a, &b) {
+                (Value::Sparse(sa), Value::Matrix(mb)) if mb.as_scalar().is_some() => {
+                    let sc = mb.as_scalar().unwrap();
+                    if sc != 0.0 && sc.is_finite() {
+                        Value::sparse(sa.scale(1.0 / sc))
+                    } else {
+                        Value::matrix(
+                            sa.to_dense()
+                                .elementwise_c(mb, |x, y| x / y)?,
+                        )
+                    }
+                }
+                _ => Value::matrix(
+                    a.to_dense_matrix()?
+                        .elementwise_c(&b.to_dense_matrix()?, |x, y| x / y)?,
+                ),
+            },
+            OpCode::ElemLeftDiv => match (&a, &b) {
+                (Value::Matrix(ma), Value::Sparse(sb)) if ma.as_scalar().is_some() => {
+                    let sc = ma.as_scalar().unwrap();
+                    if sc != 0.0 && sc.is_finite() {
+                        Value::sparse(sb.scale(1.0 / sc))
+                    } else {
+                        Value::matrix(
+                            ma.elementwise_c(&sb.to_dense(), |x, y| y / x)?,
+                        )
+                    }
+                }
+                _ => Value::matrix(
+                    a.to_dense_matrix()?
+                        .elementwise_c(&b.to_dense_matrix()?, |x, y| y / x)?,
+                ),
+            },
             OpCode::ElemPow => Value::matrix(
                 a.to_dense_matrix()?
                     .elementwise_c(&b.to_dense_matrix()?, Complex::powc)?,
@@ -2814,6 +3012,62 @@ impl Vm {
             return Ok(results.into_iter().next().unwrap_or_else(Value::empty));
         }
         Ok(obj)
+    }
+
+    #[inline(never)]
+    fn assign_value_index(
+        &mut self,
+        val: &mut Value,
+        raw_args: &[StackItem],
+        rhs: Value,
+        stdout: &mut String,
+    ) -> Result<()> {
+        if let Value::Map(map) = val {
+            if raw_args.len() != 1 {
+                return Err(MatroError::index("containers.Map indexing expects 1 key"));
+            }
+            let key = MapData::key_of(&raw_args[0].clone().into_val()?)?;
+            map.entries.insert(key, rhs);
+            return Ok(());
+        }
+        if let Value::Sparse(sp) = val {
+            assign_sparse_index(
+                std::sync::Arc::make_mut(sp),
+                raw_args,
+                &rhs.to_dense_matrix()?,
+            )?;
+            return Ok(());
+        }
+        if let Value::Cell(cell) = val {
+            return assign_cell_parens(cell, raw_args, rhs);
+        }
+        if matches!(val, Value::Struct(_) | Value::StructArray(_)) {
+            return assign_struct_parens(val, raw_args, rhs);
+        }
+        if let Value::String(s) = val {
+            return assign_string_parens(s, raw_args, rhs);
+        }
+        if let Some(updated) = self.try_subsasgn(val, "()", raw_args, rhs.clone(), stdout)? {
+            *val = updated;
+            return Ok(());
+        }
+        if matches!(val, Value::Matrix(m) if m.is_empty()) {
+            if let Value::Struct(_) | Value::StructArray(_) = rhs {
+                *val = Value::StructArray(matro_types::StructArray {
+                    rows: 0,
+                    cols: 0,
+                    items: Vec::new(),
+                });
+                return assign_struct_parens(val, raw_args, rhs);
+            }
+            if let Value::Cell(_) = rhs {
+                *val = Value::Cell(CellArray::empty());
+                if let Value::Cell(cell) = val {
+                    return assign_cell_parens(cell, raw_args, rhs);
+                }
+            }
+        }
+        assign_matrix_index(val.as_matrix_mut()?, raw_args, &rhs.to_dense_matrix()?)
     }
 
     #[inline(never)]
@@ -3270,13 +3524,82 @@ impl Vm {
                 return Ok(vec![]);
             }
             "load" => {
-                if call_args.len() != 1 {
-                    return Err(MatroError::arity("load", "1 (filename.mat)", call_args.len()));
+                if call_args.is_empty() {
+                    return Err(MatroError::arity("load", ">= 1 (filename.mat [, vars...])", 0));
                 }
                 let path = call_args[0].as_str()?;
-                let vars = self.loader.load_mat(path)?;
-                for (k, v) in &vars {
-                    store_var(k.clone(), v.clone(), frame.as_deref_mut(), &mut self.globals);
+                let mut filter_vars: Vec<String> = Vec::new();
+                let mut is_ascii = false;
+                for a in &call_args[1..] {
+                    let s = a.as_str()?;
+                    if s.eq_ignore_ascii_case("-ascii") {
+                        is_ascii = true;
+                    } else if !s.starts_with('-') {
+                        filter_vars.push(s.to_string());
+                    }
+                }
+                let mut vars = if is_ascii
+                    || (!path.to_ascii_lowercase().ends_with(".mat")
+                        && self.loader.vfs().read_to_string(path).is_some())
+                {
+                    let text = self
+                        .loader
+                        .vfs()
+                        .read_to_string(path)
+                        .ok_or_else(|| MatroError::runtime(format!("load: file '{path}' not found")))?;
+                    let mut rows: Vec<Vec<f64>> = Vec::new();
+                    for line in text.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() || trimmed.starts_with('%') || trimmed.starts_with('#') {
+                            continue;
+                        }
+                        let vals: Vec<f64> = trimmed
+                            .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+                            .filter(|t| !t.is_empty())
+                            .map(|t| t.parse::<f64>().unwrap_or(f64::NAN))
+                            .collect();
+                        if !vals.is_empty() {
+                            rows.push(vals);
+                        }
+                    }
+                    let mat = if rows.is_empty() {
+                        Matrix::empty()
+                    } else {
+                        let nc = rows[0].len();
+                        let nr = rows.len();
+                        let mut m = Matrix::zeros(nr, nc);
+                        for (r, row) in rows.iter().enumerate() {
+                            for (c, &v) in row.iter().take(nc).enumerate() {
+                                m.set(r, c, v);
+                            }
+                        }
+                        m
+                    };
+                    if nargout >= 1 {
+                        return Ok(vec![Value::matrix(mat)]);
+                    }
+                    let stem = path
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or(path)
+                        .split('.')
+                        .next()
+                        .unwrap_or("data")
+                        .to_string();
+                    let mut map = BTreeMap::new();
+                    map.insert(stem, Value::matrix(mat));
+                    map
+                } else {
+                    self.loader.load_mat(path)?
+                };
+                if !filter_vars.is_empty() {
+                    vars.retain(|k, _| filter_vars.iter().any(|f| f == k));
+                }
+                if nargout == 0 {
+                    for (k, v) in &vars {
+                        store_var(k.clone(), v.clone(), frame.as_deref_mut(), &mut self.globals);
+                    }
+                    return Ok(vec![]);
                 }
                 return Ok(vec![Value::Struct(vars)]);
             }
@@ -3295,46 +3618,34 @@ impl Vm {
                     ))),
                 };
             }
-            "arrayfun" => {
-                if call_args.len() != 2 {
-                    return Err(MatroError::arity("arrayfun", "2", call_args.len()));
+            "arrayfun" => return self.exec_arrayfun(call_args, stdout),
+            "accumarray" => {
+                if call_args.len() >= 4 && matches!(&call_args[3], Value::Closure(_)) {
+                    return self.exec_accumarray_closure(call_args, stdout);
                 }
-                let Value::Closure(cl) = &call_args[0] else {
-                    return Err(MatroError::runtime(
-                        "arrayfun: first argument must be a function handle",
-                    ));
-                };
-                let m = call_args[1].to_dense_matrix()?;
-                let mut out = Matrix::zeros(m.rows(), m.cols());
-                for c in 0..m.cols() {
-                    for r in 0..m.rows() {
-                        let elem = Value::matrix(Matrix::complex_scalar(m.get_c(r, c)));
-                        let rets = self.call_closure(cl, &[elem], 1, stdout)?;
-                        let res = rets
-                            .into_iter()
-                            .next()
-                            .unwrap_or_else(Value::empty)
-                            .as_matrix()?
-                            .as_complex_scalar()
-                            .ok_or_else(|| {
-                                MatroError::dimension("arrayfun: callback must return scalar")
-                            })?;
-                        out.set_c(r, c, res);
-                    }
-                }
-                return Ok(vec![Value::matrix(out.normalize())]);
             }
             "fopen" => return self.files.fopen(call_args, nargout, &self.loader),
             "fclose" => return self.files.fclose(call_args, &mut self.loader),
             "fprintf" => return self.files.fprintf(call_args, nargout, stdout),
+            "fscanf" => return self.files.fscanf(call_args, nargout),
+            "sscanf" => return self.files.sscanf(call_args, nargout),
             "fgetl" => return self.files.fgetl(call_args, false),
             "fgets" => return self.files.fgetl(call_args, true),
             "feof" => return self.files.feof(call_args),
             "ftell" => return self.files.ftell(call_args),
+            "fseek" => return self.files.fseek(call_args),
             "frewind" => return self.files.frewind(call_args),
+            "ferror" => return self.files.ferror(call_args, nargout),
             "fwrite" => return self.files.fwrite(call_args),
             "fread" => return self.files.fread(call_args, nargout),
             "textscan" => return self.files.textscan(call_args),
+            "pcg" | "gmres" | "bicgstab" | "minres" | "lsqr" | "cgs" | "bicg" => {
+                return krylov::solve_krylov(self, name, call_args, nargout, stdout);
+            }
+            "lsqnonneg" => return krylov::solve_lsqnonneg(call_args, nargout),
+            "odeset" => return Ok(vec![exec_odeset(call_args)?]),
+            "odeget" => return Ok(vec![exec_odeget(call_args)?]),
+            "optimset" | "optimoptions" => return Ok(vec![exec_optimset(name, call_args)?]),
             "inputParser" => return Ok(vec![self.new_input_parser()]),
             "remove" => {
                 if call_args.len() != 2 {
@@ -3369,47 +3680,7 @@ impl Vm {
                 }
                 return Ok(eval_last.map(|v| vec![v]).unwrap_or_default());
             }
-            "cellfun" => {
-                if call_args.len() < 2 {
-                    return Err(MatroError::arity("cellfun", ">= 2 (fn, C)", call_args.len()));
-                }
-                let Value::Cell(c) = &call_args[1] else {
-                    return Err(MatroError::runtime("cellfun: second argument must be a cell array"));
-                };
-                let mut uniform = true;
-                let mut i = 2;
-                while i + 1 < call_args.len() {
-                    if let Ok(k) = call_args[i].as_str() {
-                        if k.eq_ignore_ascii_case("UniformOutput") {
-                            uniform = call_args[i + 1].is_truthy();
-                        }
-                    }
-                    i += 2;
-                }
-                let mut results = Vec::with_capacity(c.data.len());
-                for item in &c.data {
-                    let v = self.invoke_callable_val(&call_args[0], &[item.clone()], stdout)?;
-                    results.push(v);
-                }
-                if uniform {
-                    let mut out = Matrix::zeros(c.rows, c.cols);
-                    for (idx, v) in results.iter().enumerate() {
-                        let sc = v.as_matrix()?.as_complex_scalar().ok_or_else(|| {
-                            MatroError::runtime(
-                                "cellfun: non-scalar output; pass 'UniformOutput', false",
-                            )
-                        })?;
-                        out.set_linear_c(idx, sc);
-                    }
-                    return Ok(vec![Value::matrix(out.normalize())]);
-                } else {
-                    return Ok(vec![Value::Cell(CellArray {
-                        rows: c.rows,
-                        cols: c.cols,
-                        data: results,
-                    })]);
-                }
-            }
+            "cellfun" => return self.exec_cellfun(call_args, stdout),
             "structfun" => {
                 if call_args.len() < 2 {
                     return Err(MatroError::arity("structfun", ">= 2 (fn, S)", call_args.len()));
@@ -3429,16 +3700,25 @@ impl Vm {
                 }
                 if uniform {
                     let mut vals = Vec::with_capacity(map.len());
+                    let mut all_logical = !map.is_empty();
                     for v in map.values() {
                         let r = self.invoke_callable_val(&call_args[0], &[v.clone()], stdout)?;
-                        let sc = r.as_matrix()?.as_complex_scalar().ok_or_else(|| {
+                        let rm = r.to_dense_matrix()?;
+                        if rm.dtype() != matro_types::NumericClass::Logical {
+                            all_logical = false;
+                        }
+                        let sc = rm.as_complex_scalar().ok_or_else(|| {
                             MatroError::runtime(
                                 "structfun: non-scalar output; pass 'UniformOutput', false",
                             )
                         })?;
                         vals.push(sc);
                     }
-                    return Ok(vec![Value::matrix(Matrix::complex_col_vec(vals).normalize())]);
+                    let mut out = Matrix::complex_col_vec(vals).normalize();
+                    if all_logical {
+                        out = out.into_logical();
+                    }
+                    return Ok(vec![Value::matrix(out)]);
                 } else {
                     let mut out = BTreeMap::new();
                     for (k, v) in map {
@@ -3448,41 +3728,7 @@ impl Vm {
                     return Ok(vec![Value::Struct(out)]);
                 }
             }
-            "bsxfun" => {
-                if call_args.len() != 3 {
-                    return Err(MatroError::arity("bsxfun", "3 (fn, A, B)", call_args.len()));
-                }
-                let a = call_args[1].to_dense_matrix()?;
-                let b = call_args[2].to_dense_matrix()?;
-                let out_r = a.rows().max(b.rows());
-                let out_c = a.cols().max(b.cols());
-                if (a.rows() != out_r && a.rows() != 1)
-                    || (b.rows() != out_r && b.rows() != 1)
-                    || (a.cols() != out_c && a.cols() != 1)
-                    || (b.cols() != out_c && b.cols() != 1)
-                {
-                    return Err(MatroError::dimension(
-                        "bsxfun: incompatible matrix dimensions for singleton expansion",
-                    ));
-                }
-                let mut out = Matrix::zeros(out_r, out_c);
-                for c in 0..out_c {
-                    let ac = if a.cols() == 1 { 0 } else { c };
-                    let bc = if b.cols() == 1 { 0 } else { c };
-                    for r in 0..out_r {
-                        let ar = if a.rows() == 1 { 0 } else { r };
-                        let br = if b.rows() == 1 { 0 } else { r };
-                        let va = Value::matrix(Matrix::complex_scalar(a.get_c(ar, ac)).normalize());
-                        let vb = Value::matrix(Matrix::complex_scalar(b.get_c(br, bc)).normalize());
-                        let res = self.invoke_callable_val(&call_args[0], &[va, vb], stdout)?;
-                        let sc = res.as_matrix()?.as_complex_scalar().ok_or_else(|| {
-                            MatroError::dimension("bsxfun: callback must return scalar")
-                        })?;
-                        out.set_c(r, c, sc);
-                    }
-                }
-                return Ok(vec![Value::matrix(out.normalize())]);
-            }
+            "bsxfun" => return self.exec_bsxfun(call_args, stdout),
             "narginchk" | "nargoutchk" => {
                 if call_args.len() != 2 {
                     return Err(MatroError::arity(name, "2 (min, max)", call_args.len()));
@@ -3518,61 +3764,8 @@ impl Vm {
                 }
                 return Ok(vec![]);
             }
-            "ode45" => {
-                if call_args.len() != 3 {
-                    return Err(MatroError::arity("ode45", "3 (f, tspan, y0)", call_args.len()));
-                }
-                let Value::Closure(cl) = &call_args[0] else {
-                    return Err(MatroError::runtime(
-                        "ode45: first argument must be a function handle @(t, y) ...",
-                    ));
-                };
-                let tspan = call_args[1].as_matrix()?.clone();
-                let y0 = call_args[2].as_matrix()?.clone();
-                let (t_mat, y_mat) = solvers::solve_ode45(self, cl, &tspan, &y0, stdout)?;
-                return Ok(vec![Value::matrix(t_mat), Value::matrix(y_mat)]);
-            }
-            "ode15s" => {
-                if call_args.len() != 3 {
-                    return Err(MatroError::arity("ode15s", "3 (f, tspan, y0)", call_args.len()));
-                }
-                let Value::Closure(cl) = &call_args[0] else {
-                    return Err(MatroError::runtime(
-                        "ode15s: first argument must be a function handle @(t, y) ...",
-                    ));
-                };
-                let tspan = call_args[1].as_matrix()?.clone();
-                let y0 = call_args[2].as_matrix()?.clone();
-                let (t_mat, y_mat) = solvers::solve_ode15s(self, cl, &tspan, &y0, stdout)?;
-                return Ok(vec![Value::matrix(t_mat), Value::matrix(y_mat)]);
-            }
-            "ode23" => {
-                if call_args.len() != 3 {
-                    return Err(MatroError::arity("ode23", "3 (f, tspan, y0)", call_args.len()));
-                }
-                let Value::Closure(cl) = &call_args[0] else {
-                    return Err(MatroError::runtime(
-                        "ode23: first argument must be a function handle @(t, y) ...",
-                    ));
-                };
-                let tspan = call_args[1].as_matrix()?.clone();
-                let y0 = call_args[2].as_matrix()?.clone();
-                let (t_mat, y_mat) = solvers_ext::solve_ode23(self, cl, &tspan, &y0, stdout)?;
-                return Ok(vec![Value::matrix(t_mat), Value::matrix(y_mat)]);
-            }
-            "ode113" => {
-                if call_args.len() != 3 {
-                    return Err(MatroError::arity("ode113", "3 (f, tspan, y0)", call_args.len()));
-                }
-                let Value::Closure(cl) = &call_args[0] else {
-                    return Err(MatroError::runtime(
-                        "ode113: first argument must be a function handle @(t, y) ...",
-                    ));
-                };
-                let tspan = call_args[1].as_matrix()?.clone();
-                let y0 = call_args[2].as_matrix()?.clone();
-                let (t_mat, y_mat) = solvers_ext::solve_ode113(self, cl, &tspan, &y0, stdout)?;
-                return Ok(vec![Value::matrix(t_mat), Value::matrix(y_mat)]);
+            "ode45" | "ode15s" | "ode23" | "ode113" | "ode23s" | "ode23t" | "ode23tb" => {
+                return self.exec_ode_solver(name, call_args, nargout, stdout);
             }
             "bvpinit" => {
                 if call_args.len() != 2 {
@@ -3636,19 +3829,7 @@ impl Vm {
                 )?;
                 return Ok(vec![sol]);
             }
-            "fzero" => {
-                if call_args.len() != 2 {
-                    return Err(MatroError::arity("fzero", "2 (f, x0)", call_args.len()));
-                }
-                let Value::Closure(cl) = &call_args[0] else {
-                    return Err(MatroError::runtime(
-                        "fzero: first argument must be a function handle",
-                    ));
-                };
-                let guess = call_args[1].as_matrix()?.clone();
-                let root = solvers::solve_fzero(self, cl, &guess, stdout)?;
-                return Ok(vec![Value::scalar(root)]);
-            }
+            "fzero" => return self.exec_fzero(call_args, nargout, stdout),
             "clear" => {
                 if call_args.is_empty()
                     || call_args.iter().any(|a| a.as_str().ok() == Some("all"))
@@ -3723,100 +3904,18 @@ impl Vm {
                 }
                 return Err(MatroError::undefined(fname));
             }
-            "fminsearch" => {
-                if call_args.len() != 2 {
-                    return Err(MatroError::arity("fminsearch", "2 (f, x0)", call_args.len()));
-                }
-                let Value::Closure(cl) = &call_args[0] else {
-                    return Err(MatroError::runtime(
-                        "fminsearch: first argument must be a function handle",
-                    ));
-                };
-                let x0 = call_args[1].as_matrix()?.clone();
-                let (best_x, fval) = solvers::solve_fminsearch(self, cl, &x0, stdout)?;
-                if nargout >= 2 {
-                    return Ok(vec![Value::matrix(best_x), Value::scalar(fval)]);
-                }
-                return Ok(vec![Value::matrix(best_x)]);
+            "fminsearch" | "fminunc" | "fmincon" | "fsolve" | "lsqnonlin" | "lsqcurvefit"
+            | "fminbnd" => {
+                return self.exec_opt_solver(name, call_args, nargout, stdout);
             }
-            "fminunc" => {
-                if call_args.len() != 2 {
-                    return Err(MatroError::arity("fminunc", "2 (fun, x0)", call_args.len()));
-                }
-                let Value::Closure(cl) = &call_args[0] else {
-                    return Err(MatroError::runtime(
-                        "fminunc: first argument must be a function handle",
-                    ));
-                };
-                let x0 = call_args[1].to_dense_matrix()?;
-                let (best_x, fval) = opt_solvers::solve_fminunc(self, cl, &x0, stdout)?;
-                if nargout >= 2 {
-                    return Ok(vec![Value::matrix(best_x), Value::scalar(fval)]);
-                }
-                return Ok(vec![Value::matrix(best_x)]);
-            }
-            "fmincon" => {
-                let (best_x, fval) = opt_solvers::solve_fmincon(self, call_args, stdout)?;
-                if nargout >= 2 {
-                    return Ok(vec![Value::matrix(best_x), Value::scalar(fval)]);
-                }
-                return Ok(vec![Value::matrix(best_x)]);
-            }
-            "fsolve" => {
-                if call_args.len() != 2 {
-                    return Err(MatroError::arity("fsolve", "2 (f, x0)", call_args.len()));
-                }
-                let Value::Closure(cl) = &call_args[0] else {
-                    return Err(MatroError::runtime(
-                        "fsolve: first argument must be a function handle",
-                    ));
-                };
-                let x0 = call_args[1].as_matrix()?.clone();
-                let (sol, _resnorm, residual) = solvers::solve_lm(self, cl, &x0, stdout)?;
-                if nargout >= 2 {
-                    return Ok(vec![Value::matrix(sol), Value::matrix(residual)]);
-                }
-                return Ok(vec![Value::matrix(sol)]);
-            }
-            "lsqnonlin" => {
-                if call_args.len() != 2 {
-                    return Err(MatroError::arity("lsqnonlin", "2 (f, x0)", call_args.len()));
-                }
-                let Value::Closure(cl) = &call_args[0] else {
-                    return Err(MatroError::runtime(
-                        "lsqnonlin: first argument must be a function handle",
-                    ));
-                };
-                let x0 = call_args[1].as_matrix()?.clone();
-                let (sol, resnorm, residual) = solvers::solve_lm(self, cl, &x0, stdout)?;
-                let mut out = vec![Value::matrix(sol)];
-                if nargout >= 2 {
-                    out.push(Value::scalar(resnorm));
-                }
-                if nargout >= 3 {
-                    out.push(Value::matrix(residual));
-                }
-                return Ok(out);
-            }
-            "integral" => {
-                if call_args.len() != 3 {
-                    return Err(MatroError::arity("integral", "3 (f, a, b)", call_args.len()));
-                }
-                let Value::Closure(cl) = &call_args[0] else {
-                    return Err(MatroError::runtime(
-                        "integral: first argument must be a function handle",
-                    ));
-                };
-                let a = call_args[1].as_scalar()?;
-                let b = call_args[2].as_scalar()?;
-                let q = solvers::solve_integral(self, cl, a, b, stdout)?;
-                return Ok(vec![Value::scalar(q)]);
+            "integral" | "quad" | "quadl" | "quadgk" => {
+                return self.exec_integral(name, call_args, stdout);
             }
             "integral2" => {
-                if call_args.len() != 5 {
+                if call_args.len() < 5 {
                     return Err(MatroError::arity(
                         "integral2",
-                        "5 (fun, xmin, xmax, ymin, ymax)",
+                        ">= 5 (fun, xmin, xmax, ymin, ymax)",
                         call_args.len(),
                     ));
                 }
@@ -3837,23 +3936,6 @@ impl Vm {
                     stdout,
                 )?;
                 return Ok(vec![Value::scalar(q)]);
-            }
-            "fminbnd" => {
-                if call_args.len() != 3 {
-                    return Err(MatroError::arity("fminbnd", "3 (fun, x1, x2)", call_args.len()));
-                }
-                let Value::Closure(cl) = &call_args[0] else {
-                    return Err(MatroError::runtime(
-                        "fminbnd: first argument must be a function handle",
-                    ));
-                };
-                let x1 = call_args[1].as_scalar()?;
-                let x2 = call_args[2].as_scalar()?;
-                let (x, fval) = solvers_ext::solve_fminbnd(self, cl, x1, x2, stdout)?;
-                if nargout >= 2 {
-                    return Ok(vec![Value::scalar(x), Value::scalar(fval)]);
-                }
-                return Ok(vec![Value::scalar(x)]);
             }
             "import" => {
                 for a in call_args {
@@ -3934,10 +4016,15 @@ impl Vm {
                 return Ok(vec![Value::String(found)]);
             }
             "exist" => {
-                if call_args.is_empty() {
-                    return Err(MatroError::arity("exist", "1", 0));
+                if call_args.is_empty() || call_args.len() > 2 {
+                    return Err(MatroError::arity("exist", "1 or 2 (name [, searchType])", call_args.len()));
                 }
                 let q = call_args[0].as_str()?;
+                let kind = call_args
+                    .get(1)
+                    .map(|v| v.as_str())
+                    .transpose()?
+                    .map(|s| s.to_ascii_lowercase());
                 let caller_file: Option<String> = explicit_source_file
                     .map(String::from)
                     .or_else(|| {
@@ -3949,11 +4036,9 @@ impl Vm {
                     .or_else(|| self.active_file.clone());
                 let caller_dir = caller_file.as_deref().map(matro_loader::parent_dir);
 
-                let code = if lookup_var(q, frame.as_deref(), &self.globals).is_some() {
-                    1.0
-                } else if self.classes.contains_key(q) {
-                    8.0
-                } else if self.functions.contains_key(q)
+                let is_var = lookup_var(q, frame.as_deref(), &self.globals).is_some();
+                let is_class = self.classes.contains_key(q);
+                let is_file = self.functions.contains_key(q)
                     || caller_file.as_deref().is_some_and(|cf| {
                         self.loaded_files
                             .get(cf)
@@ -3963,13 +4048,31 @@ impl Vm {
                         .loader
                         .resolve_in_context(q, caller_dir.as_deref())
                         .is_some()
-                    || self.loader.resolve_path(q).is_some()
-                {
-                    2.0
-                } else if self.loader.vfs().is_dir(q) {
-                    7.0
-                } else {
-                    0.0
+                    || self.loader.resolve_path(q).is_some();
+                let is_dir = self.loader.vfs().is_dir(q);
+                let is_builtin = is_vm_or_intrinsic_builtin(q);
+
+                let code = match kind.as_deref() {
+                    Some("var") => if is_var { 1.0 } else { 0.0 },
+                    Some("file") => if is_file { 2.0 } else if is_dir { 7.0 } else { 0.0 },
+                    Some("dir") => if is_dir { 7.0 } else { 0.0 },
+                    Some("builtin") => if is_builtin { 5.0 } else { 0.0 },
+                    Some("class") => if is_class { 8.0 } else { 0.0 },
+                    _ => {
+                        if is_var {
+                            1.0
+                        } else if is_class {
+                            8.0
+                        } else if is_file {
+                            2.0
+                        } else if is_builtin {
+                            5.0
+                        } else if is_dir {
+                            7.0
+                        } else {
+                            0.0
+                        }
+                    }
                 };
                 return Ok(vec![Value::scalar(code)]);
             }
@@ -4412,6 +4515,1228 @@ impl Vm {
         }
         Ok(out)
     }
+
+    #[inline(never)]
+    fn exec_arrayfun(&mut self, call_args: &[Value], stdout: &mut String) -> Result<Vec<Value>> {
+        if call_args.len() < 2 {
+            return Err(MatroError::arity("arrayfun", ">= 2 (fun, A, ...)", call_args.len()));
+        }
+        let mut uniform = true;
+        let mut end = call_args.len();
+        while end >= 4 {
+            if let Ok(k) = call_args[end - 2].as_str() {
+                if k.eq_ignore_ascii_case("UniformOutput") {
+                    uniform = call_args[end - 1].is_truthy();
+                    end -= 2;
+                    continue;
+                } else if k.eq_ignore_ascii_case("ErrorHandler") {
+                    end -= 2;
+                    continue;
+                }
+            }
+            break;
+        }
+        let arr_vals = &call_args[1..end];
+        if arr_vals.is_empty() {
+            return Err(MatroError::arity("arrayfun", ">= 2 (fun, A, ...)", call_args.len()));
+        }
+        let mats: Vec<Matrix> = arr_vals
+            .iter()
+            .map(|v| v.to_dense_matrix())
+            .collect::<Result<_>>()?;
+        let dims = mats[0].dims().to_vec();
+        let total = mats[0].len();
+        for m in &mats[1..] {
+            if m.dims() != dims.as_slice() {
+                return Err(MatroError::dimension(
+                    "arrayfun: all input arrays must have the same size",
+                ));
+            }
+        }
+        let mut results = Vec::with_capacity(total);
+        for idx in 0..total {
+            let mut elem_args = Vec::with_capacity(mats.len());
+            for m in &mats {
+                elem_args.push(Value::matrix(
+                    Matrix::complex_scalar(m.get_linear_c(idx)).normalize(),
+                ));
+            }
+            let r = self.invoke_callable_val(&call_args[0], &elem_args, stdout)?;
+            results.push(r);
+        }
+        if uniform {
+            let mut out = Matrix::zeros_nd(dims);
+            let mut all_logical = !results.is_empty();
+            for (idx, v) in results.iter().enumerate() {
+                let rm = v.to_dense_matrix()?;
+                if rm.dtype() != matro_types::NumericClass::Logical {
+                    all_logical = false;
+                }
+                let sc = rm.as_complex_scalar().ok_or_else(|| {
+                    MatroError::dimension(
+                        "arrayfun: non-scalar output; pass 'UniformOutput', false",
+                    )
+                })?;
+                out.set_linear_c(idx, sc);
+            }
+            let mut out = out.normalize();
+            if all_logical {
+                out = out.into_logical();
+            }
+            Ok(vec![Value::matrix(out)])
+        } else {
+            let rows = dims.first().copied().unwrap_or(0);
+            let cols = if rows == 0 { 0 } else { total / rows };
+            Ok(vec![Value::Cell(CellArray {
+                rows,
+                cols,
+                data: results,
+            })])
+        }
+    }
+
+    #[inline(never)]
+    fn exec_cellfun(&mut self, call_args: &[Value], stdout: &mut String) -> Result<Vec<Value>> {
+        if call_args.len() < 2 {
+            return Err(MatroError::arity("cellfun", ">= 2 (fn, C, ...)", call_args.len()));
+        }
+        let mut uniform = true;
+        let mut end = call_args.len();
+        while end >= 4 {
+            if let Ok(k) = call_args[end - 2].as_str() {
+                if k.eq_ignore_ascii_case("UniformOutput") {
+                    uniform = call_args[end - 1].is_truthy();
+                    end -= 2;
+                    continue;
+                } else if k.eq_ignore_ascii_case("ErrorHandler") {
+                    end -= 2;
+                    continue;
+                }
+            }
+            break;
+        }
+        let cell_vals = &call_args[1..end];
+        let mut cells: Vec<&CellArray> = Vec::with_capacity(cell_vals.len());
+        for v in cell_vals {
+            let Value::Cell(c) = v else {
+                return Err(MatroError::runtime("cellfun: input arguments must be cell arrays"));
+            };
+            cells.push(c);
+        }
+        let rows = cells[0].rows;
+        let cols = cells[0].cols;
+        let total = cells[0].data.len();
+        for c in &cells[1..] {
+            if c.rows != rows || c.cols != cols {
+                return Err(MatroError::dimension(
+                    "cellfun: all input cell arrays must have the same size",
+                ));
+            }
+        }
+        let shortcut = call_args[0].as_str().ok().map(|s| s.to_ascii_lowercase());
+        let mut results = Vec::with_capacity(total);
+        for idx in 0..total {
+            let elem_args: Vec<Value> = cells.iter().map(|c| c.data[idx].clone()).collect();
+            let v = match shortcut.as_deref() {
+                Some("prodofsize") => self.invoke_callable_val(
+                    &Value::String("numel".to_string()),
+                    &elem_args,
+                    stdout,
+                )?,
+                _ => self.invoke_callable_val(&call_args[0], &elem_args, stdout)?,
+            };
+            results.push(v);
+        }
+        if uniform {
+            let mut out = Matrix::zeros(rows, cols);
+            let mut all_logical = !results.is_empty();
+            for (idx, v) in results.iter().enumerate() {
+                let rm = v.to_dense_matrix()?;
+                if rm.dtype() != matro_types::NumericClass::Logical {
+                    all_logical = false;
+                }
+                let sc = rm.as_complex_scalar().ok_or_else(|| {
+                    MatroError::runtime(
+                        "cellfun: non-scalar output; pass 'UniformOutput', false",
+                    )
+                })?;
+                out.set_linear_c(idx, sc);
+            }
+            let mut out = out.normalize();
+            if all_logical {
+                out = out.into_logical();
+            }
+            Ok(vec![Value::matrix(out)])
+        } else {
+            Ok(vec![Value::Cell(CellArray {
+                rows,
+                cols,
+                data: results,
+            })])
+        }
+    }
+
+    #[inline(never)]
+    fn exec_bsxfun(&mut self, call_args: &[Value], stdout: &mut String) -> Result<Vec<Value>> {
+        if call_args.len() != 3 {
+            return Err(MatroError::arity("bsxfun", "3 (fn, A, B)", call_args.len()));
+        }
+        let a = call_args[1].to_dense_matrix()?;
+        let b = call_args[2].to_dense_matrix()?;
+        let a_dims = a.dims();
+        let b_dims = b.dims();
+        let nd = a_dims.len().max(b_dims.len());
+        let mut out_dims = Vec::with_capacity(nd);
+        for d in 0..nd {
+            let da = a_dims.get(d).copied().unwrap_or(1);
+            let db = b_dims.get(d).copied().unwrap_or(1);
+            if da == db {
+                out_dims.push(da);
+            } else if da == 1 {
+                out_dims.push(db);
+            } else if db == 1 {
+                out_dims.push(da);
+            } else {
+                return Err(MatroError::dimension(
+                    "bsxfun: incompatible array dimensions for singleton expansion",
+                ));
+            }
+        }
+        let total: usize = out_dims.iter().product();
+        let mut out = Matrix::zeros_nd(out_dims.clone());
+        let mut all_logical = total > 0;
+        let mut strides_a = vec![1usize; nd];
+        let mut strides_b = vec![1usize; nd];
+        for d in 1..nd {
+            strides_a[d] = strides_a[d - 1] * a_dims.get(d - 1).copied().unwrap_or(1);
+            strides_b[d] = strides_b[d - 1] * b_dims.get(d - 1).copied().unwrap_or(1);
+        }
+        for lin in 0..total {
+            let mut rem = lin;
+            let mut idx_a = 0usize;
+            let mut idx_b = 0usize;
+            for d in 0..nd {
+                let coord = rem % out_dims[d];
+                rem /= out_dims[d];
+                if a_dims.get(d).copied().unwrap_or(1) > 1 {
+                    idx_a += coord * strides_a[d];
+                }
+                if b_dims.get(d).copied().unwrap_or(1) > 1 {
+                    idx_b += coord * strides_b[d];
+                }
+            }
+            let va = Value::matrix(Matrix::complex_scalar(a.get_linear_c(idx_a)).normalize());
+            let vb = Value::matrix(Matrix::complex_scalar(b.get_linear_c(idx_b)).normalize());
+            let res = self.invoke_callable_val(&call_args[0], &[va, vb], stdout)?;
+            let rm = res.to_dense_matrix()?;
+            if rm.dtype() != matro_types::NumericClass::Logical {
+                all_logical = false;
+            }
+            let sc = rm.as_complex_scalar().ok_or_else(|| {
+                MatroError::dimension("bsxfun: callback must return scalar")
+            })?;
+            out.set_linear_c(lin, sc);
+        }
+        let mut out = out.normalize();
+        if all_logical {
+            out = out.into_logical();
+        }
+        Ok(vec![Value::matrix(out)])
+    }
+
+    #[inline(never)]
+    fn exec_accumarray_closure(
+        &mut self,
+        call_args: &[Value],
+        stdout: &mut String,
+    ) -> Result<Vec<Value>> {
+        let (n_entries, n_dims, coord_cols): (usize, usize, Vec<Vec<usize>>) = match &call_args[0]
+        {
+            Value::Cell(c) => {
+                let mut cols = Vec::with_capacity(c.data.len());
+                for item in &c.data {
+                    let m = item.to_dense_matrix()?;
+                    let mut col = Vec::with_capacity(m.len());
+                    for &v in m.data() {
+                        if v < 1.0 || !v.is_finite() {
+                            return Err(MatroError::index("accumarray: subscripts must be positive integers"));
+                        }
+                        col.push(v.round() as usize - 1);
+                    }
+                    cols.push(col);
+                }
+                let n = cols.first().map_or(0, |v| v.len());
+                (n, cols.len().max(1), cols)
+            }
+            other => {
+                let s = other.to_dense_matrix()?;
+                if s.rows() == 1 && s.cols() > 1 {
+                    let mut col = Vec::with_capacity(s.len());
+                    for &v in s.data() {
+                        if v < 1.0 || !v.is_finite() {
+                            return Err(MatroError::index("accumarray: subscripts must be positive integers"));
+                        }
+                        col.push(v.round() as usize - 1);
+                    }
+                    (col.len(), 1, vec![col])
+                } else {
+                    let nr = s.rows();
+                    let nc = s.cols().max(1);
+                    let mut cols = vec![Vec::with_capacity(nr); nc];
+                    for c in 0..nc {
+                        for r in 0..nr {
+                            let v = s.get(r, c);
+                            if v < 1.0 || !v.is_finite() {
+                                return Err(MatroError::index("accumarray: subscripts must be positive integers"));
+                            }
+                            cols[c].push(v.round() as usize - 1);
+                        }
+                    }
+                    (nr, nc, cols)
+                }
+            }
+        };
+
+        let val_m = call_args[1].to_dense_matrix()?;
+        let val_scalar = val_m.len() == 1;
+        if !val_scalar && val_m.len() != n_entries {
+            return Err(MatroError::dimension(
+                "accumarray: val length must match subs row count or be scalar",
+            ));
+        }
+
+        let mut dims: Vec<usize> = if call_args.len() >= 3 && !matches!(&call_args[2], Value::Matrix(m) if m.is_empty()) {
+            let sm = call_args[2].to_dense_matrix()?;
+            sm.data().iter().map(|&v| v.max(0.0).round() as usize).collect()
+        } else {
+            let mut d: Vec<usize> = coord_cols
+                .iter()
+                .map(|c| c.iter().copied().max().map_or(0, |m| m + 1))
+                .collect();
+            if d.len() == 1 {
+                d.push(1);
+            }
+            d
+        };
+        if dims.len() == 1 {
+            dims.push(1);
+        }
+        let fill = if call_args.len() >= 5 && !matches!(&call_args[4], Value::Matrix(m) if m.is_empty()) {
+            call_args[4].as_scalar()?
+        } else {
+            0.0
+        };
+
+        let total: usize = dims.iter().product();
+        let mut strides = vec![1usize; dims.len()];
+        for d in 1..dims.len() {
+            strides[d] = strides[d - 1] * dims[d - 1];
+        }
+        let mut buckets: Vec<Vec<Complex>> = vec![Vec::new(); total];
+        for i in 0..n_entries {
+            let mut lin = 0usize;
+            for d in 0..n_dims {
+                let coord = coord_cols[d][i];
+                if coord >= dims[d] {
+                    return Err(MatroError::index("accumarray: subscript exceeds output size"));
+                }
+                lin += coord * strides[d];
+            }
+            let v = if val_scalar {
+                val_m.get_linear_c(0)
+            } else {
+                val_m.get_linear_c(i)
+            };
+            buckets[lin].push(v);
+        }
+
+        let mut out = Matrix::zeros_nd(dims);
+        for (lin, grp) in buckets.into_iter().enumerate() {
+            if grp.is_empty() {
+                out.set_linear_c(lin, Complex::from_real(fill));
+            } else {
+                let arg = Value::matrix(Matrix::complex_col_vec(grp).normalize());
+                let res = self.invoke_callable_val(&call_args[3], &[arg], stdout)?;
+                let sc = res
+                    .to_dense_matrix()?
+                    .as_complex_scalar()
+                    .ok_or_else(|| MatroError::dimension("accumarray: fun must return scalar"))?;
+                out.set_linear_c(lin, sc);
+            }
+        }
+        Ok(vec![Value::matrix(out.normalize())])
+    }
+
+    #[inline(never)]
+    fn exec_ode_solver(
+        &mut self,
+        name: &str,
+        call_args: &[Value],
+        nargout: usize,
+        stdout: &mut String,
+    ) -> Result<Vec<Value>> {
+        if call_args.len() < 3 || call_args.len() > 4 {
+            return Err(MatroError::arity(name, "3 or 4 (f, tspan, y0 [, options])", call_args.len()));
+        }
+        let Value::Closure(cl) = &call_args[0] else {
+            return Err(MatroError::runtime(format!(
+                "{name}: first argument must be a function handle @(t, y) ..."
+            )));
+        };
+        let tspan = call_args[1].to_dense_matrix()?;
+        let y0 = call_args[2].to_dense_matrix()?;
+        let opts = solvers::OdeOptions::from_val(call_args.get(3));
+        let (t_mat, y_mat) = match name {
+            "ode45" => solvers::solve_ode45(self, cl, &tspan, &y0, &opts, stdout)?,
+            "ode23" => solvers_ext::solve_ode23(self, cl, &tspan, &y0, stdout)?,
+            "ode113" => solvers_ext::solve_ode113(self, cl, &tspan, &y0, stdout)?,
+            "ode15s" | "ode23s" | "ode23t" | "ode23tb" => {
+                solvers::solve_ode15s(self, cl, &tspan, &y0, stdout)?
+            }
+            _ => unreachable!(),
+        };
+        if nargout <= 1 {
+            let mut sol = BTreeMap::new();
+            sol.insert("solver".to_string(), Value::String(name.to_string()));
+            sol.insert("x".to_string(), Value::matrix(t_mat.transpose()));
+            sol.insert("y".to_string(), Value::matrix(y_mat.transpose()));
+            return Ok(vec![Value::Struct(sol)]);
+        }
+        Ok(vec![Value::matrix(t_mat), Value::matrix(y_mat)])
+    }
+
+    #[inline(never)]
+    fn exec_fzero(
+        &mut self,
+        call_args: &[Value],
+        nargout: usize,
+        stdout: &mut String,
+    ) -> Result<Vec<Value>> {
+        if call_args.len() < 2 || call_args.len() > 3 {
+            return Err(MatroError::arity("fzero", "2 or 3 (f, x0 [, options])", call_args.len()));
+        }
+        let Value::Closure(cl) = &call_args[0] else {
+            return Err(MatroError::runtime(
+                "fzero: first argument must be a function handle",
+            ));
+        };
+        let guess = call_args[1].to_dense_matrix()?;
+        let root = solvers::solve_fzero(self, cl, &guess, stdout)?;
+        let mut out = vec![Value::scalar(root)];
+        if nargout >= 2 {
+            let fval = self
+                .call_closure(cl, &[Value::scalar(root)], 1, stdout)?
+                .into_iter()
+                .next()
+                .and_then(|v| v.as_scalar().ok())
+                .unwrap_or(0.0);
+            out.push(Value::scalar(fval));
+        }
+        if nargout >= 3 {
+            out.push(Value::scalar(if root.is_finite() { 1.0 } else { -1.0 }));
+        }
+        if nargout >= 4 {
+            let mut info = BTreeMap::new();
+            info.insert("algorithm".to_string(), Value::String("bisection, interpolation".into()));
+            out.push(Value::Struct(info));
+        }
+        Ok(out)
+    }
+
+    #[inline(never)]
+    fn exec_integral(
+        &mut self,
+        name: &str,
+        call_args: &[Value],
+        stdout: &mut String,
+    ) -> Result<Vec<Value>> {
+        if call_args.len() < 3 {
+            return Err(MatroError::arity(name, ">= 3 (f, a, b [, opts...])", call_args.len()));
+        }
+        let Value::Closure(cl) = &call_args[0] else {
+            return Err(MatroError::runtime(format!(
+                "{name}: first argument must be a function handle"
+            )));
+        };
+        let a = call_args[1].as_scalar()?;
+        let b = call_args[2].as_scalar()?;
+        let mut rel_tol = 1e-6;
+        let mut abs_tol = 1e-10;
+        let mut waypoints: Vec<f64> = Vec::new();
+        let mut array_valued = false;
+
+        if call_args.len() == 4 && matches!(name, "quad" | "quadl") {
+            if let Ok(t) = call_args[3].as_scalar() {
+                abs_tol = t.abs().max(1e-15);
+            }
+        } else {
+            let mut i = 3;
+            while i + 1 < call_args.len() {
+                if let Ok(k) = call_args[i].as_str() {
+                    match k.to_ascii_lowercase().as_str() {
+                        "reltol" => rel_tol = call_args[i + 1].as_scalar()?.max(1e-14),
+                        "abstol" => abs_tol = call_args[i + 1].as_scalar()?.max(1e-15),
+                        "waypoints" => {
+                            let wm = call_args[i + 1].to_dense_matrix()?;
+                            waypoints = wm.data().to_vec();
+                        }
+                        "arrayvalued" => array_valued = call_args[i + 1].is_truthy(),
+                        _ => {}
+                    }
+                }
+                i += 2;
+            }
+        }
+
+        if array_valued {
+            let probe_x = if a.is_finite() && b.is_finite() {
+                0.5 * (a + b)
+            } else if a.is_finite() {
+                a + 1.0
+            } else if b.is_finite() {
+                b - 1.0
+            } else {
+                0.0
+            };
+            let probe = self
+                .call_closure(cl, &[Value::scalar(probe_x)], 1, stdout)?
+                .into_iter()
+                .next()
+                .unwrap_or_else(Value::empty)
+                .to_dense_matrix()?;
+            let dims = probe.dims().to_vec();
+            let total = probe.len();
+            // Integrate component-wise via fixed 64-panel Gauss-Kronrod or adaptive GK15
+            let n_panels = 64usize;
+            let mut acc = vec![Complex::ZERO; total];
+            const XGK: [f64; 8] = [
+                0.9914553711208126, 0.9491079123427585, 0.8648644233597691, 0.7415311855993945,
+                0.5860872354676911, 0.4058451513773972, 0.2077849550078985, 0.0,
+            ];
+            const WGK: [f64; 8] = [
+                0.02293532201052922, 0.06309209262997856, 0.1047900103222502, 0.1406532597155259,
+                0.1690047266392679, 0.1903505780647854, 0.2044329400752989, 0.2094821410847278,
+            ];
+            let h = (b - a) / n_panels as f64;
+            for p in 0..n_panels {
+                let lo = a + p as f64 * h;
+                let hi = lo + h;
+                let mid = 0.5 * (lo + hi);
+                let half = 0.5 * (hi - lo);
+                let eval_pt = |vm: &mut Vm, x: f64, w: f64, acc: &mut [Complex], stdout: &mut String| -> Result<()> {
+                    let m = vm
+                        .call_closure(cl, &[Value::scalar(x)], 1, stdout)?
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(Value::empty)
+                        .to_dense_matrix()?;
+                    for k in 0..total.min(m.len()) {
+                        acc[k] = acc[k] + m.get_linear_c(k) * Complex::from_real(w);
+                    }
+                    Ok(())
+                };
+                eval_pt(self, mid, half * WGK[7], &mut acc, stdout)?;
+                for j in 0..7 {
+                    let dx = half * XGK[j];
+                    eval_pt(self, mid - dx, half * WGK[j], &mut acc, stdout)?;
+                    eval_pt(self, mid + dx, half * WGK[j], &mut acc, stdout)?;
+                }
+            }
+            let re: Vec<f64> = acc.iter().map(|z| z.re).collect();
+            let im: Vec<f64> = acc.iter().map(|z| z.im).collect();
+            let out = Matrix::from_nd_complex_col_major(dims, re, im)?.normalize();
+            return Ok(vec![Value::matrix(out)]);
+        }
+
+        let q = solvers::solve_integral_opts(
+            self,
+            cl,
+            a,
+            b,
+            rel_tol,
+            abs_tol,
+            &waypoints,
+            stdout,
+        )?;
+        Ok(vec![Value::matrix(Matrix::complex_scalar(q).normalize())])
+    }
+
+    #[inline(never)]
+    fn exec_opt_solver(
+        &mut self,
+        name: &str,
+        call_args: &[Value],
+        nargout: usize,
+        stdout: &mut String,
+    ) -> Result<Vec<Value>> {
+        let make_out_struct = |algo: &str| {
+            let mut m = BTreeMap::new();
+            m.insert("algorithm".to_string(), Value::String(algo.to_string()));
+            Value::Struct(m)
+        };
+        match name {
+            "fminsearch" => {
+                if call_args.len() < 2 || call_args.len() > 3 {
+                    return Err(MatroError::arity("fminsearch", "2 or 3 (f, x0 [, options])", call_args.len()));
+                }
+                let Value::Closure(cl) = &call_args[0] else {
+                    return Err(MatroError::runtime("fminsearch: first argument must be a function handle"));
+                };
+                let x0 = call_args[1].to_dense_matrix()?;
+                let (best_x, fval) = solvers::solve_fminsearch(self, cl, &x0, stdout)?;
+                let mut out = vec![Value::matrix(best_x)];
+                if nargout >= 2 { out.push(Value::scalar(fval)); }
+                if nargout >= 3 { out.push(Value::scalar(1.0)); }
+                if nargout >= 4 { out.push(make_out_struct("Nelder-Mead simplex")); }
+                Ok(out)
+            }
+            "fminunc" => {
+                if call_args.len() < 2 || call_args.len() > 3 {
+                    return Err(MatroError::arity("fminunc", "2 or 3 (fun, x0 [, options])", call_args.len()));
+                }
+                let Value::Closure(cl) = &call_args[0] else {
+                    return Err(MatroError::runtime("fminunc: first argument must be a function handle"));
+                };
+                let x0 = call_args[1].to_dense_matrix()?;
+                let (best_x, fval) = opt_solvers::solve_fminunc(self, cl, &x0, stdout)?;
+                let mut out = vec![Value::matrix(best_x)];
+                if nargout >= 2 { out.push(Value::scalar(fval)); }
+                if nargout >= 3 { out.push(Value::scalar(1.0)); }
+                if nargout >= 4 { out.push(make_out_struct("quasi-newton")); }
+                Ok(out)
+            }
+            "fmincon" => {
+                let (best_x, fval) = opt_solvers::solve_fmincon(self, call_args, stdout)?;
+                let mut out = vec![Value::matrix(best_x)];
+                if nargout >= 2 { out.push(Value::scalar(fval)); }
+                if nargout >= 3 { out.push(Value::scalar(1.0)); }
+                if nargout >= 4 { out.push(make_out_struct("interior-point")); }
+                Ok(out)
+            }
+            "fminbnd" => {
+                if call_args.len() < 3 || call_args.len() > 4 {
+                    return Err(MatroError::arity("fminbnd", "3 or 4 (fun, x1, x2 [, options])", call_args.len()));
+                }
+                let Value::Closure(cl) = &call_args[0] else {
+                    return Err(MatroError::runtime("fminbnd: first argument must be a function handle"));
+                };
+                let x1 = call_args[1].as_scalar()?;
+                let x2 = call_args[2].as_scalar()?;
+                let (x, fval) = solvers_ext::solve_fminbnd(self, cl, x1, x2, stdout)?;
+                let mut out = vec![Value::scalar(x)];
+                if nargout >= 2 { out.push(Value::scalar(fval)); }
+                if nargout >= 3 { out.push(Value::scalar(1.0)); }
+                if nargout >= 4 { out.push(make_out_struct("golden section search, parabolic interpolation")); }
+                Ok(out)
+            }
+            "fsolve" => {
+                if call_args.len() < 2 || call_args.len() > 3 {
+                    return Err(MatroError::arity("fsolve", "2 or 3 (f, x0 [, options])", call_args.len()));
+                }
+                let Value::Closure(cl) = &call_args[0] else {
+                    return Err(MatroError::runtime("fsolve: first argument must be a function handle"));
+                };
+                let x0 = call_args[1].to_dense_matrix()?;
+                let (sol, _resnorm, residual) = solvers::solve_lm(self, cl, &x0, stdout)?;
+                let mut out = vec![Value::matrix(sol)];
+                if nargout >= 2 { out.push(Value::matrix(residual)); }
+                if nargout >= 3 { out.push(Value::scalar(1.0)); }
+                if nargout >= 4 { out.push(make_out_struct("levenberg-marquardt")); }
+                Ok(out)
+            }
+            "lsqnonlin" => {
+                if call_args.len() < 2 || call_args.len() > 5 {
+                    return Err(MatroError::arity(
+                        "lsqnonlin",
+                        "2 to 5 (f, x0 [, lb, ub, options])",
+                        call_args.len(),
+                    ));
+                }
+                let Value::Closure(cl) = &call_args[0] else {
+                    return Err(MatroError::runtime("lsqnonlin: first argument must be a function handle"));
+                };
+                let x0 = call_args[1].to_dense_matrix()?;
+                let lb = call_args.get(2).and_then(|v| v.to_dense_matrix().ok());
+                let ub = call_args.get(3).and_then(|v| v.to_dense_matrix().ok());
+                let (sol, resnorm, residual) = solvers::solve_lm_bounded(
+                    self,
+                    cl,
+                    &x0,
+                    None,
+                    lb.as_ref(),
+                    ub.as_ref(),
+                    stdout,
+                )?;
+                let mut out = vec![Value::matrix(sol)];
+                if nargout >= 2 { out.push(Value::scalar(resnorm)); }
+                if nargout >= 3 { out.push(Value::matrix(residual)); }
+                if nargout >= 4 { out.push(Value::scalar(1.0)); }
+                if nargout >= 5 { out.push(make_out_struct("levenberg-marquardt")); }
+                Ok(out)
+            }
+            "lsqcurvefit" => {
+                if call_args.len() < 4 || call_args.len() > 7 {
+                    return Err(MatroError::arity(
+                        "lsqcurvefit",
+                        "4 to 7 (fun, x0, xdata, ydata [, lb, ub, options])",
+                        call_args.len(),
+                    ));
+                }
+                let Value::Closure(cl) = &call_args[0] else {
+                    return Err(MatroError::runtime("lsqcurvefit: first argument must be a function handle"));
+                };
+                let x0 = call_args[1].to_dense_matrix()?;
+                let ydata = call_args[3].to_dense_matrix()?;
+                let lb = call_args.get(4).and_then(|v| v.to_dense_matrix().ok());
+                let ub = call_args.get(5).and_then(|v| v.to_dense_matrix().ok());
+                let (sol, resnorm, residual) = solvers::solve_lm_bounded(
+                    self,
+                    cl,
+                    &x0,
+                    Some((&call_args[2], &ydata)),
+                    lb.as_ref(),
+                    ub.as_ref(),
+                    stdout,
+                )?;
+                let mut out = vec![Value::matrix(sol)];
+                if nargout >= 2 { out.push(Value::scalar(resnorm)); }
+                if nargout >= 3 { out.push(Value::matrix(residual)); }
+                if nargout >= 4 { out.push(Value::scalar(1.0)); }
+                if nargout >= 5 { out.push(make_out_struct("levenberg-marquardt")); }
+                Ok(out)
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn exec_odeset(args: &[Value]) -> Result<Value> {
+    let mut map = BTreeMap::new();
+    let mut i = 0;
+    if let Some(Value::Struct(existing)) = args.first() {
+        map = existing.clone();
+        i = 1;
+    }
+    while i + 1 < args.len() {
+        let k = args[i].as_str()?.to_string();
+        map.insert(k, args[i + 1].clone());
+        i += 2;
+    }
+    Ok(Value::Struct(map))
+}
+
+fn exec_odeget(args: &[Value]) -> Result<Value> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(MatroError::arity("odeget", "2 or 3 (options, name [, default])", args.len()));
+    }
+    let key = args[1].as_str()?;
+    let default = args.get(2).cloned().unwrap_or_else(Value::empty);
+    if let Value::Struct(map) = &args[0] {
+        for (k, v) in map {
+            if k.eq_ignore_ascii_case(key) {
+                return Ok(v.clone());
+            }
+        }
+    }
+    Ok(default)
+}
+
+fn exec_optimset(name: &str, args: &[Value]) -> Result<Value> {
+    let mut map = BTreeMap::new();
+    let mut i = 0;
+    if name == "optimoptions" && !args.is_empty() {
+        if let Ok(solver) = args[0].as_str() {
+            map.insert("SolverName".to_string(), Value::String(solver.to_string()));
+            i = 1;
+        } else if let Value::Struct(existing) = &args[0] {
+            map = existing.clone();
+            i = 1;
+        }
+    } else if let Some(Value::Struct(existing)) = args.first() {
+        map = existing.clone();
+        i = 1;
+    } else if args.len() == 1 {
+        if let Ok(solver) = args[0].as_str() {
+            map.insert("SolverName".to_string(), Value::String(solver.to_string()));
+            return Ok(Value::Struct(map));
+        }
+    }
+    while i + 1 < args.len() {
+        let k = args[i].as_str()?.to_string();
+        map.insert(k, args[i + 1].clone());
+        i += 2;
+    }
+    Ok(Value::Struct(map))
+}
+
+fn is_vm_or_intrinsic_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "feval"
+            | "eval"
+            | "evalc"
+            | "arrayfun"
+            | "cellfun"
+            | "structfun"
+            | "bsxfun"
+            | "load"
+            | "save"
+            | "exist"
+            | "which"
+            | "addpath"
+            | "rmpath"
+            | "genpath"
+            | "path"
+            | "isa"
+            | "class"
+            | "methods"
+            | "properties"
+            | "superclasses"
+            | "builtin"
+            | "ode45"
+            | "ode23"
+            | "ode15s"
+            | "ode113"
+            | "ode23s"
+            | "ode23t"
+            | "ode23tb"
+            | "odeset"
+            | "odeget"
+            | "optimset"
+            | "optimoptions"
+            | "deval"
+            | "bvpinit"
+            | "bvp4c"
+            | "pdepe"
+            | "fzero"
+            | "fsolve"
+            | "fminsearch"
+            | "fminbnd"
+            | "fminunc"
+            | "fmincon"
+            | "lsqnonlin"
+            | "lsqcurvefit"
+            | "lsqnonneg"
+            | "integral"
+            | "integral2"
+            | "quad"
+            | "quadl"
+            | "quadgk"
+            | "pcg"
+            | "gmres"
+            | "bicgstab"
+            | "minres"
+            | "lsqr"
+            | "cgs"
+            | "bicg"
+            | "fopen"
+            | "fclose"
+            | "fgetl"
+            | "fgets"
+            | "fprintf"
+            | "fscanf"
+            | "sscanf"
+            | "fread"
+            | "fwrite"
+            | "feof"
+            | "ftell"
+            | "fseek"
+            | "frewind"
+            | "ferror"
+            | "textscan"
+            | "nargin"
+            | "nargout"
+            | "narginchk"
+            | "nargoutchk"
+            | "who"
+            | "whos"
+            | "clear"
+            | "clc"
+    ) || matro_intrinsics::is_intrinsic(name)
+}
+
+fn assign_cell_parens(cell: &mut CellArray, args: &[StackItem], rhs: Value) -> Result<()> {
+    let is_delete = matches!(&rhs, Value::Matrix(m) if m.is_empty());
+    if is_delete && args.len() == 1 {
+        let del = resolve_indices(&args[0], cell.data.len())?;
+        let mut keep = vec![true; cell.data.len()];
+        for i in del {
+            if i < keep.len() {
+                keep[i] = false;
+            }
+        }
+        let new_data: Vec<Value> = cell
+            .data
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| keep[*i])
+            .map(|(_, v)| v.clone())
+            .collect();
+        let n = new_data.len();
+        if cell.cols == 1 && cell.rows > 1 {
+            cell.rows = n;
+            cell.cols = if n == 0 { 0 } else { 1 };
+        } else {
+            cell.rows = if n == 0 { 0 } else { 1 };
+            cell.cols = n;
+        }
+        cell.data = new_data;
+        return Ok(());
+    }
+    let rhs_cells: Vec<Value> = match rhs {
+        Value::Cell(c) => c.data,
+        other => vec![other],
+    };
+    match args.len() {
+        1 => {
+            let idxs: Vec<usize> = match &args[0] {
+                StackItem::Colon => (0..cell.data.len()).collect(),
+                StackItem::Scalar(x) => {
+                    let i = x.round() as isize;
+                    if i < 1 {
+                        return Err(MatroError::index(format!("Index {x} must be >= 1")));
+                    }
+                    vec![(i - 1) as usize]
+                }
+                StackItem::Val(v) => {
+                    let m = v.to_dense_matrix()?;
+                    if m.is_logical() {
+                        m.data()
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, &f)| (f != 0.0).then_some(i))
+                            .collect()
+                    } else {
+                        m.data()
+                            .iter()
+                            .map(|&x| {
+                                let i = x.round() as isize;
+                                if i < 1 {
+                                    Err(MatroError::index(format!("Index {x} must be >= 1")))
+                                } else {
+                                    Ok((i - 1) as usize)
+                                }
+                            })
+                            .collect::<Result<_>>()?
+                    }
+                }
+                _ => Vec::new(),
+            };
+            let needed = idxs.iter().copied().max().map(|i| i + 1).unwrap_or(0);
+            if needed > cell.data.len() {
+                let was_col = cell.cols == 1 && cell.rows > 1;
+                cell.data.resize(needed, Value::empty());
+                if was_col {
+                    cell.rows = needed;
+                    cell.cols = 1;
+                } else {
+                    cell.rows = 1;
+                    cell.cols = needed;
+                }
+            }
+            if rhs_cells.len() == 1 {
+                for &i in &idxs {
+                    cell.data[i] = rhs_cells[0].clone();
+                }
+            } else if rhs_cells.len() == idxs.len() {
+                for (k, &i) in idxs.iter().enumerate() {
+                    cell.data[i] = rhs_cells[k].clone();
+                }
+            } else {
+                return Err(MatroError::dimension("Cell indexed assignment size mismatch"));
+            }
+            Ok(())
+        }
+        2 => {
+            let parse_dim = |item: &StackItem, cur: usize| -> Result<Vec<usize>> {
+                match item {
+                    StackItem::Colon => Ok((0..cur).collect()),
+                    StackItem::Scalar(x) => {
+                        let i = x.round() as isize;
+                        if i < 1 {
+                            Err(MatroError::index(format!("Index {x} must be >= 1")))
+                        } else {
+                            Ok(vec![(i - 1) as usize])
+                        }
+                    }
+                    StackItem::Val(v) => {
+                        let m = v.to_dense_matrix()?;
+                        if m.is_logical() {
+                            Ok(m.data()
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, &f)| (f != 0.0).then_some(i))
+                                .collect())
+                        } else {
+                            m.data()
+                                .iter()
+                                .map(|&x| {
+                                    let i = x.round() as isize;
+                                    if i < 1 {
+                                        Err(MatroError::index(format!("Index {x} must be >= 1")))
+                                    } else {
+                                        Ok((i - 1) as usize)
+                                    }
+                                })
+                                .collect()
+                        }
+                    }
+                    _ => Ok(Vec::new()),
+                }
+            };
+            let rows = parse_dim(&args[0], cell.rows)?;
+            let cols = parse_dim(&args[1], cell.cols)?;
+            let new_r = cell.rows.max(rows.iter().copied().max().map(|i| i + 1).unwrap_or(0));
+            let new_c = cell.cols.max(cols.iter().copied().max().map(|i| i + 1).unwrap_or(0));
+            if new_r != cell.rows || new_c != cell.cols {
+                let mut grown = CellArray {
+                    rows: new_r,
+                    cols: new_c,
+                    data: vec![Value::empty(); new_r * new_c],
+                };
+                for c in 0..cell.cols {
+                    for r in 0..cell.rows {
+                        grown.data[c * new_r + r] = cell.get(r, c).clone();
+                    }
+                }
+                *cell = grown;
+            }
+            let total = rows.len() * cols.len();
+            if rhs_cells.len() == 1 {
+                for &c in &cols {
+                    for &r in &rows {
+                        cell.data[c * cell.rows + r] = rhs_cells[0].clone();
+                    }
+                }
+            } else if rhs_cells.len() == total {
+                let mut k = 0;
+                for &c in &cols {
+                    for &r in &rows {
+                        cell.data[c * cell.rows + r] = rhs_cells[k].clone();
+                        k += 1;
+                    }
+                }
+            } else {
+                return Err(MatroError::dimension("Cell indexed assignment size mismatch"));
+            }
+            Ok(())
+        }
+        n => Err(MatroError::index(format!(
+            "Cell assignment expects 1 or 2 indices, got {n}"
+        ))),
+    }
+}
+
+fn assign_struct_parens(val: &mut Value, args: &[StackItem], rhs: Value) -> Result<()> {
+    let mut sa = match std::mem::replace(val, Value::empty()) {
+        Value::Struct(m) => matro_types::StructArray {
+            rows: 1,
+            cols: 1,
+            items: vec![m],
+        },
+        Value::StructArray(sa) => sa,
+        other => {
+            *val = other;
+            return Err(MatroError::runtime("Expected struct array"));
+        }
+    };
+    let is_delete = matches!(&rhs, Value::Matrix(m) if m.is_empty());
+    if is_delete && args.len() == 1 {
+        let del = resolve_indices(&args[0], sa.items.len())?;
+        let mut keep = vec![true; sa.items.len()];
+        for i in del {
+            if i < keep.len() {
+                keep[i] = false;
+            }
+        }
+        sa.items = sa
+            .items
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| keep[*i])
+            .map(|(_, s)| s)
+            .collect();
+        sa.rows = if sa.items.is_empty() { 0 } else { 1 };
+        sa.cols = sa.items.len();
+        *val = if sa.items.len() == 1 {
+            Value::Struct(sa.items.into_iter().next().unwrap())
+        } else {
+            Value::StructArray(sa)
+        };
+        return Ok(());
+    }
+    let rhs_items: Vec<BTreeMap<String, Value>> = match rhs {
+        Value::Struct(m) => vec![m],
+        Value::StructArray(s) => s.items,
+        other => {
+            *val = Value::StructArray(sa);
+            return Err(MatroError::runtime(format!(
+                "Cannot assign {} into struct array",
+                other.type_name()
+            )));
+        }
+    };
+    if args.len() != 1 {
+        *val = Value::StructArray(sa);
+        return Err(MatroError::index("Struct array assignment currently expects 1 index"));
+    }
+    let idxs: Vec<usize> = match &args[0] {
+        StackItem::Colon => (0..sa.items.len()).collect(),
+        StackItem::Scalar(x) => {
+            let i = x.round() as isize;
+            if i < 1 {
+                return Err(MatroError::index(format!("Index {x} must be >= 1")));
+            }
+            vec![(i - 1) as usize]
+        }
+        StackItem::Val(v) => {
+            let m = v.to_dense_matrix()?;
+            if m.is_logical() {
+                m.data()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &f)| (f != 0.0).then_some(i))
+                    .collect()
+            } else {
+                m.data()
+                    .iter()
+                    .map(|&x| {
+                        let i = x.round() as isize;
+                        if i < 1 {
+                            Err(MatroError::index(format!("Index {x} must be >= 1")))
+                        } else {
+                            Ok((i - 1) as usize)
+                        }
+                    })
+                    .collect::<Result<_>>()?
+            }
+        }
+        _ => Vec::new(),
+    };
+    let needed = idxs.iter().copied().max().map(|i| i + 1).unwrap_or(0);
+    if needed > sa.items.len() {
+        let template: BTreeMap<String, Value> = sa
+            .items
+            .first()
+            .or_else(|| rhs_items.first())
+            .map(|m| m.keys().map(|k| (k.clone(), Value::empty())).collect())
+            .unwrap_or_default();
+        sa.items.resize(needed, template);
+        sa.rows = 1;
+        sa.cols = needed;
+    }
+    if rhs_items.len() == 1 {
+        for &i in &idxs {
+            sa.items[i] = rhs_items[0].clone();
+        }
+    } else if rhs_items.len() == idxs.len() {
+        for (k, &i) in idxs.iter().enumerate() {
+            sa.items[i] = rhs_items[k].clone();
+        }
+    } else {
+        return Err(MatroError::dimension("Struct array assignment size mismatch"));
+    }
+    *val = if sa.items.len() == 1 {
+        Value::Struct(sa.items.into_iter().next().unwrap())
+    } else {
+        Value::StructArray(sa)
+    };
+    Ok(())
+}
+
+fn assign_string_parens(s: &mut String, args: &[StackItem], rhs: Value) -> Result<()> {
+    let mut chars: Vec<char> = s.chars().collect();
+    let idx_item = match args.len() {
+        1 => &args[0],
+        2 => &args[1],
+        n => {
+            return Err(MatroError::index(format!(
+                "Char array assignment expects 1 or 2 indices, got {n}"
+            )))
+        }
+    };
+    let is_delete = matches!(&rhs, Value::Matrix(m) if m.is_empty())
+        || matches!(&rhs, Value::String(rs) if rs.is_empty());
+    if is_delete {
+        let del = resolve_indices(idx_item, chars.len())?;
+        let mut keep = vec![true; chars.len()];
+        for i in del {
+            if i < keep.len() {
+                keep[i] = false;
+            }
+        }
+        *s = chars
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| keep[*i])
+            .map(|(_, ch)| ch)
+            .collect();
+        return Ok(());
+    }
+    let idxs: Vec<usize> = match idx_item {
+        StackItem::Colon => (0..chars.len()).collect(),
+        StackItem::Scalar(x) => {
+            let i = x.round() as isize;
+            if i < 1 {
+                return Err(MatroError::index(format!("Index {x} must be >= 1")));
+            }
+            vec![(i - 1) as usize]
+        }
+        StackItem::Val(v) => {
+            let m = v.to_dense_matrix()?;
+            if m.is_logical() {
+                m.data()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &f)| (f != 0.0).then_some(i))
+                    .collect()
+            } else {
+                m.data()
+                    .iter()
+                    .map(|&x| {
+                        let i = x.round() as isize;
+                        if i < 1 {
+                            Err(MatroError::index(format!("Index {x} must be >= 1")))
+                        } else {
+                            Ok((i - 1) as usize)
+                        }
+                    })
+                    .collect::<Result<_>>()?
+            }
+        }
+        _ => Vec::new(),
+    };
+    let rhs_chars: Vec<char> = match rhs {
+        Value::String(rs) => rs.chars().collect(),
+        Value::Matrix(m) => m
+            .data()
+            .iter()
+            .map(|&x| char::from_u32(x.round().max(0.0) as u32).unwrap_or('\0'))
+            .collect(),
+        other => {
+            return Err(MatroError::runtime(format!(
+                "Cannot assign {} into char vector",
+                other.type_name()
+            )))
+        }
+    };
+    let needed = idxs.iter().copied().max().map(|i| i + 1).unwrap_or(0);
+    if needed > chars.len() {
+        chars.resize(needed, ' ');
+    }
+    if rhs_chars.len() == 1 {
+        for &i in &idxs {
+            chars[i] = rhs_chars[0];
+        }
+    } else if rhs_chars.len() == idxs.len() {
+        for (k, &i) in idxs.iter().enumerate() {
+            chars[i] = rhs_chars[k];
+        }
+    } else {
+        return Err(MatroError::dimension("Char assignment size mismatch"));
+    }
+    *s = chars.into_iter().collect();
+    Ok(())
 }
 
 fn end_for_value(val: &Value, dim: u8, total_dims: u8) -> usize {
@@ -4419,6 +5744,9 @@ fn end_for_value(val: &Value, dim: u8, total_dims: u8) -> usize {
         Value::Matrix(m) => {
             if total_dims == 1 {
                 m.len()
+            } else if (dim as usize) + 1 == (total_dims as usize) && m.ndims() > (total_dims as usize) {
+                let dims = m.dims();
+                dims[(dim as usize)..].iter().product()
             } else {
                 m.dim_size(dim as usize)
             }
@@ -4798,18 +6126,35 @@ fn bin_logical(stack: &mut Vec<StackItem>, f: impl Fn(f64, f64) -> bool) -> Resu
     let a = pop_val(stack)?;
     let res = a
         .to_dense_matrix()?
-        .elementwise(&b.to_dense_matrix()?, |x, y| if f(x, y) { 1.0 } else { 0.0 })?
+        .elementwise_c(&b.to_dense_matrix()?, |x, y| {
+            let ax = if !x.is_zero() && !x.re.is_nan() && !x.im.is_nan() { 1.0 } else { 0.0 };
+            let by = if !y.is_zero() && !y.re.is_nan() && !y.im.is_nan() { 1.0 } else { 0.0 };
+            Complex::from_real(if f(ax, by) { 1.0 } else { 0.0 })
+        })?
         .with_logical(true);
     stack.push(StackItem::Val(Value::matrix(res)));
     Ok(())
 }
 
 fn extract_col(m: &Matrix, col: usize) -> Matrix {
-    if m.rows() == 1 {
-        Matrix::complex_scalar(m.get_c(0, col))
+    let orig_dtype = m.dtype();
+    let out = if m.rows() == 1 {
+        Matrix::complex_scalar(m.get_linear_c(col))
     } else {
-        let vals = (0..m.rows()).map(|r| m.get_c(r, col)).collect();
+        let base = col * m.rows();
+        let vals = (0..m.rows()).map(|r| m.get_linear_c(base + r)).collect();
         Matrix::complex_col_vec(vals)
+    };
+    preserve_dtype(out.normalize(), orig_dtype)
+}
+
+fn preserve_dtype(m: Matrix, dtype: matro_types::NumericClass) -> Matrix {
+    if dtype == matro_types::NumericClass::Logical {
+        m.with_logical(true)
+    } else if dtype != matro_types::NumericClass::Double {
+        m.cast_to(dtype)
+    } else {
+        m
     }
 }
 
@@ -4833,18 +6178,18 @@ fn resolve_indices(item: &StackItem, max_len: usize) -> Result<Vec<usize>> {
         }
         StackItem::Void => Ok(Vec::new()),
         StackItem::Val(v) => {
-            let m = v.as_matrix()?;
+            let m = v.to_dense_matrix()?;
             if m.is_logical() {
-                if m.len() > max_len {
-                    return Err(MatroError::index(format!(
-                        "Logical index length {} exceeds dimension {}",
-                        m.len(),
-                        max_len
-                    )));
-                }
                 let mut out = Vec::new();
                 for (i, &flag) in m.data().iter().enumerate() {
                     if flag != 0.0 {
+                        if i >= max_len {
+                            return Err(MatroError::index(format!(
+                                "Logical index position {} exceeds dimension {}",
+                                i + 1,
+                                max_len
+                            )));
+                        }
                         out.push(i);
                     }
                 }
@@ -4971,29 +6316,31 @@ fn nd_strides(dims: &[usize]) -> Vec<usize> {
 }
 
 fn index_matrix(m: &Matrix, args: &[StackItem]) -> Result<Matrix> {
-    match args.len() {
+    let orig_dtype = m.dtype();
+    let res = match args.len() {
         1 => {
             let idxs = resolve_indices(&args[0], m.len())?;
             let vals: Vec<Complex> = idxs.iter().map(|&i| m.get_linear_c(i)).collect();
             if let StackItem::Val(v) = &args[0] {
-                if let Ok(idx_m) = v.as_matrix() {
+                if let Ok(idx_m) = v.to_dense_matrix() {
                     if !idx_m.is_logical() {
-                        let a_is_vec = m.ndims() == 2 && (m.rows() == 1 || m.cols() == 1);
+                        let a_is_vec =
+                            m.ndims() == 2 && (m.rows() == 1 || m.cols() == 1) && m.len() != 1;
                         let idx_is_vec =
                             idx_m.ndims() == 2 && (idx_m.rows() == 1 || idx_m.cols() == 1);
                         if !a_is_vec || !idx_is_vec {
                             let re: Vec<f64> = vals.iter().map(|c| c.re).collect();
                             let im: Vec<f64> = vals.iter().map(|c| c.im).collect();
                             return Matrix::from_nd_complex_col_major(idx_m.dims(), re, im)
-                                .map(Matrix::normalize);
+                                .map(|mat| preserve_dtype(mat.normalize(), orig_dtype));
                         }
                     }
                 }
             }
             if m.rows() == 1 && m.ndims() == 2 && !matches!(args[0], StackItem::Colon) {
-                Ok(Matrix::complex_row_vec(vals).normalize())
+                Matrix::complex_row_vec(vals).normalize()
             } else {
-                Ok(Matrix::complex_col_vec(vals).normalize())
+                Matrix::complex_col_vec(vals).normalize()
             }
         }
         2 => {
@@ -5011,20 +6358,28 @@ fn index_matrix(m: &Matrix, args: &[StackItem]) -> Result<Matrix> {
                     out.set_c(ri, ci, m.get_linear_c(c * m.rows() + r));
                 }
             }
-            Ok(out.normalize())
+            out.normalize()
         }
         n => {
-            // General N-D indexing `A(i1, i2, ..., in)`
+            // General N-D indexing `A(i1, i2, ..., in)` with MATLAB trailing-dim collapse when n < ndims
+            let in_dims = m.dims();
+            let mut eff_dims = Vec::with_capacity(n);
+            for ax in 0..n {
+                if ax + 1 == n && in_dims.len() > n {
+                    eff_dims.push(in_dims[ax..].iter().product());
+                } else {
+                    eff_dims.push(in_dims.get(ax).copied().unwrap_or(1));
+                }
+            }
             let mut dim_idxs = Vec::with_capacity(n);
             let mut out_dims = Vec::with_capacity(n);
             for (ax, arg) in args.iter().enumerate() {
-                let dlen = m.dim_size(ax);
+                let dlen = eff_dims[ax];
                 let idxs = resolve_indices(arg, dlen)?;
                 out_dims.push(idxs.len());
                 dim_idxs.push(idxs);
             }
-            let in_dims = m.dims();
-            let in_strides = nd_strides(&in_dims);
+            let in_strides = nd_strides(&eff_dims);
             let total: usize = out_dims.iter().product();
             let mut re = Vec::with_capacity(total);
             let mut im = Vec::with_capacity(total);
@@ -5033,9 +6388,7 @@ fn index_matrix(m: &Matrix, args: &[StackItem]) -> Result<Matrix> {
                 let mut src = 0usize;
                 for ax in 0..n {
                     let c = dim_idxs[ax][coord[ax]];
-                    if ax < in_strides.len() {
-                        src += c * in_strides[ax];
-                    }
+                    src += c * in_strides[ax];
                 }
                 let val = m.get_linear_c(src);
                 re.push(val.re);
@@ -5048,9 +6401,10 @@ fn index_matrix(m: &Matrix, args: &[StackItem]) -> Result<Matrix> {
                     coord[ax] = 0;
                 }
             }
-            Matrix::from_nd_complex_col_major(out_dims, re, im).map(Matrix::normalize)
+            Matrix::from_nd_complex_col_major(out_dims, re, im)?.normalize()
         }
-    }
+    };
+    Ok(preserve_dtype(res, orig_dtype))
 }
 
 fn index_cell_contents(cell: &CellArray, args: &[StackItem]) -> Result<Vec<Value>> {
@@ -5163,18 +6517,23 @@ fn assign_matrix_index(m: &mut Matrix, args: &[StackItem], rhs: &Matrix) -> Resu
                         keep[idx] = false;
                     }
                 }
+                let orig_dtype = m.dtype();
                 let vals: Vec<Complex> = (0..m.len())
                     .filter(|&i| keep[i])
                     .map(|i| m.get_linear_c(i))
                     .collect();
-                *m = if m.cols() == 1 && m.rows() > 1 {
-                    Matrix::complex_col_vec(vals).normalize()
-                } else {
-                    Matrix::complex_row_vec(vals).normalize()
-                };
+                *m = preserve_dtype(
+                    if m.cols() == 1 && m.rows() > 1 {
+                        Matrix::complex_col_vec(vals).normalize()
+                    } else {
+                        Matrix::complex_row_vec(vals).normalize()
+                    },
+                    orig_dtype,
+                );
                 return Ok(());
             }
             2 => {
+                let orig_dtype = m.dtype();
                 if matches!(args[0], StackItem::Colon) {
                     let del_cols = resolve_indices(&args[1], m.cols())?;
                     let keep_cols: Vec<usize> = (0..m.cols())
@@ -5186,7 +6545,7 @@ fn assign_matrix_index(m: &mut Matrix, args: &[StackItem], rhs: &Matrix) -> Resu
                             out.set_c(r, nc, m.get_c(r, oc));
                         }
                     }
-                    *m = out.normalize();
+                    *m = preserve_dtype(out.normalize(), orig_dtype);
                     return Ok(());
                 } else if matches!(args[1], StackItem::Colon) {
                     let del_rows = resolve_indices(&args[0], m.rows())?;
@@ -5199,7 +6558,7 @@ fn assign_matrix_index(m: &mut Matrix, args: &[StackItem], rhs: &Matrix) -> Resu
                             out.set_c(nr, c, m.get_c(or, c));
                         }
                     }
-                    *m = out.normalize();
+                    *m = preserve_dtype(out.normalize(), orig_dtype);
                     return Ok(());
                 }
                 return Err(MatroError::index(
@@ -5259,9 +6618,18 @@ fn assign_matrix_index(m: &mut Matrix, args: &[StackItem], rhs: &Matrix) -> Resu
             };
             let needed = idxs.iter().copied().max().map(|i| i + 1).unwrap_or(0);
             if needed > m.len() {
+                let orig_dtype = m.dtype();
+                let was_col = m.cols() == 1 && m.rows() > 1;
                 let mut vals: Vec<Complex> = (0..m.len()).map(|i| m.get_linear_c(i)).collect();
                 vals.resize(needed, Complex::ZERO);
-                *m = Matrix::complex_row_vec(vals);
+                *m = preserve_dtype(
+                    if was_col {
+                        Matrix::complex_col_vec(vals)
+                    } else {
+                        Matrix::complex_row_vec(vals)
+                    },
+                    orig_dtype,
+                );
             }
             if let Some(s) = rhs.as_complex_scalar() {
                 for &i in &idxs {
@@ -5327,13 +6695,14 @@ fn assign_matrix_index(m: &mut Matrix, args: &[StackItem], rhs: &Matrix) -> Resu
                 .cols()
                 .max(cols.iter().copied().max().map(|i| i + 1).unwrap_or(0));
             if new_r != m.rows() || new_c != m.cols() {
+                let orig_dtype = m.dtype();
                 let mut grown = Matrix::zeros(new_r, new_c);
                 for c in 0..m.cols() {
                     for r in 0..m.rows() {
                         grown.set_c(r, c, m.get_c(r, c));
                     }
                 }
-                *m = grown;
+                *m = preserve_dtype(grown, orig_dtype);
             }
             if let Some(s) = rhs.as_complex_scalar() {
                 for &c in &cols {
@@ -5385,19 +6754,30 @@ fn assign_matrix_index(m: &mut Matrix, args: &[StackItem], rhs: &Matrix) -> Resu
                         ));
                     }
                     StackItem::Void => Vec::new(),
-                    StackItem::Val(v) => v
-                        .as_matrix()?
-                        .data()
-                        .iter()
-                        .map(|&x| {
-                            let i = x.round() as isize;
-                            if i < 1 {
-                                Err(MatroError::index(format!("Index {x} must be >= 1")))
-                            } else {
-                                Ok((i - 1) as usize)
-                            }
-                        })
-                        .collect::<Result<Vec<usize>>>()?,
+                    StackItem::Val(v) => {
+                        let idx_m = v.to_dense_matrix()?;
+                        if idx_m.is_logical() {
+                            idx_m
+                                .data()
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, &f)| (f != 0.0).then_some(i))
+                                .collect()
+                        } else {
+                            idx_m
+                                .data()
+                                .iter()
+                                .map(|&x| {
+                                    let i = x.round() as isize;
+                                    if i < 1 {
+                                        Err(MatroError::index(format!("Index {x} must be >= 1")))
+                                    } else {
+                                        Ok((i - 1) as usize)
+                                    }
+                                })
+                                .collect::<Result<Vec<usize>>>()?
+                        }
+                    }
                 };
                 if let Some(&mx) = idxs.iter().max() {
                     new_dims[ax] = new_dims[ax].max(mx + 1);
@@ -5406,6 +6786,7 @@ fn assign_matrix_index(m: &mut Matrix, args: &[StackItem], rhs: &Matrix) -> Resu
             }
             let old_dims = m.dims();
             if new_dims != old_dims {
+                let orig_dtype = m.dtype();
                 let mut grown = Matrix::zeros_nd(new_dims.clone());
                 let new_strides = nd_strides(&new_dims);
                 let mut coord = vec![0usize; old_dims.len()];
@@ -5423,7 +6804,7 @@ fn assign_matrix_index(m: &mut Matrix, args: &[StackItem], rhs: &Matrix) -> Resu
                         coord[ax] = 0;
                     }
                 }
-                *m = grown;
+                *m = preserve_dtype(grown, orig_dtype);
             }
             let strides = nd_strides(&m.dims());
             let target_lens: Vec<usize> = dim_idxs.iter().map(Vec::len).collect();
