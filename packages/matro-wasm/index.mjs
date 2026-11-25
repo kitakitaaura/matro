@@ -111,6 +111,17 @@ export class MatroSession {
     return this._readOutput();
   }
 
+  /** Render all open figures (`figure(1)`, `figure(2)`, ...) as `{ id, active, svg }[]`. */
+  plotsJson(width = 640, height = 360) {
+    if (typeof this.exports.matro_plots_json === "function") {
+      this.exports.matro_plots_json(width, height);
+      const raw = this._readOutput();
+      return raw ? JSON.parse(raw) : [];
+    }
+    const svg = this.plotSvg(width, height);
+    return svg ? [{ id: 1, active: true, svg }] : [];
+  }
+
   /** Clear workspace variables, functions, classes, open files, and plots. */
   reset() {
     this.exports.matro_reset();

@@ -911,3 +911,83 @@ fn wave9_complex_sparse_chained_lvalues_nd_cells_and_benchmarks() {
     )
     .unwrap();
 }
+
+#[test]
+fn wave10_dynamic_fields_multifig_sparse_chol_and_complex_eigs() {
+    let mut vm = Vm::new();
+    vm.eval(
+        r#"
+        % 10A. Dynamic struct field names s.(expr) (read, write, chained, local)
+        s = struct();
+        s.('alpha') = 10;
+        k = 'beta';
+        s.(k) = 25;
+        assert(s.alpha == 10 && s.(k) == 25 && s.beta == 25);
+        s.(string('gamma')) = 42;
+        assert(s.gamma == 42 && s.(string('gamma')) == 42);
+
+        % Chained dynamic field assignment
+        arr(2).(k){1}(2, 3) = 77;
+        assert(arr(2).beta{1}(2, 3) == 77);
+
+        function out = dyn_field_local(fname, val)
+            d.(fname) = val * 2;
+            out = d.(fname);
+        end
+        assert(dyn_field_local('score', 21) == 42);
+
+        % 10B. Exact Sparse Cholesky chol(S)
+        Ap = gallery('poisson', 10); % 100 x 100 SPD sparse
+        R = chol(Ap);
+        assert(issparse(R) && norm(full(R' * R - Ap), 'fro') < 1e-11);
+        L = chol(Ap, 'lower');
+        assert(issparse(L) && norm(full(L * L' - Ap), 'fro') < 1e-11);
+        [R2, flag_ok, P2] = chol(Ap);
+        assert(flag_ok == 0 && issparse(R2) && issparse(P2));
+        [~, flag_bad] = chol(-speye(5));
+        assert(flag_bad == 1);
+
+        % 10C. Complex Sparse eigs (direct <=64 + large 80x80 complex Arnoldi smallestabs/largestabs/shift)
+        N = 80;
+        K = gallery('tridiag', N, -0.5, 2, -0.5);
+        pot = spdiags(((1:N)' / N) * 6.0 + 0.4i * linspace(-1, 1, N)', 0, N, N);
+        H = K + pot;
+        [V1, D1] = eigs(H, 3, 'smallestabs');
+        assert(norm(H * V1 - V1 * D1, 'fro') < 1e-8);
+        [V2, D2] = eigs(H, 3, 'largestabs');
+        assert(norm(H * V2 - V2 * D2, 'fro') < 1e-8);
+        [V3, D3] = eigs(H, 2, 4.0 + 0.1i);
+        assert(norm(H * V3 - V3 * D3, 'fro') < 1e-8);
+
+        % 10D. Complex Sparse svds (60 x 45)
+        ii = [1:45, 1:44, 2:45, 16:60];
+        jj = [1:45, 2:45, 1:44, 1:45];
+        vv = [(1:45) * 0.25 + 0.5i, -0.7*ones(1,44), 0.3i*ones(1,44), 0.4*ones(1,45) - 0.2i];
+        B = sparse(ii, jj, vv, 60, 45);
+        [Us, Ss, Vs] = svds(B, 3);
+        assert(norm(Us' * Us - eye(3), 'fro') < 1e-10);
+        assert(norm(Vs' * Vs - eye(3), 'fro') < 1e-10);
+        assert(norm(B * Vs - Us * Ss, 'fro') < 1e-7);
+
+        % 10E. Multi-figure creation & switching
+        f1 = figure(1);
+        plot([0, 1, 2], [0, 1, 4], 'b');
+        title('Fig One');
+        f2 = figure(2);
+        plot([0, 1, 2], [2, 1, 0], 'r');
+        title('Fig Two');
+        assert(f1 == 1 && f2 == 2);
+        "#,
+    )
+    .unwrap();
+    assert_eq!(vm.figure().figure_count(), 2);
+    let json = vm.figure().all_figures_svg_json(680.0, 340.0);
+    assert!(json.contains("Fig One") && json.contains("Fig Two"));
+    assert!(json.contains("matro-plot-area") && json.contains("data-xmin"));
+
+    // Verify clf clears only current figure and close('all') clears all
+    vm.eval("clf;").unwrap();
+    assert_eq!(vm.figure().figure_count(), 1);
+    vm.eval("close('all');").unwrap();
+    assert_eq!(vm.figure().figure_count(), 0);
+}

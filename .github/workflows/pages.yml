@@ -22,10 +22,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      - name: Build size-optimized matro_wasm.wasm
+      - name: Install Binaryen (wasm-opt)
         run: |
-          cargo build -p matro_wasm --target wasm32-unknown-unknown --profile wasm-release
-          cp target/wasm32-unknown-unknown/wasm-release/matro_wasm.wasm web/matro_wasm.wasm
+          sudo apt-get update
+          sudo apt-get install -y binaryen
+      - name: Build SIMD + size-optimized matro_wasm.wasm
+        run: |
+          RUSTFLAGS="-C target-feature=+simd128" cargo build -p matro_wasm --target wasm32-unknown-unknown --profile wasm-release
+          wasm-opt -Oz --enable-simd --enable-bulk-memory --enable-sign-ext --enable-mutable-globals --enable-nontrapping-float-to-int \
+            target/wasm32-unknown-unknown/wasm-release/matro_wasm.wasm -o web/matro_wasm.wasm
           ls -lh web/matro_wasm.wasm
       - name: Configure Pages
         uses: actions/configure-pages@v5

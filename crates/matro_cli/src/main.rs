@@ -269,7 +269,10 @@ fn run_benchmarks() {
 }
 
 fn run_repl() {
-    println!("Matro 0.1.0 — pure-Rust MATLAB/Octave VM (type 'exit' to leave, 'whos' for vars)");
+    println!(
+        "Matro {} — pure-Rust MATLAB/Octave VM (type 'exit' to leave, 'whos' for vars)",
+        env!("CARGO_PKG_VERSION")
+    );
     let mut vm = new_cli_vm();
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();

@@ -240,6 +240,15 @@ pub extern "C" fn matro_plot_svg(width: f64, height: f64) {
     });
 }
 
+/// Render all non-empty plot figures as a JSON array `[{"id":1,"active":true,"svg":"..."}]`.
+#[unsafe(no_mangle)]
+pub extern "C" fn matro_plots_json(width: f64, height: f64) {
+    SESSION.with(|vm| {
+        let json = vm.borrow().figure().all_figures_svg_json(width, height);
+        set_output(&json);
+    });
+}
+
 /// Pointer to the UTF-8 output buffer from the last call.
 #[unsafe(no_mangle)]
 pub extern "C" fn matro_output_ptr() -> *const u8 {

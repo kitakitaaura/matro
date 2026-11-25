@@ -92,6 +92,7 @@ pub enum OpCode {
     StoreCellIndexLocal { slot: u16, argc: u8 },
 
     GetField(u32),
+    GetDynamicField,
     StoreField { name_idx: u32, path_idx: u32 },
     StoreFieldLocal { slot: u16, path_idx: u32 },
     StoreIndexedField { name_idx: u32, argc: u8, path_idx: u32 },
@@ -166,6 +167,7 @@ pub struct ClassProto {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChainStep {
     Field(u32),
+    DynamicField,
     Paren(u8),
     Brace(u8),
 }

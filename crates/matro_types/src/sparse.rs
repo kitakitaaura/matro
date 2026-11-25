@@ -1105,6 +1105,103 @@ impl SparseMatrix {
         Some(x)
     }
 
+    /// Exact left-looking sparse Cholesky factorization `A = L * L^T` for symmetric positive definite
+    /// real sparse matrices, returning lower-triangular sparse `L` (or `Err(p)` with 1-based column `p`
+    /// where a non-positive pivot was encountered).
+    pub fn chol_sparse(&self) -> std::result::Result<Self, usize> {
+        let n = self.rows;
+        if n != self.cols {
+            return Err(1);
+        }
+        if n == 0 {
+            return Ok(Self::zeros(0, 0));
+        }
+        let mut l_cols: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        let mut l_rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        let mut x = vec![0.0; n];
+        let mut mark = vec![0usize; n];
+        let mut touched: Vec<usize> = Vec::new();
+        let mut cur_mark = 0usize;
+
+        for j in 0..n {
+            cur_mark += 1;
+            touched.clear();
+
+            // Scatter lower triangle of A[:, j]
+            for idx in self.col_ptr[j]..self.col_ptr[j + 1] {
+                let r = self.row_idx[idx];
+                if r >= j {
+                    x[r] += self.values[idx];
+                    if mark[r] != cur_mark {
+                        mark[r] = cur_mark;
+                        touched.push(r);
+                    }
+                }
+            }
+
+            // Subtract contributions from all earlier columns k < j where L[j, k] != 0
+            for &(k, l_jk) in &l_rows[j] {
+                let col_k = &l_cols[k];
+                // Binary search for first entry in col_k with row >= j
+                let start = col_k.partition_point(|&(r, _)| r < j);
+                for &(r, l_rk) in &col_k[start..] {
+                    x[r] -= l_rk * l_jk;
+                    if mark[r] != cur_mark {
+                        mark[r] = cur_mark;
+                        touched.push(r);
+                    }
+                }
+            }
+
+            let diag = x[j];
+            if !diag.is_finite() || diag <= 0.0 {
+                for &r in &touched {
+                    x[r] = 0.0;
+                }
+                return Err(j + 1);
+            }
+            let ljj = diag.sqrt();
+            let inv_ljj = 1.0 / ljj;
+            x[j] = 0.0;
+
+            l_cols[j].push((j, ljj));
+            for &r in &touched {
+                if r == j {
+                    continue;
+                }
+                let v = x[r] * inv_ljj;
+                x[r] = 0.0;
+                if v != 0.0 {
+                    l_cols[j].push((r, v));
+                }
+            }
+            l_cols[j].sort_unstable_by_key(|&(r, _)| r);
+            for &(r, v) in l_cols[j].iter().skip(1) {
+                l_rows[r].push((j, v));
+            }
+        }
+
+        let mut col_ptr = Vec::with_capacity(n + 1);
+        let mut row_idx = Vec::new();
+        let mut values = Vec::new();
+        col_ptr.push(0);
+        for col in l_cols {
+            for (r, v) in col {
+                row_idx.push(r);
+                values.push(v);
+            }
+            col_ptr.push(row_idx.len());
+        }
+        Ok(Self {
+            rows: n,
+            cols: n,
+            col_ptr,
+            row_idx,
+            values,
+            imag: None,
+        })
+    }
+
     /// Zero-fill Incomplete Cholesky `IC(0)` factorization returning lower-triangular sparse `L`
     /// with the same lower-triangular sparsity pattern as `self` (`diagcomp >= 0` shifts diagonal by `diagcomp * diag(A)`).
     pub fn ichol0(&self, diagcomp: f64) -> Result<Self> {

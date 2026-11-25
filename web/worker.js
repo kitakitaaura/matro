@@ -1,7 +1,7 @@
-import { MatroRuntime } from "./matro.js";
+import { MatroRuntime } from "./matro.js?v=0.2.0";
 
 let rt = null;
-const ready = MatroRuntime.load("./matro_wasm.wasm").then((runtime) => {
+const ready = MatroRuntime.load("./matro_wasm.wasm?v=0.2.0").then((runtime) => {
   rt = runtime;
   self.postMessage({ type: "ready" });
 }).catch((err) => {
@@ -31,6 +31,7 @@ self.onmessage = async (e) => {
         vars: rt.vars(),
         files: rt.files(),
         svg: rt.plotSvg(680, 340),
+        figures: rt.plotsJson(680, 340),
       });
     } else if (msg.type === "repl") {
       const res = rt.eval(msg.code);
@@ -42,19 +43,20 @@ self.onmessage = async (e) => {
         vars: rt.vars(),
         files: rt.files(),
         svg: rt.plotSvg(680, 340),
+        figures: rt.plotsJson(680, 340),
       });
     } else if (msg.type === "mount_file") {
       rt.mountFile(msg.path, msg.content);
-      self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: rt.plotSvg(680, 340) });
+      self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: rt.plotSvg(680, 340), figures: rt.plotsJson(680, 340) });
     } else if (msg.type === "mount_bytes") {
       rt.mountBytes(msg.path, new Uint8Array(msg.bytes));
-      self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: rt.plotSvg(680, 340) });
+      self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: rt.plotSvg(680, 340), figures: rt.plotsJson(680, 340) });
     } else if (msg.type === "clear_files") {
       rt.clearFiles();
-      self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: rt.plotSvg(680, 340) });
+      self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: rt.plotSvg(680, 340), figures: rt.plotsJson(680, 340) });
     } else if (msg.type === "reset") {
       rt.reset();
-      self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: "" });
+      self.postMessage({ id, type: "state", vars: rt.vars(), files: rt.files(), svg: "", figures: [] });
     }
   } catch (err) {
     self.postMessage({ id, type: "result", ok: false, output: String(err), dt: 0, disasm: "", vars: [], files: [], svg: "" });

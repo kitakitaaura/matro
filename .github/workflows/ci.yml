@@ -16,9 +16,9 @@ jobs:
           targets: wasm32-unknown-unknown,wasm32-wasip1
       - name: Run Rust workspace tests
         run: cargo test --workspace
-      - name: Build browser Wasm (wasm32-unknown-unknown, wasm-release)
+      - name: Build browser Wasm (wasm32-unknown-unknown +simd128, wasm-release)
         run: |
-          cargo build -p matro_wasm --target wasm32-unknown-unknown --profile wasm-release
+          RUSTFLAGS="-C target-feature=+simd128" cargo build -p matro_wasm --target wasm32-unknown-unknown --profile wasm-release
           cp target/wasm32-unknown-unknown/wasm-release/matro_wasm.wasm packages/matro-wasm/
       - name: Build portable WASI CLI (wasm32-wasip1, wasm-release)
         run: cargo build -p matro_cli --target wasm32-wasip1 --profile wasm-release
@@ -27,8 +27,9 @@ jobs:
           node -e "
             import('./packages/matro-wasm/index.mjs').then(async ({ loadMatro }) => {
               const m = await loadMatro();
-              const r = m.eval('A = [3 1; 1 2]; x = A \\\\ [9; 8]; fprintf(\"%.0f,%.0f\", x(1), x(2));');
-              if (!r.ok || r.output !== '2,3') { console.error(r); process.exit(1); }
-              console.log('Node @matro/wasm smoke test passed:', r.output);
+              const r = m.eval('A = [3 1; 1 2]; x = A \\\\ [9; 8]; figure(1); plot(1:4, (1:4).^2); fprintf(\"%.0f,%.0f\", x(1), x(2));');
+              const figs = m.plotsJson(640, 320);
+              if (!r.ok || r.output !== '2,3' || figs.length !== 1) { console.error(r, figs); process.exit(1); }
+              console.log('Node @matro/wasm SIMD smoke test passed:', r.output, 'figs:', figs.length);
             });
           "

@@ -37,6 +37,12 @@ export interface PlotFigureJson {
   panels: PlotPanelJson[];
 }
 
+export interface RenderedFigure {
+  id: number;
+  active: boolean;
+  svg: string;
+}
+
 export class MatroSession {
   eval(code: string): EvalResult;
   evalFile(path: string, code: string): EvalResult;
@@ -49,6 +55,7 @@ export class MatroSession {
   vars(): WorkspaceVar[];
   plotJson(): PlotFigureJson | null;
   plotSvg(width?: number, height?: number): string;
+  plotsJson(width?: number, height?: number): RenderedFigure[];
   reset(): void;
 }
 

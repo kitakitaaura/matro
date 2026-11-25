@@ -2049,114 +2049,34 @@ impl Vm {
                 let field = chunk.names[field_idx as usize].clone();
                 let obj = pop_val(stack)?;
                 let cur_fn = frame.as_deref().map(|f| f.func_name);
-                let val = match obj {
-                    Value::Struct(map) => map.get(&field).cloned(),
-                    Value::Object(ref inst) if inst.class_name == "__class_ref" => {
-                        let cname = inst
-                            .fields
-                            .get("__name")
-                            .and_then(|v| v.as_str().ok())
-                            .unwrap_or("")
-                            .to_string();
-                        self.resolve_class_ref_field(&cname, &field, stdout)?
-                    }
-                    Value::Object(ref inst) if inst.class_name == "__pkg_ref" => {
-                        let pkg_path = inst
-                            .fields
-                            .get("__path")
-                            .and_then(|v| v.as_str().ok())
-                            .unwrap_or("")
-                            .to_string();
-                        self.resolve_pkg_field(&pkg_path, &field, stdout)?
-                    }
-                    Value::Object(inst) => {
-                        let getter = format!("get.{field}");
-                        if cur_fn != Some(getter.as_str()) {
-                            if let Some(proto) = self.find_class_method(&inst.class_name, &getter) {
-                                let rets = self.call_user_func(
-                                    &proto,
-                                    &[Value::Object(inst)],
-                                    1,
-                                    None,
-                                    stdout,
-                                )?;
-                                Some(rets.into_iter().next().unwrap_or_else(Value::empty))
-                            } else {
-                                inst.fields.get(&field).cloned()
-                            }
+                let val = self.exec_get_field_by_name(obj, field, cur_fn, stdout)?;
+                stack.push(StackItem::Val(val));
+            }
+            OpCode::GetDynamicField => {
+                let field_val = pop_val(stack)?;
+                let field = match &field_val {
+                    Value::String(s) => s.clone(),
+                    Value::Object(o) if o.class_name == "string" => {
+                        if let Some(Value::Cell(c)) = o.fields.get("Data") {
+                            c.data
+                                .first()
+                                .and_then(|v| v.as_str().ok())
+                                .unwrap_or("")
+                                .to_string()
                         } else {
-                            inst.fields.get(&field).cloned()
+                            return Err(MatroError::runtime("Dynamic field name must be a string"));
                         }
                     }
-                    Value::Handle(h) => {
-                        let getter = format!("get.{field}");
-                        if cur_fn != Some(getter.as_str()) {
-                            if let Some(proto) = self.find_class_method(&h.class_name, &getter) {
-                                let rets = self.call_user_func(
-                                    &proto,
-                                    &[Value::Handle(h)],
-                                    1,
-                                    None,
-                                    stdout,
-                                )?;
-                                Some(rets.into_iter().next().unwrap_or_else(Value::empty))
-                            } else {
-                                self.handles
-                                    .get(h.id)
-                                    .and_then(|inst| inst.fields.get(&field).cloned())
-                            }
-                        } else {
-                            self.handles
-                                .get(h.id)
-                                .and_then(|inst| inst.fields.get(&field).cloned())
-                        }
-                    }
-                    Value::StructArray(sa) => {
-                        let items: Vec<Value> = sa
-                            .items
-                            .iter()
-                            .map(|m| m.get(&field).cloned().unwrap_or_else(Value::empty))
-                            .collect();
-                        if items.iter().all(|v| v.as_scalar().is_ok()) {
-                            let nums: Vec<f64> =
-                                items.iter().map(|v| v.as_scalar().unwrap()).collect();
-                            Some(Value::matrix(Matrix::row_vec(nums)))
-                        } else {
-                            Some(Value::Cell(CellArray::from_rows(vec![items])?))
-                        }
-                    }
-                    Value::Table(t) => {
-                        if field == "Properties" {
-                            let mut props = BTreeMap::new();
-                            let vnames: Vec<Value> = t
-                                .col_names
-                                .iter()
-                                .cloned()
-                                .map(Value::String)
-                                .collect();
-                            let cell = if vnames.is_empty() {
-                                CellArray::empty()
-                            } else {
-                                CellArray::from_rows(vec![vnames])?
-                            };
-                            props.insert("VariableNames".to_string(), Value::Cell(cell));
-                            Some(Value::Struct(props))
-                        } else {
-                            t.get_col(&field).cloned()
-                        }
-                    }
-                    Value::Map(m) => match field.as_str() {
-                        "Count" => Some(Value::scalar(m.entries.len() as f64)),
-                        _ => None,
-                    },
                     other => {
                         return Err(MatroError::runtime(format!(
-                            "Dot indexing requires a struct or object, got {}",
+                            "Dynamic field name must be a character vector or string, got {}",
                             other.type_name()
                         )));
                     }
-                }
-                .ok_or_else(|| MatroError::runtime(format!("No field or property '{field}'")))?;
+                };
+                let obj = pop_val(stack)?;
+                let cur_fn = frame.as_deref().map(|f| f.func_name);
+                let val = self.exec_get_field_by_name(obj, field, cur_fn, stdout)?;
                 stack.push(StackItem::Val(val));
             }
             OpCode::StoreField { name_idx, path_idx } => {
@@ -5051,6 +4971,123 @@ impl Vm {
     }
 
     #[inline(never)]
+    fn exec_get_field_by_name(
+        &mut self,
+        obj: Value,
+        field: String,
+        cur_fn: Option<&str>,
+        stdout: &mut String,
+    ) -> Result<Value> {
+        match obj {
+            Value::Struct(map) => map.get(&field).cloned(),
+            Value::Object(ref inst) if inst.class_name == "__class_ref" => {
+                let cname = inst
+                    .fields
+                    .get("__name")
+                    .and_then(|v| v.as_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                self.resolve_class_ref_field(&cname, &field, stdout)?
+            }
+            Value::Object(ref inst) if inst.class_name == "__pkg_ref" => {
+                let pkg_path = inst
+                    .fields
+                    .get("__path")
+                    .and_then(|v| v.as_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                self.resolve_pkg_field(&pkg_path, &field, stdout)?
+            }
+            Value::Object(inst) => {
+                let getter = format!("get.{field}");
+                if cur_fn != Some(getter.as_str()) {
+                    if let Some(proto) = self.find_class_method(&inst.class_name, &getter) {
+                        let rets = self.call_user_func(
+                            &proto,
+                            &[Value::Object(inst)],
+                            1,
+                            None,
+                            stdout,
+                        )?;
+                        Some(rets.into_iter().next().unwrap_or_else(Value::empty))
+                    } else {
+                        inst.fields.get(&field).cloned()
+                    }
+                } else {
+                    inst.fields.get(&field).cloned()
+                }
+            }
+            Value::Handle(h) => {
+                let getter = format!("get.{field}");
+                if cur_fn != Some(getter.as_str()) {
+                    if let Some(proto) = self.find_class_method(&h.class_name, &getter) {
+                        let rets = self.call_user_func(
+                            &proto,
+                            &[Value::Handle(h)],
+                            1,
+                            None,
+                            stdout,
+                        )?;
+                        Some(rets.into_iter().next().unwrap_or_else(Value::empty))
+                    } else {
+                        self.handles
+                            .get(h.id)
+                            .and_then(|inst| inst.fields.get(&field).cloned())
+                    }
+                } else {
+                    self.handles
+                        .get(h.id)
+                        .and_then(|inst| inst.fields.get(&field).cloned())
+                }
+            }
+            Value::StructArray(sa) => {
+                let items: Vec<Value> = sa
+                    .items
+                    .iter()
+                    .map(|m| m.get(&field).cloned().unwrap_or_else(Value::empty))
+                    .collect();
+                if items.iter().all(|v| v.as_scalar().is_ok()) {
+                    let nums: Vec<f64> = items.iter().map(|v| v.as_scalar().unwrap()).collect();
+                    Some(Value::matrix(Matrix::row_vec(nums)))
+                } else {
+                    Some(Value::Cell(CellArray::from_rows(vec![items])?))
+                }
+            }
+            Value::Table(t) => {
+                if field == "Properties" {
+                    let mut props = BTreeMap::new();
+                    let vnames: Vec<Value> = t
+                        .col_names
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect();
+                    let cell = if vnames.is_empty() {
+                        CellArray::empty()
+                    } else {
+                        CellArray::from_rows(vec![vnames])?
+                    };
+                    props.insert("VariableNames".to_string(), Value::Cell(cell));
+                    Some(Value::Struct(props))
+                } else {
+                    t.get_col(&field).cloned()
+                }
+            }
+            Value::Map(m) => match field.as_str() {
+                "Count" => Some(Value::scalar(m.entries.len() as f64)),
+                _ => None,
+            },
+            other => {
+                return Err(MatroError::runtime(format!(
+                    "Dot indexing requires a struct or object, got {}",
+                    other.type_name()
+                )));
+            }
+        }
+        .ok_or_else(|| MatroError::runtime(format!("No field or property '{field}'")))
+    }
+
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn exec_store_chain(
         &mut self,
@@ -5068,6 +5105,9 @@ impl Vm {
         for (i, step) in spec.iter().enumerate().rev() {
             match *step {
                 ChainStep::Field(_) => {}
+                ChainStep::DynamicField => {
+                    step_args[i] = pop_items(stack, 1)?;
+                }
                 ChainStep::Paren(argc) | ChainStep::Brace(argc) => {
                     step_args[i] = pop_items(stack, argc as usize)?;
                 }
@@ -7191,82 +7231,116 @@ fn assign_chain_step(
         *cur = rhs;
         return Ok(());
     }
+    let resolve_field_name = |step: &ChainStep, args: &[StackItem]| -> Result<Option<String>> {
+        match *step {
+            ChainStep::Field(f_idx) => Ok(Some(names[f_idx as usize].clone())),
+            ChainStep::DynamicField => {
+                let v = args
+                    .first()
+                    .ok_or_else(|| MatroError::runtime("Missing dynamic field name"))?
+                    .clone()
+                    .into_val()?;
+                match v {
+                    Value::String(s) => Ok(Some(s)),
+                    Value::Object(o) if o.class_name == "string" => {
+                        if let Some(Value::Cell(c)) = o.fields.get("Data") {
+                            Ok(Some(
+                                c.data
+                                    .first()
+                                    .and_then(|x| x.as_str().ok())
+                                    .unwrap_or("")
+                                    .to_string(),
+                            ))
+                        } else {
+                            Err(MatroError::runtime("Dynamic field name must be a string"))
+                        }
+                    }
+                    other => Err(MatroError::runtime(format!(
+                        "Dynamic field name must be a character vector or string, got {}",
+                        other.type_name()
+                    ))),
+                }
+            }
+            _ => Ok(None),
+        }
+    };
+
     // Handle object reference mutation via VM heap
     if let Value::Handle(h) = cur {
-        if let ChainStep::Field(f_idx) = steps[0] {
-            let fname = &names[f_idx as usize];
+        if let Some(fname) = resolve_field_name(&steps[0], &step_args[0])? {
             let hid = h.id;
             if steps.len() == 1 {
                 let inst = handles
                     .get_mut(hid)
                     .ok_or_else(|| MatroError::runtime("Invalid object handle"))?;
-                inst.fields.insert(fname.clone(), rhs);
+                inst.fields.insert(fname, rhs);
                 return Ok(());
             } else {
                 let mut child = handles
                     .get_mut(hid)
                     .ok_or_else(|| MatroError::runtime("Invalid object handle"))?
                     .fields
-                    .remove(fname)
+                    .remove(&fname)
                     .unwrap_or_else(Value::empty);
                 assign_chain_step(&mut child, &steps[1..], &step_args[1..], names, rhs, handles)?;
                 if let Some(inst) = handles.get_mut(hid) {
-                    inst.fields.insert(fname.clone(), child);
+                    inst.fields.insert(fname, child);
                 }
                 return Ok(());
             }
         }
     }
 
-    match steps[0] {
-        ChainStep::Field(f_idx) => {
-            let fname = &names[f_idx as usize];
-            if steps.len() == 1 {
-                match cur {
-                    Value::Struct(map) => {
-                        map.insert(fname.clone(), rhs);
-                    }
-                    Value::Object(o) => {
-                        o.fields.insert(fname.clone(), rhs);
-                    }
-                    Value::StructArray(sa) if sa.items.len() == 1 => {
-                        sa.items[0].insert(fname.clone(), rhs);
-                    }
-                    _ => {
-                        let mut map = BTreeMap::new();
-                        map.insert(fname.clone(), rhs);
-                        *cur = Value::Struct(map);
-                    }
+    if let Some(fname) = resolve_field_name(&steps[0], &step_args[0])? {
+        if steps.len() == 1 {
+            match cur {
+                Value::Struct(map) => {
+                    map.insert(fname, rhs);
                 }
-                Ok(())
-            } else {
-                match cur {
-                    Value::Struct(map) => {
-                        let mut child = map.remove(fname).unwrap_or_else(Value::empty);
-                        assign_chain_step(&mut child, &steps[1..], &step_args[1..], names, rhs, handles)?;
-                        map.insert(fname.clone(), child);
-                    }
-                    Value::Object(o) => {
-                        let mut child = o.fields.remove(fname).unwrap_or_else(Value::empty);
-                        assign_chain_step(&mut child, &steps[1..], &step_args[1..], names, rhs, handles)?;
-                        o.fields.insert(fname.clone(), child);
-                    }
-                    Value::StructArray(sa) if sa.items.len() == 1 => {
-                        let mut child = sa.items[0].remove(fname).unwrap_or_else(Value::empty);
-                        assign_chain_step(&mut child, &steps[1..], &step_args[1..], names, rhs, handles)?;
-                        sa.items[0].insert(fname.clone(), child);
-                    }
-                    _ => {
-                        let mut child = Value::empty();
-                        assign_chain_step(&mut child, &steps[1..], &step_args[1..], names, rhs, handles)?;
-                        let mut map = BTreeMap::new();
-                        map.insert(fname.clone(), child);
-                        *cur = Value::Struct(map);
-                    }
+                Value::Object(o) => {
+                    o.fields.insert(fname, rhs);
                 }
-                Ok(())
+                Value::StructArray(sa) if sa.items.len() == 1 => {
+                    sa.items[0].insert(fname, rhs);
+                }
+                _ => {
+                    let mut map = BTreeMap::new();
+                    map.insert(fname, rhs);
+                    *cur = Value::Struct(map);
+                }
             }
+            return Ok(());
+        } else {
+            match cur {
+                Value::Struct(map) => {
+                    let mut child = map.remove(&fname).unwrap_or_else(Value::empty);
+                    assign_chain_step(&mut child, &steps[1..], &step_args[1..], names, rhs, handles)?;
+                    map.insert(fname, child);
+                }
+                Value::Object(o) => {
+                    let mut child = o.fields.remove(&fname).unwrap_or_else(Value::empty);
+                    assign_chain_step(&mut child, &steps[1..], &step_args[1..], names, rhs, handles)?;
+                    o.fields.insert(fname, child);
+                }
+                Value::StructArray(sa) if sa.items.len() == 1 => {
+                    let mut child = sa.items[0].remove(&fname).unwrap_or_else(Value::empty);
+                    assign_chain_step(&mut child, &steps[1..], &step_args[1..], names, rhs, handles)?;
+                    sa.items[0].insert(fname, child);
+                }
+                _ => {
+                    let mut child = Value::empty();
+                    assign_chain_step(&mut child, &steps[1..], &step_args[1..], names, rhs, handles)?;
+                    let mut map = BTreeMap::new();
+                    map.insert(fname, child);
+                    *cur = Value::Struct(map);
+                }
+            }
+            return Ok(());
         }
+    }
+
+    match steps[0] {
+        ChainStep::Field(_) | ChainStep::DynamicField => unreachable!(),
         ChainStep::Paren(_) => {
             let args = &step_args[0];
             if steps.len() == 1 {

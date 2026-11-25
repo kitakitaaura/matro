@@ -777,8 +777,38 @@ pub fn call_intrinsic(
         "zlabel" => fn_plot_label("zlabel", args, |s| ctx.figure.panel_mut().zlabel = s),
         "grid" => fn_plot_toggle("grid", args, &mut ctx.figure.panel_mut().grid),
         "hold" => fn_plot_toggle("hold", args, &mut ctx.figure.panel_mut().hold),
-        "clf" | "figure" => {
-            ctx.figure.clear();
+        "clf" => {
+            ctx.figure.clear_current();
+            Ok(vec![])
+        }
+        "figure" => {
+            let target = args
+                .first()
+                .and_then(|v| v.as_scalar().ok())
+                .map(|s| s.max(1.0).round() as usize);
+            let id = ctx.figure.switch_figure(target);
+            if nargout >= 1 {
+                ok1(Value::scalar(id as f64))
+            } else {
+                Ok(vec![])
+            }
+        }
+        "close" => {
+            if let Some(a0) = args.first() {
+                if let Ok(s) = a0.as_str() {
+                    if s.eq_ignore_ascii_case("all") {
+                        ctx.figure.close_figure(true, None);
+                    } else {
+                        ctx.figure.close_figure(false, None);
+                    }
+                } else if let Ok(n) = a0.as_scalar() {
+                    ctx.figure.close_figure(false, Some(n.max(1.0).round() as usize));
+                } else {
+                    ctx.figure.close_figure(false, None);
+                }
+            } else {
+                ctx.figure.close_figure(false, None);
+            }
             Ok(vec![])
         }
 
@@ -975,7 +1005,7 @@ pub fn is_intrinsic(name: &str) -> bool {
             | "audiowrite" | "plot" | "plot3" | "scatter" | "bar" | "stem" | "errorbar" | "fill" | "patch" | "hist" | "histogram"
             | "contour" | "surf" | "mesh" | "quiver" | "imagesc" | "figure" | "subplot"
             | "hold" | "grid" | "title" | "xlabel" | "ylabel" | "zlabel" | "legend" | "xlim"
-            | "ylim" | "zlim" | "colorbar" | "colormap" | "axis" | "clf" | "gca" | "gcf"
+            | "ylim" | "zlim" | "colorbar" | "colormap" | "axis" | "clf" | "close" | "gca" | "gcf"
             | "parula" | "viridis" | "jet" | "turbo" | "gray" | "hot" | "cool" | "bone"
             | "get" | "set" | "dir" | "pwd" | "cd" | "mkdir" | "rmdir" | "delete" | "copyfile"
             | "movefile" | "isfile" | "isfolder" | "fullfile" | "fileparts" | "plus" | "minus"
@@ -2875,17 +2905,57 @@ fn fn_chol(args: &[Value], nargout: usize) -> Result<Vec<Value>> {
     if args.is_empty() || args.len() > 3 {
         return Err(MatroError::arity("chol", "1 to 3 (A [, 'upper'|'lower'])", args.len()));
     }
-    let a = args[0].to_dense_matrix()?;
     let mut lower = false;
+    let mut vec_perm = false;
     for arg in &args[1..] {
         if let Some(s) = value_as_text(arg) {
             match s.trim().to_ascii_lowercase().as_str() {
                 "lower" => lower = true,
                 "upper" => lower = false,
+                "vector" => vec_perm = true,
                 _ => {}
             }
         }
     }
+    if let Value::Sparse(sp) = &args[0] {
+        if !sp.is_complex() && sp.rows() == sp.cols() {
+            match sp.chol_sparse() {
+                Ok(l) => {
+                    let factor = if lower { l } else { l.transpose() };
+                    if nargout >= 3 {
+                        let n = sp.rows();
+                        let p_val = if vec_perm {
+                            Value::matrix(Matrix::row_vec((1..=n).map(|i| i as f64).collect()))
+                        } else {
+                            Value::sparse(SparseMatrix::eye(n))
+                        };
+                        return Ok(vec![Value::sparse(factor), Value::scalar(0.0), p_val]);
+                    } else if nargout == 2 {
+                        return Ok(vec![Value::sparse(factor), Value::scalar(0.0)]);
+                    } else {
+                        return ok1(Value::sparse(factor));
+                    }
+                }
+                Err(flag) => {
+                    if nargout >= 2 {
+                        let empty = Value::sparse(SparseMatrix::zeros(0, 0));
+                        if nargout >= 3 {
+                            let n = sp.rows();
+                            let p_val = if vec_perm {
+                                Value::matrix(Matrix::row_vec((1..=n).map(|i| i as f64).collect()))
+                            } else {
+                                Value::sparse(SparseMatrix::eye(n))
+                            };
+                            return Ok(vec![empty, Value::scalar(flag as f64), p_val]);
+                        }
+                        return Ok(vec![empty, Value::scalar(flag as f64)]);
+                    }
+                    return Err(MatroError::runtime("Matrix is not positive definite for chol()"));
+                }
+            }
+        }
+    }
+    let a = args[0].to_dense_matrix()?;
     let (factor, flag) = a.chol_with_flag(lower)?;
     if nargout >= 2 {
         Ok(vec![Value::matrix(factor), Value::scalar(flag as f64)])

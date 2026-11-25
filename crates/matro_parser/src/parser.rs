@@ -936,7 +936,9 @@ impl Parser {
                         None => Self::unwrap_lvalue_chain(orig, span)?,
                     }
                 }
-                ExprKind::DynamicCall { .. } => Self::unwrap_lvalue_chain(expr, span)?,
+                ExprKind::DynamicCall { .. } | ExprKind::DynamicFieldAccess { .. } => {
+                    Self::unwrap_lvalue_chain(expr, span)?
+                }
                 _ => {
                     return Err(MatroError::syntax(span, "Invalid assignment target"));
                 }
@@ -965,6 +967,10 @@ impl Parser {
                 }
                 ExprKind::FieldAccess { object, field } => {
                     steps.push(LValueStep::Field(field));
+                    expr = *object;
+                }
+                ExprKind::DynamicFieldAccess { object, field_expr } => {
+                    steps.push(LValueStep::DynamicField(*field_expr));
                     expr = *object;
                 }
                 ExprKind::MethodCall {
@@ -1341,6 +1347,19 @@ impl Parser {
                 }
                 TokenKind::Dot => {
                     let span = self.bump().span;
+                    if *self.peek_kind() == TokenKind::LParen {
+                        self.bump();
+                        let field_expr = self.parse_expr()?;
+                        self.expect(TokenKind::RParen, "')'")?;
+                        expr = Expr {
+                            kind: ExprKind::DynamicFieldAccess {
+                                object: Box::new(expr),
+                                field_expr: Box::new(field_expr),
+                            },
+                            span,
+                        };
+                        continue;
+                    }
                     let tok = self.bump();
                     let field = match tok.kind {
                         TokenKind::Ident(f) => f,

@@ -103,6 +103,7 @@ pub struct MethodDef {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LValueStep {
     Field(String),
+    DynamicField(Expr),
     Paren(Vec<IndexArg>),
     Brace(Vec<IndexArg>),
 }
@@ -188,6 +189,11 @@ pub enum ExprKind {
     FieldAccess {
         object: Box<Expr>,
         field: String,
+    },
+    /// Dynamic struct/object field access `s.(expr)`.
+    DynamicFieldAccess {
+        object: Box<Expr>,
+        field_expr: Box<Expr>,
     },
     /// Dot-method or field-closure call `obj.method(args...)`.
     MethodCall {

@@ -398,6 +398,9 @@ impl Compiler {
                                 | "axis"
                                 | "colorbar"
                                 | "colormap"
+                                | "figure"
+                                | "clf"
+                                | "close"
                                 | "format"
                                 | "clc"
                                 | "pause"
@@ -708,6 +711,10 @@ impl Compiler {
                             LValueStep::Field(f) => {
                                 let f_idx = self.chunk.add_name(f);
                                 compiled_steps.push(ChainStep::Field(f_idx));
+                            }
+                            LValueStep::DynamicField(fe) => {
+                                self.compile_expr(fe, 1, false)?;
+                                compiled_steps.push(ChainStep::DynamicField);
                             }
                             LValueStep::Paren(indices) => {
                                 for arg in indices {
@@ -1525,6 +1532,11 @@ impl Compiler {
                 let f_idx = self.chunk.add_name(field);
                 self.chunk.emit(OpCode::GetField(f_idx), line);
             }
+            ExprKind::DynamicFieldAccess { object, field_expr } => {
+                self.compile_expr(object, 1, in_index)?;
+                self.compile_expr(field_expr, 1, in_index)?;
+                self.chunk.emit(OpCode::GetDynamicField, line);
+            }
         }
         Ok(())
     }
@@ -1543,6 +1555,9 @@ fn expr_has_end(expr: &Expr) -> bool {
         | ExprKind::CTranspose(inner)
         | ExprKind::Transpose(inner)
         | ExprKind::FieldAccess { object: inner, .. } => expr_has_end(inner),
+        ExprKind::DynamicFieldAccess { object, field_expr } => {
+            expr_has_end(object) || expr_has_end(field_expr)
+        }
         ExprKind::Binary { left, right, .. } => expr_has_end(left) || expr_has_end(right),
         ExprKind::Range { start, step, stop } => {
             expr_has_end(start)

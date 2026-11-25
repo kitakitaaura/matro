@@ -336,13 +336,24 @@ impl PlotPanel {
     }
 }
 
-/// Multi-panel figure supporting `subplot(rows, cols, idx)` as well as single-panel plots.
+/// Saved snapshot of another figure window when multiple figures (`figure(1)`, `figure(2)`) exist.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedFigure {
+    pub grid_rows: usize,
+    pub grid_cols: usize,
+    pub active: usize,
+    pub panels: Vec<PlotPanel>,
+}
+
+/// Multi-panel, multi-figure container supporting `figure(n)`, `subplot(rows, cols, idx)`, `clf`, and `close`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlotFigure {
     pub grid_rows: usize,
     pub grid_cols: usize,
     pub active: usize,
     pub panels: Vec<PlotPanel>,
+    pub active_figure_id: usize,
+    pub other_figures: std::collections::BTreeMap<usize, SavedFigure>,
 }
 
 const PALETTE: &[&str] = &[
@@ -361,13 +372,133 @@ impl Default for PlotFigure {
             grid_cols: 1,
             active: 0,
             panels: vec![PlotPanel::default()],
+            active_figure_id: 1,
+            other_figures: std::collections::BTreeMap::new(),
         }
     }
 }
 
 impl PlotFigure {
+    /// Reset all figures completely (used on VM reset).
     pub fn clear(&mut self) {
         *self = Self::default();
+    }
+
+    /// Clear only the active figure (`clf`), preserving other figures.
+    pub fn clear_current(&mut self) {
+        self.grid_rows = 1;
+        self.grid_cols = 1;
+        self.active = 0;
+        self.panels = vec![PlotPanel::default()];
+    }
+
+    /// Switch to figure `id` (`figure(n)`) or create a new figure (`figure`). Returns the active figure id.
+    pub fn switch_figure(&mut self, target_id: Option<usize>) -> usize {
+        let next_id = match target_id {
+            Some(n) if n >= 1 => n,
+            _ => {
+                if self.is_empty() && self.other_figures.is_empty() {
+                    return self.active_figure_id;
+                }
+                let max_other = self.other_figures.keys().copied().max().unwrap_or(0);
+                max_other.max(self.active_figure_id) + 1
+            }
+        };
+        if next_id == self.active_figure_id {
+            return next_id;
+        }
+        // Save current active figure
+        let cur = SavedFigure {
+            grid_rows: self.grid_rows,
+            grid_cols: self.grid_cols,
+            active: self.active,
+            panels: std::mem::replace(&mut self.panels, vec![PlotPanel::default()]),
+        };
+        self.other_figures.insert(self.active_figure_id, cur);
+
+        if let Some(saved) = self.other_figures.remove(&next_id) {
+            self.grid_rows = saved.grid_rows;
+            self.grid_cols = saved.grid_cols;
+            self.active = saved.active;
+            self.panels = saved.panels;
+        } else {
+            self.grid_rows = 1;
+            self.grid_cols = 1;
+            self.active = 0;
+            self.panels = vec![PlotPanel::default()];
+        }
+        self.active_figure_id = next_id;
+        next_id
+    }
+
+    /// Close one or all figures (`close`, `close(n)`, `close('all')`).
+    pub fn close_figure(&mut self, all: bool, target_id: Option<usize>) {
+        if all {
+            self.clear();
+            return;
+        }
+        let id = target_id.unwrap_or(self.active_figure_id);
+        if id == self.active_figure_id {
+            if let Some((&next_id, _)) = self.other_figures.iter().next_back() {
+                if let Some(saved) = self.other_figures.remove(&next_id) {
+                    self.grid_rows = saved.grid_rows;
+                    self.grid_cols = saved.grid_cols;
+                    self.active = saved.active;
+                    self.panels = saved.panels;
+                    self.active_figure_id = next_id;
+                    return;
+                }
+            }
+            self.clear();
+        } else {
+            self.other_figures.remove(&id);
+        }
+    }
+
+    /// Number of non-empty figures (including active and saved figures).
+    pub fn figure_count(&self) -> usize {
+        let mut n = usize::from(!self.is_empty());
+        for f in self.other_figures.values() {
+            if !f.panels.iter().all(PlotPanel::is_empty) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Render all non-empty figures as a JSON array `[{"id":1,"active":true,"svg":"..."}]`.
+    pub fn all_figures_svg_json(&self, width: f64, height: f64) -> String {
+        let mut items: Vec<(usize, bool, String)> = Vec::new();
+        if !self.is_empty() {
+            items.push((self.active_figure_id, true, self.to_svg(width, height)));
+        }
+        for (&id, sf) in &self.other_figures {
+            if sf.panels.iter().all(PlotPanel::is_empty) {
+                continue;
+            }
+            let tmp = PlotFigure {
+                grid_rows: sf.grid_rows,
+                grid_cols: sf.grid_cols,
+                active: sf.active,
+                panels: sf.panels.clone(),
+                active_figure_id: id,
+                other_figures: std::collections::BTreeMap::new(),
+            };
+            items.push((id, false, tmp.to_svg(width, height)));
+        }
+        items.sort_by_key(|(id, _, _)| *id);
+        let mut out = String::from("[");
+        for (i, (id, active, svg)) in items.into_iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "{{\"id\":{id},\"active\":{active},\"svg\":{}}}",
+                json_str(&svg)
+            ));
+        }
+        out.push(']');
+        out
     }
 
     pub fn subplot(&mut self, rows: usize, cols: usize, index_1based: usize) {
@@ -531,7 +662,11 @@ fn render_panel(svg: &mut String, panel: &PlotPanel, width: f64, height: f64) {
             }
         }
         svg.push_str(&format!(
-            "<rect x=\"{pad_l}\" y=\"{pad_t}\" width=\"{pw}\" height=\"{ph}\" fill=\"none\" stroke=\"#333333\" stroke-width=\"1\"/>"
+            "<rect class=\"matro-plot-area\" x=\"{pad_l}\" y=\"{pad_t}\" width=\"{pw}\" height=\"{ph}\" fill=\"none\" stroke=\"#333333\" stroke-width=\"1\" data-xmin=\"{x0}\" data-xmax=\"{x1}\" data-ymin=\"{y1}\" data-ymax=\"{y0}\" data-logx=\"0\" data-logy=\"0\" data-invert-y=\"1\"/>",
+            x0 = hm.x_extent.map_or(1.0, |e| e.0),
+            x1 = hm.x_extent.map_or(hm.cols as f64, |e| e.1),
+            y0 = hm.y_extent.map_or(1.0, |e| e.0),
+            y1 = hm.y_extent.map_or(hm.rows as f64, |e| e.1),
         ));
         // Axis extent tick labels on heatmap when provided
         let (x0, x1) = hm.x_extent.unwrap_or((1.0, hm.cols as f64));
@@ -773,7 +908,9 @@ fn render_panel(svg: &mut String, panel: &PlotPanel, width: f64, height: f64) {
     // Frame, grid & ticks (hidden when axis_off is true)
     if !panel.axis_off {
         svg.push_str(&format!(
-            "<rect x=\"{pad_l}\" y=\"{pad_t}\" width=\"{pw}\" height=\"{ph}\" fill=\"#ffffff\" stroke=\"#333333\" stroke-width=\"1\"/>"
+            "<rect class=\"matro-plot-area\" x=\"{pad_l}\" y=\"{pad_t}\" width=\"{pw}\" height=\"{ph}\" fill=\"#ffffff\" stroke=\"#333333\" stroke-width=\"1\" data-xmin=\"{xmin}\" data-xmax=\"{xmax}\" data-ymin=\"{ymin}\" data-ymax=\"{ymax}\" data-logx=\"{}\" data-logy=\"{}\"/>",
+            u8::from(panel.log_x),
+            u8::from(panel.log_y),
         ));
 
         let ticks = 5usize;

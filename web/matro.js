@@ -111,6 +111,16 @@ export class MatroRuntime {
     return this._readOutput();
   }
 
+  plotsJson(width = 640, height = 360) {
+    if (typeof this.exports.matro_plots_json === "function") {
+      this.exports.matro_plots_json(width, height);
+      const raw = this._readOutput();
+      return raw ? JSON.parse(raw) : [];
+    }
+    const svg = this.plotSvg(width, height);
+    return svg ? [{ id: 1, active: true, svg }] : [];
+  }
+
   reset() {
     this.exports.matro_reset();
   }

@@ -50,15 +50,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown,wasm32-wasip1
-      - name: Build browser Wasm & WASI CLI
+      - name: Install Binaryen (wasm-opt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binaryen
+      - name: Build SIMD browser Wasm & WASI CLI
         run: |
           mkdir -p dist
-          cargo build -p matro_wasm --target wasm32-unknown-unknown --profile wasm-release
-          cp target/wasm32-unknown-unknown/wasm-release/matro_wasm.wasm packages/matro-wasm/matro_wasm.wasm
-          cp target/wasm32-unknown-unknown/wasm-release/matro_wasm.wasm dist/matro_wasm.wasm
+          RUSTFLAGS="-C target-feature=+simd128" cargo build -p matro_wasm --target wasm32-unknown-unknown --profile wasm-release
+          wasm-opt -Oz --enable-simd --enable-bulk-memory --enable-sign-ext --enable-mutable-globals --enable-nontrapping-float-to-int \
+            target/wasm32-unknown-unknown/wasm-release/matro_wasm.wasm -o dist/matro_wasm.wasm
+          cp dist/matro_wasm.wasm packages/matro-wasm/matro_wasm.wasm
           tar -czf dist/matro-wasm-sdk.tar.gz -C packages matro-wasm
           cargo build -p matro_cli --target wasm32-wasip1 --profile wasm-release
           cp target/wasm32-wasip1/wasm-release/matro.wasm dist/matro-wasip1.wasm
+          ls -lh dist/
       - uses: actions/upload-artifact@v4
         with:
           name: matro-wasm-artifacts
