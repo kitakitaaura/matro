@@ -44,7 +44,7 @@ impl SparseMatrix {
 
     /// Construct from 0-based `(row, col, val)` triplets, summing duplicate coordinates (MATLAB convention).
     pub fn from_triplets(rows: usize, cols: usize, triplets: &[(usize, usize, f64)]) -> Result<Self> {
-        let mut by_col: Vec<BTreeMap<usize, f64>> = vec![BTreeMap::new(); cols];
+        let mut entries: Vec<(usize, usize, f64)> = Vec::with_capacity(triplets.len());
         for &(r, c, v) in triplets {
             if r >= rows || c >= cols {
                 return Err(MatroError::index(format!(
@@ -54,21 +54,36 @@ impl SparseMatrix {
                 )));
             }
             if v != 0.0 {
-                *by_col[c].entry(r).or_insert(0.0) += v;
+                entries.push((c, r, v));
             }
         }
-        let mut col_ptr = Vec::with_capacity(cols + 1);
-        let mut row_idx = Vec::new();
-        let mut values = Vec::new();
-        col_ptr.push(0);
-        for col in by_col {
-            for (r, v) in col {
-                if v != 0.0 {
-                    row_idx.push(r);
-                    values.push(v);
-                }
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        let mut col_ptr = vec![0usize; cols + 1];
+        let mut row_idx = Vec::with_capacity(entries.len());
+        let mut values = Vec::with_capacity(entries.len());
+
+        let mut cur_col = 0usize;
+        let mut idx = 0usize;
+        while idx < entries.len() {
+            let (c, r, mut sum) = entries[idx];
+            idx += 1;
+            while idx < entries.len() && entries[idx].0 == c && entries[idx].1 == r {
+                sum += entries[idx].2;
+                idx += 1;
             }
-            col_ptr.push(row_idx.len());
+            if sum != 0.0 {
+                while cur_col < c {
+                    cur_col += 1;
+                    col_ptr[cur_col] = row_idx.len();
+                }
+                row_idx.push(r);
+                values.push(sum);
+            }
+        }
+        while cur_col < cols {
+            cur_col += 1;
+            col_ptr[cur_col] = row_idx.len();
         }
         Ok(Self {
             rows,
@@ -134,6 +149,167 @@ impl SparseMatrix {
         match self.row_idx[start..end].binary_search(&r) {
             Ok(offset) => self.values[start + offset],
             Err(_) => 0.0,
+        }
+    }
+
+    /// Set entry `(r, c)` in-place (auto-growing dimensions if needed, removing explicit zeros).
+    pub fn set(&mut self, r: usize, c: usize, val: f64) {
+        if r >= self.rows {
+            self.rows = r + 1;
+        }
+        if c >= self.cols {
+            let last = *self.col_ptr.last().unwrap_or(&0);
+            self.col_ptr.resize(c + 2, last);
+            self.cols = c + 1;
+        }
+        let start = self.col_ptr[c];
+        let end = self.col_ptr[c + 1];
+        match self.row_idx[start..end].binary_search(&r) {
+            Ok(offset) => {
+                let pos = start + offset;
+                if val == 0.0 {
+                    self.row_idx.remove(pos);
+                    self.values.remove(pos);
+                    for p in &mut self.col_ptr[(c + 1)..] {
+                        *p -= 1;
+                    }
+                } else {
+                    self.values[pos] = val;
+                }
+            }
+            Err(offset) => {
+                if val != 0.0 {
+                    let pos = start + offset;
+                    self.row_idx.insert(pos, r);
+                    self.values.insert(pos, val);
+                    for p in &mut self.col_ptr[(c + 1)..] {
+                        *p += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Extract sparse submatrix `S(rows, cols)` in `O(nnz)` time, preserving sparsity.
+    pub fn submatrix(&self, rows: &[usize], cols: &[usize]) -> Self {
+        // Map each original row index -> list of output row indices (supports duplicate row selection)
+        let mut row_counts = vec![0usize; self.rows];
+        let mut has_dup_rows = false;
+        let mut row_single = vec![usize::MAX; self.rows];
+        for (out_r, &orig_r) in rows.iter().enumerate() {
+            if orig_r < self.rows {
+                row_counts[orig_r] += 1;
+                if row_counts[orig_r] == 1 {
+                    row_single[orig_r] = out_r;
+                } else {
+                    has_dup_rows = true;
+                }
+            }
+        }
+
+        let mut row_multi: Vec<Vec<usize>> = Vec::new();
+        if has_dup_rows {
+            row_multi.resize(self.rows, Vec::new());
+            for (out_r, &orig_r) in rows.iter().enumerate() {
+                if orig_r < self.rows {
+                    row_multi[orig_r].push(out_r);
+                }
+            }
+        }
+
+        let mut col_ptr = Vec::with_capacity(cols.len() + 1);
+        let mut row_idx = Vec::new();
+        let mut values = Vec::new();
+        col_ptr.push(0);
+
+        let mut col_entries: Vec<(usize, f64)> = Vec::new();
+        for &orig_c in cols {
+            col_entries.clear();
+            if orig_c < self.cols {
+                for idx in self.col_ptr[orig_c]..self.col_ptr[orig_c + 1] {
+                    let orig_r = self.row_idx[idx];
+                    let v = self.values[idx];
+                    if has_dup_rows {
+                        for &out_r in &row_multi[orig_r] {
+                            col_entries.push((out_r, v));
+                        }
+                    } else {
+                        let out_r = row_single[orig_r];
+                        if out_r != usize::MAX {
+                            col_entries.push((out_r, v));
+                        }
+                    }
+                }
+                col_entries.sort_unstable_by_key(|&(r, _)| r);
+                for &(r, v) in &col_entries {
+                    row_idx.push(r);
+                    values.push(v);
+                }
+            }
+            col_ptr.push(row_idx.len());
+        }
+
+        Self {
+            rows: rows.len(),
+            cols: cols.len(),
+            col_ptr,
+            row_idx,
+            values,
+        }
+    }
+
+    /// `O(nnz)` column or row sum (`dim == 1` -> `1 x cols`, `dim == 2` -> `rows x 1`).
+    pub fn sum_dim(&self, dim: usize) -> Matrix {
+        if dim == 1 {
+            let mut out = vec![0.0; self.cols];
+            for (c, slot) in out.iter_mut().enumerate() {
+                let mut acc = 0.0;
+                for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
+                    acc += self.values[idx];
+                }
+                *slot = acc;
+            }
+            Matrix::row_vec(out)
+        } else {
+            let mut out = vec![0.0; self.rows];
+            for idx in 0..self.values.len() {
+                out[self.row_idx[idx]] += self.values[idx];
+            }
+            Matrix::col_vec(out)
+        }
+    }
+
+    /// Sparse Kronecker tensor product `kron(self, other)`.
+    pub fn kron(&self, other: &Self) -> Self {
+        let out_rows = self.rows * other.rows;
+        let out_cols = self.cols * other.cols;
+        let mut col_ptr = Vec::with_capacity(out_cols + 1);
+        let mut row_idx = Vec::with_capacity(self.nnz().saturating_mul(other.nnz()));
+        let mut values = Vec::with_capacity(self.nnz().saturating_mul(other.nnz()));
+        col_ptr.push(0);
+        for ca in 0..self.cols {
+            for cb in 0..other.cols {
+                for ia in self.col_ptr[ca]..self.col_ptr[ca + 1] {
+                    let ra = self.row_idx[ia];
+                    let va = self.values[ia];
+                    let r_off = ra * other.rows;
+                    for ib in other.col_ptr[cb]..other.col_ptr[cb + 1] {
+                        let v = va * other.values[ib];
+                        if v != 0.0 {
+                            row_idx.push(r_off + other.row_idx[ib]);
+                            values.push(v);
+                        }
+                    }
+                }
+                col_ptr.push(row_idx.len());
+            }
+        }
+        Self {
+            rows: out_rows,
+            cols: out_cols,
+            col_ptr,
+            row_idx,
+            values,
         }
     }
 
@@ -318,7 +494,188 @@ impl SparseMatrix {
         true
     }
 
-    /// Conjugate Gradient solver for symmetric positive definite sparse systems (`pcg`).
+    /// Lower and upper half-bandwidths `(kl, ku)` in `O(nnz)` time.
+    pub fn bandwidth(&self) -> (usize, usize) {
+        let mut kl = 0usize;
+        let mut ku = 0usize;
+        for c in 0..self.cols {
+            for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
+                let r = self.row_idx[idx];
+                if r > c {
+                    kl = kl.max(r - c);
+                } else {
+                    ku = ku.max(c - r);
+                }
+            }
+        }
+        (kl, ku)
+    }
+
+    /// Exact Banded Cholesky factorization `A = L * L^T` for symmetric positive definite banded systems.
+    fn factor_banded_cholesky(&self, bw: usize) -> Option<Vec<f64>> {
+        let n = self.rows;
+        let stride = bw + 1;
+        let mut l = vec![0.0; n * stride];
+        for c in 0..n {
+            for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
+                let r = self.row_idx[idx];
+                if r >= c && r - c <= bw {
+                    l[c * stride + (r - c)] = self.values[idx];
+                }
+            }
+        }
+        for j in 0..n {
+            let diag = l[j * stride];
+            if !diag.is_finite() || diag <= 0.0 {
+                return None;
+            }
+            let ljj = diag.sqrt();
+            l[j * stride] = ljj;
+            let max_i = (j + bw).min(n - 1);
+            let inv_ljj = 1.0 / ljj;
+            let col_j = j * stride;
+            for i in (j + 1)..=max_i {
+                l[col_j + (i - j)] *= inv_ljj;
+            }
+            for k in (j + 1)..=max_i {
+                let lkj = l[col_j + (k - j)];
+                if lkj == 0.0 {
+                    continue;
+                }
+                let col_k = k * stride;
+                for i in k..=max_i {
+                    l[col_k + (i - k)] -= l[col_j + (i - j)] * lkj;
+                }
+            }
+        }
+        Some(l)
+    }
+
+    fn solve_with_banded_cholesky(l: &[f64], n: usize, bw: usize, b: &[f64]) -> Vec<f64> {
+        let stride = bw + 1;
+        let mut y = b.to_vec();
+        for j in 0..n {
+            let col_j = j * stride;
+            let yj = y[j] / l[col_j];
+            y[j] = yj;
+            if yj != 0.0 {
+                let max_i = (j + bw).min(n - 1);
+                for i in (j + 1)..=max_i {
+                    y[i] -= l[col_j + (i - j)] * yj;
+                }
+            }
+        }
+        for j in (0..n).rev() {
+            let col_j = j * stride;
+            let mut s = y[j];
+            let max_i = (j + bw).min(n - 1);
+            for i in (j + 1)..=max_i {
+                s -= l[col_j + (i - j)] * y[i];
+            }
+            y[j] = s / l[col_j];
+        }
+        y
+    }
+
+    /// Exact Banded LU with partial pivoting (LAPACK `DGBTRF`/`DGBTRS` layout) for general banded sparse systems.
+    fn factor_banded_lu(&self, kl: usize, ku: usize) -> Option<(Vec<f64>, Vec<usize>)> {
+        let n = self.rows;
+        let ldab = 2 * kl + ku + 1;
+        let kv = kl + ku;
+        let mut ab = vec![0.0; n * ldab];
+        for c in 0..n {
+            for idx in self.col_ptr[c]..self.col_ptr[c + 1] {
+                let r = self.row_idx[idx];
+                let row_slot = kv as isize + r as isize - c as isize;
+                if row_slot >= 0 && (row_slot as usize) < ldab {
+                    ab[c * ldab + row_slot as usize] = self.values[idx];
+                }
+            }
+        }
+        let mut ipiv = vec![0usize; n];
+        for j in 0..n {
+            let max_row_off = kl.min(n - 1 - j);
+            let mut piv_off = 0usize;
+            let mut piv_val = ab[j * ldab + kv].abs();
+            for off in 1..=max_row_off {
+                let v = ab[j * ldab + kv + off].abs();
+                if v > piv_val {
+                    piv_val = v;
+                    piv_off = off;
+                }
+            }
+            if !piv_val.is_finite() || piv_val == 0.0 {
+                return None;
+            }
+            ipiv[j] = j + piv_off;
+            let max_col = (j + ku + kl).min(n - 1);
+            if piv_off != 0 {
+                for k in j..=max_col {
+                    let base = k * ldab;
+                    let r1 = kv + j - k;
+                    let r2 = r1 + piv_off;
+                    ab.swap(base + r1, base + r2);
+                }
+            }
+            let pivot = ab[j * ldab + kv];
+            let inv_piv = 1.0 / pivot;
+            for off in 1..=max_row_off {
+                ab[j * ldab + kv + off] *= inv_piv;
+            }
+            for k in (j + 1)..=max_col {
+                let base_k = k * ldab;
+                let u_jk = ab[base_k + kv + j - k];
+                if u_jk == 0.0 {
+                    continue;
+                }
+                for off in 1..=max_row_off {
+                    let m = ab[j * ldab + kv + off];
+                    ab[base_k + kv + j + off - k] -= m * u_jk;
+                }
+            }
+        }
+        Some((ab, ipiv))
+    }
+
+    fn solve_with_banded_lu(
+        ab: &[f64],
+        ipiv: &[usize],
+        n: usize,
+        kl: usize,
+        ku: usize,
+        b: &[f64],
+    ) -> Vec<f64> {
+        let ldab = 2 * kl + ku + 1;
+        let kv = kl + ku;
+        let mut x = b.to_vec();
+        for j in 0..n {
+            let p = ipiv[j];
+            if p != j {
+                x.swap(j, p);
+            }
+            let xj = x[j];
+            if xj != 0.0 {
+                let max_off = kl.min(n - 1 - j);
+                for off in 1..=max_off {
+                    x[j + off] -= ab[j * ldab + kv + off] * xj;
+                }
+            }
+        }
+        for j in (0..n).rev() {
+            let base = j * ldab;
+            let xj = x[j] / ab[base + kv];
+            x[j] = xj;
+            if xj != 0.0 {
+                let min_i = j.saturating_sub(kv);
+                for i in min_i..j {
+                    x[i] -= ab[base + kv + i - j] * xj;
+                }
+            }
+        }
+        x
+    }
+
+    /// Jacobi-preconditioned Conjugate Gradient solver for symmetric positive definite sparse systems (`pcg`).
     pub fn solve_cg(&self, b: &[f64], tol: f64, maxit: usize) -> Result<Vec<f64>> {
         if self.rows != self.cols || self.rows != b.len() {
             return Err(MatroError::dimension(
@@ -327,13 +684,20 @@ impl SparseMatrix {
         }
         let n = self.rows;
         let b_norm = dot(b, b).sqrt().max(1e-15);
+        let inv_diag: Vec<f64> = (0..n)
+            .map(|i| {
+                let d = self.get(i, i);
+                if d.abs() > 1e-30 { 1.0 / d } else { 1.0 }
+            })
+            .collect();
         let mut x = vec![0.0; n];
         let mut r = b.to_vec();
-        let mut p = r.clone();
-        let mut rs_old = dot(&r, &r);
+        let mut z: Vec<f64> = (0..n).map(|i| r[i] * inv_diag[i]).collect();
+        let mut p = z.clone();
+        let mut rz_old = dot(&r, &z);
 
         for _ in 0..maxit {
-            if rs_old.sqrt() / b_norm < tol {
+            if dot(&r, &r).sqrt() / b_norm < tol {
                 return Ok(x);
             }
             let ap = self.matvec(&p)?;
@@ -341,20 +705,26 @@ impl SparseMatrix {
             if pap.abs() < 1e-30 {
                 break;
             }
-            let alpha = rs_old / pap;
+            let alpha = rz_old / pap;
             for i in 0..n {
                 x[i] += alpha * p[i];
                 r[i] -= alpha * ap[i];
             }
-            let rs_new = dot(&r, &r);
-            if rs_new.sqrt() / b_norm < tol {
+            if dot(&r, &r).sqrt() / b_norm < tol {
                 return Ok(x);
             }
-            let beta = rs_new / rs_old;
             for i in 0..n {
-                p[i] = r[i] + beta * p[i];
+                z[i] = r[i] * inv_diag[i];
             }
-            rs_old = rs_new;
+            let rz_new = dot(&r, &z);
+            if rz_old.abs() < 1e-30 {
+                break;
+            }
+            let beta = rz_new / rz_old;
+            for i in 0..n {
+                p[i] = z[i] + beta * p[i];
+            }
+            rz_old = rz_new;
         }
         Ok(x)
     }
@@ -420,8 +790,8 @@ impl SparseMatrix {
         Ok(x)
     }
 
-    /// Sparse linear solve `S \ B`: uses CG for symmetric matrices, BiCGSTAB otherwise
-    /// (falling back to dense LU for tiny matrices <= 16).
+    /// Sparse linear solve `S \ B`: uses exact Banded Cholesky (for banded SPD),
+    /// exact Banded LU (for general banded), and falls back to Jacobi-PCG / BiCGSTAB.
     pub fn solve_dense(&self, rhs: &Matrix) -> Result<Matrix> {
         if self.rows != self.cols || self.rows != rhs.rows() {
             return Err(MatroError::dimension(format!(
@@ -432,17 +802,53 @@ impl SparseMatrix {
                 rhs.cols()
             )));
         }
-        if self.rows <= 16 {
+        let n = self.rows;
+        if n == 0 {
+            return Ok(Matrix::zeros(0, rhs.cols()));
+        }
+        if n <= 16 {
             return self.to_dense().solve(rhs);
         }
-        let maxit = (self.rows * 4).max(400);
-        let sym = self.is_symmetric();
+
+        let (kl, ku) = self.bandwidth();
+        let sym = kl == ku && self.is_symmetric();
+
+        // Fast exact direct Banded Cholesky for banded SPD matrices (e.g. 2D FEM stiffness matrices)
+        if sym && kl <= 256 && n.saturating_mul(kl + 1) <= 2_000_000 {
+            if let Some(l) = self.factor_banded_cholesky(kl) {
+                let mut out = Matrix::zeros(n, rhs.cols());
+                for j in 0..rhs.cols() {
+                    let b: Vec<f64> = (0..n).map(|r| rhs.get(r, j)).collect();
+                    let x = Self::solve_with_banded_cholesky(&l, n, kl, &b);
+                    for (i, &val) in x.iter().enumerate() {
+                        out.set(i, j, val);
+                    }
+                }
+                return Ok(out);
+            }
+        }
+
+        // Fast exact direct Banded LU with partial pivoting for general or indefinite banded matrices
+        if kl + ku <= 256 && n.saturating_mul(2 * kl + ku + 1) <= 2_000_000 {
+            if let Some((ab, ipiv)) = self.factor_banded_lu(kl, ku) {
+                let mut out = Matrix::zeros(n, rhs.cols());
+                for j in 0..rhs.cols() {
+                    let b: Vec<f64> = (0..n).map(|r| rhs.get(r, j)).collect();
+                    let x = Self::solve_with_banded_lu(&ab, &ipiv, n, kl, ku, &b);
+                    for (i, &val) in x.iter().enumerate() {
+                        out.set(i, j, val);
+                    }
+                }
+                return Ok(out);
+            }
+        }
+
+        let maxit = (n * 4).max(400);
         let mut out = Matrix::zeros(self.cols, rhs.cols());
         for j in 0..rhs.cols() {
             let b: Vec<f64> = (0..rhs.rows()).map(|r| rhs.get(r, j)).collect();
             let x = if sym {
                 let cand = self.solve_cg(&b, 1e-10, maxit)?;
-                // Verify residual (in case symmetric indefinite)
                 let ax = self.matvec(&cand)?;
                 let res: f64 = (0..b.len()).map(|i| (ax[i] - b[i]).powi(2)).sum::<f64>().sqrt();
                 let bn = dot(&b, &b).sqrt().max(1.0);

@@ -598,6 +598,16 @@ impl Value {
     }
 
     pub fn as_scalar(&self) -> Result<f64> {
+        if let Self::Sparse(s) = self {
+            if s.rows() == 1 && s.cols() == 1 {
+                return Ok(s.get(0, 0));
+            }
+            return Err(MatroError::dimension(format!(
+                "Expected real scalar (1x1), got {}x{} sparse",
+                s.rows(),
+                s.cols()
+            )));
+        }
         let m = self.as_matrix()?;
         m.as_scalar().ok_or_else(|| {
             MatroError::dimension(format!(

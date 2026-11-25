@@ -1504,6 +1504,12 @@ impl Vm {
                     }
                     let key = MapData::key_of(&raw_args[0].clone().into_val()?)?;
                     map.entries.insert(key, rhs);
+                } else if let Value::Sparse(ref mut sp) = val {
+                    assign_sparse_index(
+                        std::sync::Arc::make_mut(sp),
+                        &raw_args,
+                        &rhs.to_dense_matrix()?,
+                    )?;
                 } else if let Some(updated) =
                     self.try_subsasgn(&val, "()", &raw_args, rhs.clone(), stdout)?
                 {
@@ -1528,6 +1534,12 @@ impl Vm {
                     }
                     let key = MapData::key_of(&raw_args[0].clone().into_val()?)?;
                     map.entries.insert(key, rhs);
+                } else if let Value::Sparse(ref mut sp) = val {
+                    assign_sparse_index(
+                        std::sync::Arc::make_mut(sp),
+                        &raw_args,
+                        &rhs.to_dense_matrix()?,
+                    )?;
                 } else if let Some(updated) =
                     self.try_subsasgn(&val, "()", &raw_args, rhs.clone(), stdout)?
                 {
@@ -1989,7 +2001,7 @@ impl Vm {
             }
             Value::Sparse(s) => {
                 let indexed = index_sparse(&s, &raw_args)?;
-                stack.push(StackItem::Val(Value::matrix(indexed)));
+                stack.push(StackItem::Val(indexed));
             }
             Value::Cell(c) => {
                 let sub = index_cell_subarray(&c, &raw_args)?;
@@ -4853,19 +4865,88 @@ fn resolve_indices(item: &StackItem, max_len: usize) -> Result<Vec<usize>> {
     }
 }
 
-fn index_sparse(s: &SparseMatrix, args: &[StackItem]) -> Result<Matrix> {
+fn index_sparse(s: &SparseMatrix, args: &[StackItem]) -> Result<Value> {
     if args.len() == 2 {
         let rows = resolve_indices(&args[0], s.rows())?;
         let cols = resolve_indices(&args[1], s.cols())?;
-        let mut out = Matrix::zeros(rows.len(), cols.len());
-        for (ci, &c) in cols.iter().enumerate() {
-            for (ri, &r) in rows.iter().enumerate() {
-                out.set(ri, ci, s.get(r, c));
-            }
-        }
-        return Ok(out);
+        return Ok(Value::sparse(s.submatrix(&rows, &cols)));
     }
-    index_matrix(&s.to_dense(), args)
+    Ok(Value::matrix(index_matrix(&s.to_dense(), args)?))
+}
+
+fn assign_sparse_index(s: &mut SparseMatrix, args: &[StackItem], rhs: &Matrix) -> Result<()> {
+    match args.len() {
+        2 => {
+            let parse_dim = |item: &StackItem, cur: usize| -> Result<Vec<usize>> {
+                match item {
+                    StackItem::Colon => Ok((0..cur).collect()),
+                    StackItem::Scalar(x) => {
+                        let i = x.round() as isize;
+                        if i < 1 {
+                            Err(MatroError::index(format!("Index {x} must be >= 1")))
+                        } else {
+                            Ok(vec![(i - 1) as usize])
+                        }
+                    }
+                    StackItem::Val(v) => {
+                        let idx_m = v.as_matrix()?;
+                        if idx_m.is_logical() {
+                            Ok(idx_m
+                                .data()
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, &f)| (f != 0.0).then_some(i))
+                                .collect())
+                        } else {
+                            idx_m
+                                .data()
+                                .iter()
+                                .map(|&x| {
+                                    let i = x.round() as isize;
+                                    if i < 1 {
+                                        Err(MatroError::index(format!("Index {x} must be >= 1")))
+                                    } else {
+                                        Ok((i - 1) as usize)
+                                    }
+                                })
+                                .collect()
+                        }
+                    }
+                    StackItem::Spread(_) => Err(MatroError::index(
+                        "Comma-separated list cannot be used as assignment index",
+                    )),
+                    StackItem::Void => Ok(Vec::new()),
+                }
+            };
+            let rows = parse_dim(&args[0], s.rows())?;
+            let cols = parse_dim(&args[1], s.cols())?;
+            if let Some(sc) = rhs.as_scalar() {
+                for &c in &cols {
+                    for &r in &rows {
+                        s.set(r, c, sc);
+                    }
+                }
+            } else if rhs.rows() == rows.len() && rhs.cols() == cols.len() {
+                for (ci, &c) in cols.iter().enumerate() {
+                    for (ri, &r) in rows.iter().enumerate() {
+                        s.set(r, c, rhs.get(ri, ci));
+                    }
+                }
+            } else {
+                return Err(MatroError::dimension("Sparse indexed assignment size mismatch"));
+            }
+            Ok(())
+        }
+        1 => {
+            let mut dense = s.to_dense();
+            assign_matrix_index(&mut dense, args, rhs)?;
+            *s = SparseMatrix::from_dense(&dense);
+            Ok(())
+        }
+        n => Err(MatroError::index(format!(
+            "Sparse assignment expects 1 or 2 indices, got {n}"
+        ))),
+    }
 }
 
 fn nd_strides(dims: &[usize]) -> Vec<usize> {
@@ -4883,6 +4964,21 @@ fn index_matrix(m: &Matrix, args: &[StackItem]) -> Result<Matrix> {
         1 => {
             let idxs = resolve_indices(&args[0], m.len())?;
             let vals: Vec<Complex> = idxs.iter().map(|&i| m.get_linear_c(i)).collect();
+            if let StackItem::Val(v) = &args[0] {
+                if let Ok(idx_m) = v.as_matrix() {
+                    if !idx_m.is_logical() {
+                        let a_is_vec = m.ndims() == 2 && (m.rows() == 1 || m.cols() == 1);
+                        let idx_is_vec =
+                            idx_m.ndims() == 2 && (idx_m.rows() == 1 || idx_m.cols() == 1);
+                        if !a_is_vec || !idx_is_vec {
+                            let re: Vec<f64> = vals.iter().map(|c| c.re).collect();
+                            let im: Vec<f64> = vals.iter().map(|c| c.im).collect();
+                            return Matrix::from_nd_complex_col_major(idx_m.dims(), re, im)
+                                .map(Matrix::normalize);
+                        }
+                    }
+                }
+            }
             if m.rows() == 1 && m.ndims() == 2 && !matches!(args[0], StackItem::Colon) {
                 Ok(Matrix::complex_row_vec(vals).normalize())
             } else {

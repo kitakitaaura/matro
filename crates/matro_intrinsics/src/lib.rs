@@ -161,6 +161,7 @@ pub fn call_intrinsic(
         "permute" => extras::fn_permute(args),
         "cat" => extras::fn_cat(args),
         "repmat" => extras::fn_repmat(args),
+        "kron" => fn_kron(args),
         "fliplr" => extras::fn_fliplr(args),
         "flipud" => extras::fn_flipud(args),
         "rot90" => extras::fn_rot90(args),
@@ -217,9 +218,7 @@ pub fn call_intrinsic(
         "diff" => fn_diff(args),
 
         // Reductions
-        "sum" => fn_reduce_c(name, args, |slice| {
-            slice.iter().copied().fold(Complex::ZERO, |a, b| a + b)
-        }),
+        "sum" => fn_sum(args),
         "prod" => fn_reduce_c(name, args, |slice| {
             slice.iter().copied().fold(Complex::ONE, |a, b| a * b)
         }),
@@ -1277,15 +1276,139 @@ fn fn_cols(args: &[Value]) -> Result<Vec<Value>> {
     ok1(Value::scalar(args[0].as_matrix()?.cols() as f64))
 }
 
-fn fn_reshape(args: &[Value]) -> Result<Vec<Value>> {
-    if args.len() < 3 {
-        return Err(MatroError::arity("reshape", ">= 3 (A, d1, d2, ...)", args.len()));
+fn fn_kron(args: &[Value]) -> Result<Vec<Value>> {
+    if args.len() != 2 {
+        return Err(MatroError::arity("kron", "2 (A, B)", args.len()));
     }
-    let m = args[0].as_matrix()?;
-    let dims: Vec<usize> = args[1..]
-        .iter()
-        .map(|a| as_usize(a, "reshape"))
-        .collect::<Result<_>>()?;
+    match (&args[0], &args[1]) {
+        (Value::Sparse(sa), Value::Sparse(sb)) => ok1(Value::sparse(sa.kron(sb))),
+        (Value::Sparse(sa), Value::Matrix(mb)) => {
+            ok1(Value::sparse(sa.kron(&SparseMatrix::from_dense(mb))))
+        }
+        (Value::Matrix(ma), Value::Sparse(sb)) => {
+            ok1(Value::sparse(SparseMatrix::from_dense(ma).kron(sb)))
+        }
+        _ => {
+            let a = args[0].as_matrix()?;
+            let b = args[1].as_matrix()?;
+            let (ra, ca) = (a.rows(), a.cols());
+            let (rb, cb) = (b.rows(), b.cols());
+            let out_r = ra * rb;
+            let out_c = ca * cb;
+            if !a.is_complex() && !b.is_complex() {
+                let mut data = vec![0.0; out_r * out_c];
+                for ja in 0..ca {
+                    for jb in 0..cb {
+                        let col = ja * cb + jb;
+                        let col_off = col * out_r;
+                        for ia in 0..ra {
+                            let av = a.get(ia, ja);
+                            let row_off = col_off + ia * rb;
+                            for ib in 0..rb {
+                                data[row_off + ib] = av * b.get(ib, jb);
+                            }
+                        }
+                    }
+                }
+                ok1(Value::matrix(Matrix::from_col_major(out_r, out_c, data)?))
+            } else {
+                let mut re = vec![0.0; out_r * out_c];
+                let mut im = vec![0.0; out_r * out_c];
+                for ja in 0..ca {
+                    for jb in 0..cb {
+                        let col = ja * cb + jb;
+                        let col_off = col * out_r;
+                        for ia in 0..ra {
+                            let av = a.get_c(ia, ja);
+                            let row_off = col_off + ia * rb;
+                            for ib in 0..rb {
+                                let p = av * b.get_c(ib, jb);
+                                re[row_off + ib] = p.re;
+                                im[row_off + ib] = p.im;
+                            }
+                        }
+                    }
+                }
+                ok1(Value::matrix(
+                    Matrix::from_complex_col_major(out_r, out_c, re, im)?.normalize(),
+                ))
+            }
+        }
+    }
+}
+
+fn fn_sum(args: &[Value]) -> Result<Vec<Value>> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(MatroError::arity("sum", "1 or 2", args.len()));
+    }
+    if let Value::Sparse(s) = &args[0] {
+        let dim = if args.len() == 2 {
+            as_usize(&args[1], "sum")?
+        } else if s.rows() == 1 {
+            2
+        } else {
+            1
+        };
+        if dim != 1 && dim != 2 {
+            return Err(MatroError::runtime(format!("sum: unsupported dimension {dim}")));
+        }
+        return ok1(Value::matrix(s.sum_dim(dim)));
+    }
+    fn_reduce_c("sum", args, |slice| {
+        slice.iter().copied().fold(Complex::ZERO, |a, b| a + b)
+    })
+}
+
+fn fn_reshape(args: &[Value]) -> Result<Vec<Value>> {
+    if args.len() < 2 {
+        return Err(MatroError::arity("reshape", ">= 2 (A, sz | d1, d2, ...)", args.len()));
+    }
+    let m = args[0].to_dense_matrix()?;
+    let total = m.len();
+    let dims: Vec<usize> = if args.len() == 2 {
+        let sz = args[1].as_matrix()?;
+        if sz.len() < 2 {
+            return Err(MatroError::dimension("reshape: size vector must have at least 2 elements"));
+        }
+        sz.data()
+            .iter()
+            .map(|&v| {
+                let n = v.round() as isize;
+                if n < 0 {
+                    Err(MatroError::dimension("reshape: size must be non-negative"))
+                } else {
+                    Ok(n as usize)
+                }
+            })
+            .collect::<Result<_>>()?
+    } else {
+        let mut parsed: Vec<Option<usize>> = Vec::with_capacity(args.len() - 1);
+        let mut auto_idx: Option<usize> = None;
+        for (i, a) in args[1..].iter().enumerate() {
+            let am = a.as_matrix()?;
+            if am.is_empty() {
+                if auto_idx.is_some() {
+                    return Err(MatroError::dimension(
+                        "reshape: size can only have one unknown dimension []",
+                    ));
+                }
+                auto_idx = Some(i);
+                parsed.push(None);
+            } else {
+                parsed.push(Some(as_usize(a, "reshape")?));
+            }
+        }
+        if let Some(ai) = auto_idx {
+            let known_prod: usize = parsed.iter().flatten().product();
+            if known_prod == 0 || total % known_prod != 0 {
+                return Err(MatroError::dimension(format!(
+                    "reshape: number of elements ({total}) is not divisible by {known_prod}"
+                )));
+            }
+            parsed[ai] = Some(total / known_prod);
+        }
+        parsed.into_iter().map(Option::unwrap).collect()
+    };
     let out = if let Some(im) = m.imag_data() {
         Matrix::from_nd_complex_col_major(dims, m.data().to_vec(), im.to_vec())?
     } else {

@@ -899,3 +899,149 @@ fn core_multifile_function_resolution() {
     assert!(out.stdout.contains("entry_out=40"));
     assert_eq!(out.last_value.unwrap().as_scalar().unwrap(), 40.0);
 }
+
+#[test]
+fn core_sparse_fem_kron_reshape_and_2d_index() {
+    let mut vm = Vm::new();
+    vm.eval(
+        r#"
+        % 1. kron (dense real, dense complex, sparse)
+        A = [1, 2; 3, 4];
+        B = [0, 5; 6, 7];
+        K_ab = kron(A, B);
+        assert(isequal(K_ab, [0, 5, 0, 10; 6, 7, 12, 14; 0, 15, 0, 20; 18, 21, 24, 28]));
+        K_sp = kron(sparse(eye(2)), sparse([2, 1; 0, 3]));
+        assert(issparse(K_sp) && isequal(full(K_sp), [2, 1, 0, 0; 0, 3, 0, 0; 0, 0, 2, 1; 0, 0, 0, 3]));
+
+        % 2. reshape with [] auto-inferred dim and vector size form
+        M = [1, 2, 3; 4, 5, 6];
+        c1 = reshape(M, [], 1);
+        assert(size(c1, 1) == 6 && size(c1, 2) == 1 && isequal(c1, [1; 4; 2; 5; 3; 6]));
+        r2 = reshape(1:12, 3, []);
+        assert(size(r2, 1) == 3 && size(r2, 2) == 4);
+        r3 = reshape(1:12, [4, 3]);
+        assert(size(r3, 1) == 4 && size(r3, 2) == 3);
+
+        % 3. 1D indexing with 2D index matrix preserves index matrix shape
+        U = (10:10:60)';
+        idx2d = [1, 3, 5; 2, 4, 6];
+        U2d = U(idx2d);
+        assert(size(U2d, 1) == 2 && size(U2d, 2) == 3);
+        assert(isequal(U2d, [10, 30, 50; 20, 40, 60]));
+        % Vector indexed by vector preserves source vector orientation
+        row = [10, 20, 30, 40];
+        assert(size(row([1, 3]), 1) == 1 && size(row([1, 3]), 2) == 2);
+
+        % 4. Sparse indexed assignment, sum(H, dim), sparse submatrix, Banded Cholesky & Banded LU
+        H = sparse(5, 5);
+        for i = 1:5
+            H(i, i) = 4;
+            if i < 5
+                H(i, i+1) = -1;
+                H(i+1, i) = -1;
+            end
+        end
+        assert(issparse(H) && H(2, 2) == 4 && H(2, 3) == -1);
+        hs = sum(H, 2);
+        assert(size(hs, 1) == 5 && size(hs, 2) == 1 && isequal(hs, [3; 2; 2; 2; 3]));
+        Hsub = H([2, 3, 4], [2, 3, 4]);
+        assert(issparse(Hsub) && size(Hsub, 1) == 3 && size(Hsub, 2) == 3);
+
+        % Banded SPD (n=40, bw=2) solved via Banded Cholesky
+        n = 40;
+        Spd = sparse(n, n);
+        for i = 1:n
+            Spd(i, i) = 6;
+            if i + 1 <= n, Spd(i, i+1) = -2; Spd(i+1, i) = -2; end
+            if i + 2 <= n, Spd(i, i+2) = 0.5; Spd(i+2, i) = 0.5; end
+        end
+        rhs = (1:n)';
+        sol = Spd \ rhs;
+        assert(norm(Spd * sol - rhs) < 1e-10);
+
+        % Non-symmetric banded (n=30, kl=1, ku=2) solved via Banded LU
+        n2 = 30;
+        Ns = sparse(n2, n2);
+        for i = 1:n2
+            Ns(i, i) = 5;
+            if i + 1 <= n2, Ns(i+1, i) = -1.5; Ns(i, i+1) = 0.8; end
+            if i + 2 <= n2, Ns(i, i+2) = -0.3; end
+        end
+        rhs2 = sin((1:n2)');
+        sol2 = Ns \ rhs2;
+        assert(norm(Ns * sol2 - rhs2) < 1e-10);
+        "#,
+    )
+    .unwrap();
+
+    // 5. Compact 2D SIMP cantilever FEM topology optimization (zero-arg function auto-run)
+    let fem_src = r#"
+        function res = mini_topopt()
+            nelx = 12; nely = 4; volfrac = 0.4; penal = 3.0; rmin = 1.5;
+            E0 = 1.0; Emin = 1e-9; nu = 0.3;
+            A11 = [12 3 -6 -3; 3 12 3 0; -6 3 12 -3; -3 0 -3 12];
+            A12 = [-6 -3 0 3; -3 -6 -3 -6; 0 -3 -6 3; 3 -6 3 -6];
+            B11 = [-4 3 -2 9; 3 -4 -9 4; -2 -9 -4 -3; 9 4 -3 -4];
+            B12 = [2 -3 4 -9; -3 2 9 -2; 4 9 2 3; -9 -2 3 2];
+            KE = ([A11 A12; A12' A11] + nu*[B11 B12; B12' B11]) / (24*(1-nu^2));
+            nodenrs = reshape(1:(nelx+1)*(nely+1), nely+1, nelx+1);
+            edofVec = reshape(2*nodenrs(1:end-1, 1:end-1)+1, nelx*nely, 1);
+            edofMat = repmat(edofVec, 1, 8) + repmat([0 1 2*nely+[2 3 0 1] -2 -1], nelx*nely, 1);
+            ndof = 2*(nelx+1)*(nely+1);
+            nel = nelx*nely;
+            iK = reshape(kron(edofMat, ones(8, 1))', 64*nel, 1);
+            jK = reshape(kron(edofMat, ones(1, 8))', 64*nel, 1);
+            leftNodes = nodenrs(:, 1);
+            fixedDofs = reshape([2*leftNodes-1, 2*leftNodes]', [], 1);
+            freeDofs = setdiff((1:ndof)', fixedDofs);
+            F = zeros(ndof, 1);
+            F(2*nodenrs(end, end)) = -1;
+            H = sparse(nel, nel);
+            for ex = 1:nelx
+                for ey = 1:nely
+                    e1 = (ex-1)*nely + ey;
+                    for fx = max(1, ex-floor(rmin)):min(nelx, ex+floor(rmin))
+                        for fy = max(1, ey-floor(rmin)):min(nely, ey+floor(rmin))
+                            e2 = (fx-1)*nely + fy;
+                            w = rmin - sqrt((ex-fx)^2 + (ey-fy)^2);
+                            if w > 0, H(e1, e2) = w; end
+                        end
+                    end
+                end
+            end
+            Hs = sum(H, 2);
+            x = volfrac * ones(nely, nelx);
+            xPhys = x;
+            U = zeros(ndof, 1);
+            c_hist = zeros(8, 1);
+            for it = 1:8
+                E = Emin + xPhys(:)'.^penal * (E0 - Emin);
+                sK = reshape(KE(:) * E, 64*nel, 1);
+                K = sparse(iK, jK, sK, ndof, ndof);
+                K = (K + K') / 2;
+                U(:) = 0;
+                U(freeDofs) = K(freeDofs, freeDofs) \ F(freeDofs);
+                elU = U(edofMat);
+                elE = sum((elU * KE) .* elU, 2);
+                c_hist(it) = F' * U;
+                dc = -penal*(E0-Emin)*xPhys(:).^(penal-1).*elE;
+                dc = H*(x(:).*dc)./Hs./max(1e-3, x(:));
+                lo = 0; hi = 1e9;
+                while (hi - lo)/(hi + lo + eps) > 1e-3
+                    mid = 0.5*(lo + hi);
+                    cand = max(0, max(x(:)-0.2, min(1, min(x(:)+0.2, x(:).*sqrt(-dc/mid)))));
+                    if mean(cand) > volfrac, lo = mid; else, hi = mid; end
+                end
+                x = reshape(cand, nely, nelx);
+                xPhys(:) = (H * x(:)) ./ Hs;
+            end
+            assert(c_hist(end) < c_hist(1) * 0.7 && c_hist(end) < c_hist(2));
+            assert(abs(mean(x(:)) - volfrac) < 2e-3);
+            assert(abs(mean(xPhys(:)) - volfrac) < 0.05);
+            res = c_hist(end);
+        end
+    "#;
+    let out = vm.eval_file(Some("mini_topopt.m"), fem_src, true).unwrap();
+    let final_c = out.last_value.unwrap().as_scalar().unwrap();
+    assert!(final_c > 0.0 && final_c.is_finite());
+}
