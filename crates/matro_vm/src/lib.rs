@@ -22,13 +22,14 @@ pub struct EvalOutput {
     pub last_value: Option<Value>,
 }
 
-/// Internal stack slot (regular value, fast unboxed scalar, `:` sentinel, or `c{:}` spread).
+/// Internal stack slot (regular value, fast unboxed scalar, `:` sentinel, `c{:}` spread, or void script result).
 #[derive(Debug, Clone)]
 enum StackItem {
     Val(Value),
     Scalar(f64),
     Colon,
     Spread(Vec<Value>),
+    Void,
 }
 
 impl StackItem {
@@ -63,6 +64,7 @@ impl StackItem {
                     Ok(vs.remove(0))
                 }
             }
+            Self::Void => Ok(Value::empty()),
         }
     }
 }
@@ -114,6 +116,7 @@ struct EndFrame {
 /// Fast indexed local frame for functions & closures (no HashMap per call!).
 struct LocalFrame<'a> {
     func_name: &'a str,
+    source_file: Option<&'a str>,
     slots: Vec<Option<Value>>,
     names: &'a [String],
     captures: Option<&'a BTreeMap<String, Value>>,
@@ -123,12 +126,14 @@ struct LocalFrame<'a> {
 impl<'a> LocalFrame<'a> {
     fn new(
         func_name: &'a str,
+        source_file: Option<&'a str>,
         names: &'a [String],
         captures: Option<&'a BTreeMap<String, Value>>,
         env_id: Option<usize>,
     ) -> Self {
         Self {
             func_name,
+            source_file,
             slots: vec![None; names.len()],
             names,
             captures,
@@ -244,6 +249,18 @@ enum TicMark {
     Steps(u64),
 }
 
+/// Compiled `.m` file metadata with file-scoped local subfunctions.
+#[derive(Debug, Clone)]
+struct LoadedFile {
+    path: String,
+    primary_name: String,
+    primary_func: Option<FunctionProto>,
+    primary_class: Option<ClassProto>,
+    local_funcs: HashMap<String, FunctionProto>,
+    is_script: bool,
+    chunk: Chunk,
+}
+
 /// Embeddable, pure-Rust MATLAB/Octave bytecode Virtual Machine.
 #[derive(Debug)]
 pub struct Vm {
@@ -251,6 +268,8 @@ pub struct Vm {
     persistents: HashMap<(String, String), Value>,
     functions: HashMap<String, FunctionProto>,
     classes: HashMap<String, ClassProto>,
+    loaded_files: HashMap<String, LoadedFile>,
+    active_file: Option<String>,
     handles: Vec<ObjectInstance>,
     listeners: HashMap<(usize, String), Vec<ClosureHandle>>,
     imports: Vec<String>,
@@ -280,6 +299,8 @@ impl Vm {
             persistents: HashMap::new(),
             functions: HashMap::new(),
             classes: HashMap::new(),
+            loaded_files: HashMap::new(),
+            active_file: None,
             handles: Vec::new(),
             listeners: HashMap::new(),
             imports: Vec::new(),
@@ -320,16 +341,37 @@ impl Vm {
         &mut self.loader
     }
 
+    fn invalidate_file(&mut self, path: &str) {
+        let key = matro_loader::MemoryVfs::normalize(path);
+        self.loaded_files.remove(&key);
+        self.functions
+            .retain(|_, f| f.source_file.as_deref() != Some(key.as_str()));
+        self.classes
+            .retain(|_, c| c.source_file.as_deref() != Some(key.as_str()));
+    }
+
     pub fn mount_file(&mut self, path: &str, content: &str) -> Result<()> {
+        self.invalidate_file(path);
         self.loader.mount_file(path, content)
     }
 
     pub fn mount_bytes(&mut self, path: &str, data: &[u8]) -> Result<()> {
+        self.invalidate_file(path);
         self.loader.mount_bytes(path, data)
     }
 
     pub fn add_path(&mut self, dir: &str) {
         self.loader.add_path(dir);
+    }
+
+    pub fn active_file(&self) -> Option<&str> {
+        self.active_file.as_deref()
+    }
+
+    pub fn set_active_file(&mut self, path: Option<&str>) {
+        self.active_file = path
+            .map(matro_loader::MemoryVfs::normalize)
+            .filter(|s| !s.is_empty());
     }
 
     pub fn globals(&self) -> &HashMap<String, Value> {
@@ -357,12 +399,15 @@ impl Vm {
         self.persistents.clear();
         self.functions.clear();
         self.classes.clear();
+        self.loaded_files.clear();
+        self.active_file = None;
         self.handles.clear();
         self.listeners.clear();
         self.imports.clear();
         self.closures.clear();
         self.envs.clear();
         self.figure.clear();
+        self.loader.reset_search_paths();
         self.loader.clear_cache();
         self.files.clear();
         self.tic_stack.clear();
@@ -424,6 +469,92 @@ impl Vm {
     pub fn eval(&mut self, source: &str) -> Result<EvalOutput> {
         let chunk = compile(source)?;
         self.execute_chunk(&chunk)
+    }
+
+    /// Compile and execute a `.m` file with full file-path context (sibling & `private/` resolution).
+    /// When `auto_invoke_zero_arg` is `true` and the file is a pure function file whose primary
+    /// function takes 0 parameters (e.g. `function r = main()`), it is automatically invoked.
+    pub fn eval_file(
+        &mut self,
+        path: Option<&str>,
+        source: &str,
+        auto_invoke_zero_arg: bool,
+    ) -> Result<EvalOutput> {
+        self.steps = 0;
+        let mut chunk = compile(source)?;
+        let norm_path = path
+            .map(matro_loader::MemoryVfs::normalize)
+            .filter(|s| !s.is_empty());
+        let file_key = norm_path
+            .clone()
+            .unwrap_or_else(|| "__editor_buffer__.m".to_string());
+        chunk.set_source_file(&file_key);
+        if let Some(ref np) = norm_path {
+            self.active_file = Some(np.clone());
+        } else {
+            self.active_file = Some(file_key.clone());
+        }
+
+        let mut stdout = String::new();
+        let mut last_value = None;
+
+        if chunk.is_definition_only() && !chunk.functions.is_empty() && chunk.classes.is_empty() {
+            let primary = chunk.functions[0].clone();
+            let stem = if norm_path.is_some() {
+                matro_loader::file_stem(&file_key)
+            } else {
+                primary.name.clone()
+            };
+            let mut local_funcs = HashMap::new();
+            if primary.name != stem {
+                local_funcs.insert(primary.name.clone(), primary.clone());
+            }
+            for sub in chunk.functions.iter().skip(1) {
+                local_funcs.insert(sub.name.clone(), sub.clone());
+            }
+            let lf = LoadedFile {
+                path: file_key.clone(),
+                primary_name: stem.clone(),
+                primary_func: Some(primary.clone()),
+                primary_class: None,
+                local_funcs,
+                is_script: false,
+                chunk,
+            };
+            self.loaded_files.insert(file_key, lf);
+            // Also register primary function so follow-up REPL calls work by name.
+            self.functions.insert(stem, primary.clone());
+            if auto_invoke_zero_arg && primary.params.is_empty() {
+                let want = if primary.returns.is_empty() { 0 } else { 1 };
+                let rets = self.call_user_func(&primary, &[], want, None, &mut stdout)?;
+                if let Some(v) = rets.into_iter().next() {
+                    last_value = Some(v.clone());
+                    self.globals.insert("ans".to_string(), v);
+                }
+            }
+            return Ok(EvalOutput { stdout, last_value });
+        }
+
+        // Script or classdef file: register any script-local functions scoped to `file_key`.
+        if !chunk.functions.is_empty() {
+            let mut local_funcs = HashMap::new();
+            for f in &chunk.functions {
+                local_funcs.insert(f.name.clone(), f.clone());
+            }
+            let lf = LoadedFile {
+                path: file_key.clone(),
+                primary_name: matro_loader::file_stem(&file_key),
+                primary_func: None,
+                primary_class: chunk.classes.first().cloned(),
+                local_funcs,
+                is_script: !chunk.is_definition_only(),
+                chunk: chunk.clone(),
+            };
+            self.loaded_files.insert(file_key, lf);
+        }
+
+        self.run_frame(&chunk, None, &mut stdout, &mut last_value)?;
+        Ok(EvalOutput { stdout, last_value })
     }
 
     /// Execute a precompiled bytecode `Chunk` at top-level scope.
@@ -631,64 +762,9 @@ impl Vm {
                 } else if name == "inputParser" {
                     let handle = self.new_input_parser();
                     stack.push(StackItem::Val(handle));
-                } else if let Some(res) = call_intrinsic(
-                    &name,
-                    &[],
-                    1,
-                    &mut IntrinsicContext {
-                        stdout,
-                        figure: &mut self.figure,
-                        rng: &mut self.rng,
-                        loader: &mut self.loader,
-                    },
-                ) {
-                    let vals = res?;
-                    stack.push(StackItem::Val(
-                        vals.into_iter().next().unwrap_or_else(Value::empty),
-                    ));
-                } else if let Some(func) = self.functions.get(&name).cloned() {
-                    let mut rets = self.call_user_func(&func, &[], 1, None, stdout)?;
-                    stack.push(StackItem::Val(rets.pop().unwrap_or_else(Value::empty)));
-                } else if let Some(cls) = self.classes.get(&name).cloned() {
-                    if self.class_has_static_or_enum_or_const(&name) {
-                        let mut f = BTreeMap::new();
-                        f.insert("__name".to_string(), Value::String(name));
-                        stack.push(StackItem::Val(Value::Object(ObjectInstance {
-                            class_name: "__class_ref".to_string(),
-                            fields: f,
-                        })));
-                    } else {
-                        let obj = self.instantiate_class(&cls, &[], stdout)?;
-                        stack.push(StackItem::Val(obj));
-                    }
-                } else if self.try_autoload_symbol(&name, stdout)? {
-                    if let Some(func) = self.functions.get(&name).cloned() {
-                        let mut rets = self.call_user_func(&func, &[], 1, None, stdout)?;
-                        stack.push(StackItem::Val(rets.pop().unwrap_or_else(Value::empty)));
-                    } else if let Some(cls) = self.classes.get(&name).cloned() {
-                        if self.class_has_static_or_enum_or_const(&name) {
-                            let mut f = BTreeMap::new();
-                            f.insert("__name".to_string(), Value::String(name));
-                            stack.push(StackItem::Val(Value::Object(ObjectInstance {
-                                class_name: "__class_ref".to_string(),
-                                fields: f,
-                            })));
-                        } else {
-                            let obj = self.instantiate_class(&cls, &[], stdout)?;
-                            stack.push(StackItem::Val(obj));
-                        }
-                    } else {
-                        return Err(MatroError::undefined(name));
-                    }
-                } else if self.loader.has_package(&name) {
-                    let mut f = BTreeMap::new();
-                    f.insert("__path".to_string(), Value::String(name));
-                    stack.push(StackItem::Val(Value::Object(ObjectInstance {
-                        class_name: "__pkg_ref".to_string(),
-                        fields: f,
-                    })));
                 } else {
-                    return Err(MatroError::undefined(name));
+                    let item = self.resolve_bare_ident(&name, frame.as_deref_mut(), stdout)?;
+                    stack.push(item);
                 }
             }
             OpCode::StoreVar(idx) => {
@@ -725,6 +801,10 @@ impl Vm {
                 format_assignment(stdout, name, &val);
             }
             OpCode::PrintAns => {
+                if matches!(stack.last(), Some(StackItem::Void)) {
+                    stack.pop();
+                    return Ok(true);
+                }
                 let val = pop_val(stack)?;
                 *last_value = Some(val.clone());
                 store_var(
@@ -1317,7 +1397,14 @@ impl Vm {
                     _ => None,
                 };
                 if let Some(cname) = class_name {
-                    if let Some(proto) = self.find_class_method(&cname, &method_name) {
+                    let caller_dir = frame
+                        .as_deref()
+                        .and_then(|f| f.source_file)
+                        .or(self.active_file.as_deref())
+                        .map(matro_loader::parent_dir);
+                    if let Some(proto) =
+                        self.resolve_class_method(&cname, &method_name, caller_dir.as_deref())?
+                    {
                         let expanded = flatten_call_args(raw_args)?;
                         let call_args = if self.is_static_method(&cname, &method_name) {
                             expanded
@@ -1775,11 +1862,27 @@ impl Vm {
                 f.set(slot, updated);
             }
             OpCode::DefineFunc(idx) => {
-                let proto = chunk.functions[idx as usize].clone();
-                self.functions.insert(proto.name.clone(), proto);
+                let mut proto = chunk.functions[idx as usize].clone();
+                if proto.source_file.is_none() {
+                    proto.source_file = self.active_file.clone();
+                }
+                let scoped_to_file = proto
+                    .source_file
+                    .as_deref()
+                    .is_some_and(|sf| self.loaded_files.contains_key(sf));
+                if !scoped_to_file {
+                    self.functions.insert(proto.name.clone(), proto);
+                }
             }
             OpCode::DefineNestedFunc { func_idx, slot } => {
-                let proto = chunk.functions[func_idx as usize].clone();
+                let mut proto = chunk.functions[func_idx as usize].clone();
+                if proto.source_file.is_none() {
+                    proto.source_file = frame
+                        .as_deref()
+                        .and_then(|f| f.source_file)
+                        .map(String::from)
+                        .or_else(|| self.active_file.clone());
+                }
                 let params = proto.params.clone();
                 let id = self.closures.len();
                 self.closures.push(proto);
@@ -1796,11 +1899,24 @@ impl Vm {
                 }
             }
             OpCode::DefineClass(idx) => {
-                let cls = chunk.classes[idx as usize].clone();
+                let mut cls = chunk.classes[idx as usize].clone();
+                if cls.source_file.is_none() {
+                    cls.source_file = self.active_file.clone();
+                }
+                let caller_dir = cls.source_file.as_deref().map(matro_loader::parent_dir);
+                let supers = cls.superclasses.clone();
                 self.classes.insert(cls.name.clone(), cls);
+                self.ensure_superclasses_loaded(&supers, caller_dir.as_deref())?;
             }
             OpCode::MakeClosure(idx) => {
-                let proto = chunk.functions[idx as usize].clone();
+                let mut proto = chunk.functions[idx as usize].clone();
+                if proto.source_file.is_none() {
+                    proto.source_file = frame
+                        .as_deref()
+                        .and_then(|f| f.source_file)
+                        .map(String::from)
+                        .or_else(|| self.active_file.clone());
+                }
                 let params = proto.params.clone();
                 let id = self.closures.len();
                 self.closures.push(proto);
@@ -2542,6 +2658,77 @@ impl Vm {
         None
     }
 
+    fn resolve_class_method(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        caller_dir: Option<&str>,
+    ) -> Result<Option<FunctionProto>> {
+        if let Some(m) = self.find_class_method(class_name, method_name) {
+            return Ok(Some(m));
+        }
+        for anc in self.all_ancestors(class_name) {
+            let class_dir = self
+                .classes
+                .get(&anc)
+                .and_then(|c| c.source_file.as_deref())
+                .map(|sf| {
+                    let p = matro_loader::parent_dir(sf);
+                    // If `sf` is `@ClassName/ClassName.m`, its parent is `@ClassName`; go one level up for sibling `@ClassName/` probes.
+                    if p.ends_with(&format!("@{anc}")) {
+                        matro_loader::parent_dir(&p)
+                    } else {
+                        p
+                    }
+                });
+            let probe_dir = class_dir.as_deref().or(caller_dir);
+            if let Some(mpath) = self
+                .loader
+                .resolve_class_method_file(&anc, method_name, probe_dir)
+            {
+                if let Some(lf) = self.load_file(&mpath)? {
+                    if let Some(func) = lf.primary_func {
+                        return Ok(Some(func));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn ensure_superclasses_loaded(
+        &mut self,
+        superclasses: &[String],
+        caller_dir: Option<&str>,
+    ) -> Result<()> {
+        for sup in superclasses {
+            if sup == "handle" || self.classes.contains_key(sup) {
+                continue;
+            }
+            if let Some(m) = self.loader.resolve_in_context(sup, caller_dir) {
+                let _ = self.load_file(&m.path)?;
+            } else {
+                let imports = self.imports.clone();
+                for imp in imports {
+                    if let Some(pkg) = imp.strip_suffix(".*") {
+                        if let Some(mpath) = self.loader.resolve_package_member(pkg, sup) {
+                            let _ = self.load_file(&mpath)?;
+                            break;
+                        }
+                    } else if let Some((pkg, member)) = imp.rsplit_once('.') {
+                        if member == sup {
+                            if let Some(mpath) = self.loader.resolve_package_member(pkg, sup) {
+                                let _ = self.load_file(&mpath)?;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn collect_class_hierarchy(&self, class_name: &str) -> Vec<ClassProto> {
         let mut chain = Vec::new();
         for anc in self.all_ancestors(class_name) {
@@ -2601,7 +2788,13 @@ impl Vm {
             }
             ctor_args.extend_from_slice(args);
 
-            let mut f = LocalFrame::new(&ctor.name, &ctor.local_names, None, None);
+            let mut f = LocalFrame::new(
+                &ctor.name,
+                ctor.source_file.as_deref(),
+                &ctor.local_names,
+                None,
+                None,
+            );
             if let Some(&ret_slot) = ctor.return_slots.first() {
                 f.set(ret_slot, obj);
             }
@@ -2655,6 +2848,235 @@ impl Vm {
         }
     }
 
+    /// Load and index a `.m` file by normalized VFS path, keeping its local subfunctions strictly file-scoped.
+    #[inline(never)]
+    fn load_file(&mut self, resolved_path: &str) -> Result<Option<LoadedFile>> {
+        let key = matro_loader::MemoryVfs::normalize(resolved_path);
+        if let Some(lf) = self.loaded_files.get(&key) {
+            return Ok(Some(lf.clone()));
+        }
+        let Some(chunk) = self.loader.load_module_at(&key)? else {
+            return Ok(None);
+        };
+        let dir = matro_loader::parent_dir(&key);
+        let stem = matro_loader::file_stem(&key);
+
+        let lf = if chunk.is_definition_only() && !chunk.classes.is_empty() {
+            let cls = chunk.classes[0].clone();
+            let supers = cls.superclasses.clone();
+            let mut local_funcs = HashMap::new();
+            for f in &chunk.functions {
+                local_funcs.insert(f.name.clone(), f.clone());
+            }
+            self.classes.insert(cls.name.clone(), cls.clone());
+            let lf = LoadedFile {
+                path: key.clone(),
+                primary_name: cls.name.clone(),
+                primary_func: None,
+                primary_class: Some(cls),
+                local_funcs,
+                is_script: false,
+                chunk,
+            };
+            self.loaded_files.insert(key, lf.clone());
+            self.ensure_superclasses_loaded(&supers, Some(&dir))?;
+            lf
+        } else if chunk.is_definition_only() && !chunk.functions.is_empty() {
+            let primary = chunk.functions[0].clone();
+            let mut local_funcs = HashMap::new();
+            if primary.name != stem {
+                local_funcs.insert(primary.name.clone(), primary.clone());
+            }
+            for sub in chunk.functions.iter().skip(1) {
+                local_funcs.insert(sub.name.clone(), sub.clone());
+            }
+            let lf = LoadedFile {
+                path: key.clone(),
+                primary_name: stem,
+                primary_func: Some(primary),
+                primary_class: None,
+                local_funcs,
+                is_script: false,
+                chunk,
+            };
+            self.loaded_files.insert(key, lf.clone());
+            lf
+        } else {
+            // Script file (possibly with local functions at the bottom)
+            let mut local_funcs = HashMap::new();
+            for f in &chunk.functions {
+                local_funcs.insert(f.name.clone(), f.clone());
+            }
+            let lf = LoadedFile {
+                path: key.clone(),
+                primary_name: stem,
+                primary_func: None,
+                primary_class: None,
+                local_funcs,
+                is_script: true,
+                chunk,
+            };
+            self.loaded_files.insert(key, lf.clone());
+            lf
+        };
+        Ok(Some(lf))
+    }
+
+    fn resolve_imported_file(&mut self, name: &str) -> Result<Option<LoadedFile>> {
+        let imports = self.imports.clone();
+        for imp in imports {
+            if let Some(pkg) = imp.strip_suffix(".*") {
+                if let Some(mpath) = self.loader.resolve_package_member(pkg, name) {
+                    if let Some(lf) = self.load_file(&mpath)? {
+                        return Ok(Some(lf));
+                    }
+                }
+            } else if let Some((pkg, member)) = imp.rsplit_once('.') {
+                if member == name {
+                    if let Some(mpath) = self.loader.resolve_package_member(pkg, name) {
+                        if let Some(lf) = self.load_file(&mpath)? {
+                            return Ok(Some(lf));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn exec_script_file(
+        &mut self,
+        lf: &LoadedFile,
+        frame: Option<&mut LocalFrame<'_>>,
+        stdout: &mut String,
+    ) -> Result<()> {
+        let prev_active = self.active_file.replace(lf.path.clone());
+        let mut ignored = None;
+        let res = self.run_frame(&lf.chunk, frame, stdout, &mut ignored);
+        self.active_file = prev_active;
+        res
+    }
+
+    #[inline(never)]
+    fn resolve_bare_ident(
+        &mut self,
+        name: &str,
+        mut frame: Option<&mut LocalFrame<'_>>,
+        stdout: &mut String,
+    ) -> Result<StackItem> {
+        let caller_file: Option<String> = frame
+            .as_deref()
+            .and_then(|f| f.source_file)
+            .map(String::from)
+            .or_else(|| self.active_file.clone());
+        let caller_dir = caller_file.as_deref().map(matro_loader::parent_dir);
+
+        // 1. File-local subfunction in caller's file
+        if let Some(ref cf) = caller_file {
+            if let Some(lf) = self.loaded_files.get(cf) {
+                if let Some(func) = lf.local_funcs.get(name).cloned() {
+                    let mut rets = self.call_user_func(&func, &[], 1, None, stdout)?;
+                    return Ok(StackItem::Val(rets.pop().unwrap_or_else(Value::empty)));
+                }
+                if lf.primary_name == name {
+                    if let Some(func) = lf.primary_func.clone() {
+                        let mut rets = self.call_user_func(&func, &[], 1, None, stdout)?;
+                        return Ok(StackItem::Val(rets.pop().unwrap_or_else(Value::empty)));
+                    }
+                }
+            }
+        }
+
+        // 2. Private function in caller directory's `private/` folder
+        if let Some(cd) = caller_dir.as_deref() {
+            if let Some(pm) = self.loader.resolve_private(name, cd) {
+                if let Some(lf) = self.load_file(&pm.path)? {
+                    if let Some(func) = lf.primary_func {
+                        let mut rets = self.call_user_func(&func, &[], 1, None, stdout)?;
+                        return Ok(StackItem::Val(rets.pop().unwrap_or_else(Value::empty)));
+                    }
+                }
+            }
+        }
+
+        // 3. Inline workspace functions / classes
+        if let Some(func) = self.functions.get(name).cloned() {
+            let mut rets = self.call_user_func(&func, &[], 1, None, stdout)?;
+            return Ok(StackItem::Val(rets.pop().unwrap_or_else(Value::empty)));
+        }
+        if let Some(cls) = self.classes.get(name).cloned() {
+            if self.class_has_static_or_enum_or_const(name) {
+                let mut f = BTreeMap::new();
+                f.insert("__name".to_string(), Value::String(name.to_string()));
+                return Ok(StackItem::Val(Value::Object(ObjectInstance {
+                    class_name: "__class_ref".to_string(),
+                    fields: f,
+                })));
+            }
+            let obj = self.instantiate_class(&cls, &[], stdout)?;
+            return Ok(StackItem::Val(obj));
+        }
+
+        // 4. External `.m` file (sibling / cwd / search_paths / @Class / imported +package)
+        let resolved_lf = if let Some(m) = self.loader.resolve_in_context(name, caller_dir.as_deref()) {
+            self.load_file(&m.path)?
+        } else {
+            self.resolve_imported_file(name)?
+        };
+        if let Some(lf) = resolved_lf {
+            if let Some(func) = lf.primary_func {
+                let mut rets = self.call_user_func(&func, &[], 1, None, stdout)?;
+                return Ok(StackItem::Val(rets.pop().unwrap_or_else(Value::empty)));
+            }
+            if let Some(cls) = lf.primary_class {
+                if self.class_has_static_or_enum_or_const(&cls.name) {
+                    let mut f = BTreeMap::new();
+                    f.insert("__name".to_string(), Value::String(cls.name));
+                    return Ok(StackItem::Val(Value::Object(ObjectInstance {
+                        class_name: "__class_ref".to_string(),
+                        fields: f,
+                    })));
+                }
+                let obj = self.instantiate_class(&cls, &[], stdout)?;
+                return Ok(StackItem::Val(obj));
+            }
+            if lf.is_script {
+                self.exec_script_file(&lf, frame.as_deref_mut(), stdout)?;
+                return Ok(StackItem::Void);
+            }
+        }
+
+        // 5. Built-in 0-arg intrinsics (pi, eps, i, j, inf, nan, true, false, ans, pwd, ...)
+        if let Some(res) = call_intrinsic(
+            name,
+            &[],
+            1,
+            &mut IntrinsicContext {
+                stdout,
+                figure: &mut self.figure,
+                rng: &mut self.rng,
+                loader: &mut self.loader,
+            },
+        ) {
+            let vals = res?;
+            return Ok(StackItem::Val(
+                vals.into_iter().next().unwrap_or_else(Value::empty),
+            ));
+        }
+
+        // 6. MATLAB `+package` namespace root
+        if self.loader.has_package(name) {
+            let mut f = BTreeMap::new();
+            f.insert("__path".to_string(), Value::String(name.to_string()));
+            return Ok(StackItem::Val(Value::Object(ObjectInstance {
+                class_name: "__pkg_ref".to_string(),
+                fields: f,
+            })));
+        }
+
+        Err(MatroError::undefined(name))
+    }
+
     #[inline(never)]
     fn resolve_pkg_field(
         &mut self,
@@ -2672,15 +3094,13 @@ impl Vm {
             })));
         }
         if let Some(mpath) = self.loader.resolve_package_member(pkg_path, field) {
-            let Some(chunk) = self.loader.load_module(&mpath)? else {
+            let Some(lf) = self.load_file(&mpath)? else {
                 return Ok(None);
             };
-            let mut ignored = None;
-            self.run_frame(&chunk, None, stdout, &mut ignored)?;
-            if let Some(cls) = self.classes.get(field).cloned() {
-                if self.class_has_static_or_enum_or_const(field) {
+            if let Some(cls) = lf.primary_class {
+                if self.class_has_static_or_enum_or_const(&cls.name) {
                     let mut f = BTreeMap::new();
-                    f.insert("__name".to_string(), Value::String(field.to_string()));
+                    f.insert("__name".to_string(), Value::String(cls.name));
                     return Ok(Some(Value::Object(ObjectInstance {
                         class_name: "__class_ref".to_string(),
                         fields: f,
@@ -2688,7 +3108,7 @@ impl Vm {
                 }
                 return Ok(Some(self.instantiate_class(&cls, &[], stdout)?));
             }
-            if let Some(func) = self.functions.get(field).cloned() {
+            if let Some(func) = lf.primary_func {
                 let rets = self.call_user_func(&func, &[], 1, None, stdout)?;
                 return Ok(Some(rets.into_iter().next().unwrap_or_else(Value::empty)));
             }
@@ -2710,60 +3130,20 @@ impl Vm {
                 "Unable to resolve package member '{pkg_path}.{member}'"
             )));
         };
-        let Some(chunk) = self.loader.load_module(&mpath)? else {
+        let Some(lf) = self.load_file(&mpath)? else {
             return Err(MatroError::runtime(format!(
                 "Unable to load package member '{pkg_path}.{member}'"
             )));
         };
-        let mut ignored = None;
-        self.run_frame(&chunk, None, stdout, &mut ignored)?;
-        if let Some(func) = self.functions.get(member).cloned() {
+        if let Some(func) = lf.primary_func {
             return self.call_user_func(&func, args, nargout, None, stdout);
         }
-        if let Some(cls) = self.classes.get(member).cloned() {
+        if let Some(cls) = lf.primary_class {
             return Ok(vec![self.instantiate_class(&cls, args, stdout)?]);
         }
         Err(MatroError::runtime(format!(
             "Package file '{mpath}' did not define function or class '{member}'"
         )))
-    }
-
-    fn try_autoload_symbol(&mut self, name: &str, stdout: &mut String) -> Result<bool> {
-        if let Some(mod_chunk) = self.loader.load_module(name)? {
-            let mut ignored = None;
-            self.run_frame(&mod_chunk, None, stdout, &mut ignored)?;
-            if self.functions.contains_key(name) || self.classes.contains_key(name) {
-                return Ok(true);
-            }
-        }
-        // Check MATLAB `import pkg.*` and `import pkg.member` statements
-        let imports = self.imports.clone();
-        for imp in imports {
-            if let Some(pkg) = imp.strip_suffix(".*") {
-                if let Some(mpath) = self.loader.resolve_package_member(pkg, name) {
-                    if let Some(mod_chunk) = self.loader.load_module(&mpath)? {
-                        let mut ignored = None;
-                        self.run_frame(&mod_chunk, None, stdout, &mut ignored)?;
-                        if self.functions.contains_key(name) || self.classes.contains_key(name) {
-                            return Ok(true);
-                        }
-                    }
-                }
-            } else if let Some((pkg, member)) = imp.rsplit_once('.') {
-                if member == name {
-                    if let Some(mpath) = self.loader.resolve_package_member(pkg, name) {
-                        if let Some(mod_chunk) = self.loader.load_module(&mpath)? {
-                            let mut ignored = None;
-                            self.run_frame(&mod_chunk, None, stdout, &mut ignored)?;
-                            if self.functions.contains_key(name) || self.classes.contains_key(name) {
-                                return Ok(true);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(false)
     }
 
     fn do_tic(&mut self) {
@@ -2791,7 +3171,19 @@ impl Vm {
         name: &str,
         call_args: &[Value],
         nargout: usize,
+        frame: Option<&mut LocalFrame<'_>>,
+        stdout: &mut String,
+    ) -> Result<Vec<Value>> {
+        self.invoke_named_callable_in_file(name, call_args, nargout, frame, None, stdout)
+    }
+
+    fn invoke_named_callable_in_file(
+        &mut self,
+        name: &str,
+        call_args: &[Value],
+        nargout: usize,
         mut frame: Option<&mut LocalFrame<'_>>,
+        explicit_source_file: Option<&str>,
         stdout: &mut String,
     ) -> Result<Vec<Value>> {
         match name {
@@ -3465,24 +3857,105 @@ impl Vm {
                     return Err(MatroError::arity("run", "1", call_args.len()));
                 }
                 let path = call_args[0].as_str()?;
-                let Some(script_chunk) = self.loader.load_module(path)? else {
+                let caller_dir = explicit_source_file
+                    .or_else(|| frame.as_deref().and_then(|f| f.source_file))
+                    .or(self.active_file.as_deref())
+                    .map(matro_loader::parent_dir);
+                let resolved = self
+                    .loader
+                    .resolve_in_context(path, caller_dir.as_deref())
+                    .map(|m| m.path)
+                    .or_else(|| self.loader.resolve_path(path))
+                    .ok_or_else(|| MatroError::runtime(format!("Script not found: '{path}'")))?;
+                let Some(lf) = self.load_file(&resolved)? else {
                     return Err(MatroError::runtime(format!("Script not found: '{path}'")));
                 };
-                let mut ignored = None;
-                self.run_frame(&script_chunk, frame.as_deref_mut(), stdout, &mut ignored)?;
+                if lf.is_script {
+                    self.exec_script_file(&lf, frame.as_deref_mut(), stdout)?;
+                } else if let Some(func) = lf.primary_func {
+                    if func.params.is_empty() {
+                        let _ = self.call_user_func(&func, &[], 0, None, stdout)?;
+                    } else {
+                        return Err(MatroError::runtime(format!(
+                            "Cannot run function '{}' without input arguments",
+                            lf.primary_name
+                        )));
+                    }
+                }
                 return Ok(vec![]);
+            }
+            "which" => {
+                if call_args.is_empty() {
+                    return Err(MatroError::arity("which", "1", 0));
+                }
+                let q = call_args[0].as_str()?;
+                let caller_file: Option<String> = explicit_source_file
+                    .map(String::from)
+                    .or_else(|| {
+                        frame
+                            .as_deref()
+                            .and_then(|f| f.source_file)
+                            .map(String::from)
+                    })
+                    .or_else(|| self.active_file.clone());
+                let caller_dir = caller_file.as_deref().map(matro_loader::parent_dir);
+
+                let found = if lookup_var(q, frame.as_deref(), &self.globals).is_some() {
+                    "variable".to_string()
+                } else if caller_file.as_deref().is_some_and(|cf| {
+                    self.loaded_files
+                        .get(cf)
+                        .is_some_and(|lf| lf.local_funcs.contains_key(q))
+                }) {
+                    format!("{} (local function)", caller_file.as_deref().unwrap_or(""))
+                } else if let Some(m) = self.loader.resolve_in_context(q, caller_dir.as_deref()) {
+                    m.path
+                } else if let Some(lf) = self.resolve_imported_file(q)? {
+                    lf.path
+                } else if self.functions.contains_key(q) {
+                    format!("{q} (workspace function)")
+                } else if self.classes.contains_key(q) {
+                    format!("{q} (workspace class)")
+                } else {
+                    String::new()
+                };
+                return Ok(vec![Value::String(found)]);
             }
             "exist" => {
                 if call_args.is_empty() {
                     return Err(MatroError::arity("exist", "1", 0));
                 }
                 let q = call_args[0].as_str()?;
+                let caller_file: Option<String> = explicit_source_file
+                    .map(String::from)
+                    .or_else(|| {
+                        frame
+                            .as_deref()
+                            .and_then(|f| f.source_file)
+                            .map(String::from)
+                    })
+                    .or_else(|| self.active_file.clone());
+                let caller_dir = caller_file.as_deref().map(matro_loader::parent_dir);
+
                 let code = if lookup_var(q, frame.as_deref(), &self.globals).is_some() {
                     1.0
                 } else if self.classes.contains_key(q) {
                     8.0
-                } else if self.functions.contains_key(q) || self.loader.resolve_path(q).is_some() {
+                } else if self.functions.contains_key(q)
+                    || caller_file.as_deref().is_some_and(|cf| {
+                        self.loaded_files
+                            .get(cf)
+                            .is_some_and(|lf| lf.local_funcs.contains_key(q))
+                    })
+                    || self
+                        .loader
+                        .resolve_in_context(q, caller_dir.as_deref())
+                        .is_some()
+                    || self.loader.resolve_path(q).is_some()
+                {
                     2.0
+                } else if self.loader.vfs().is_dir(q) {
+                    7.0
                 } else {
                     0.0
                 };
@@ -3491,7 +3964,18 @@ impl Vm {
             _ => {}
         }
 
-        // Method dispatch when first argument is a `classdef` Object or Handle (MATLAB syntax `method(obj, ...)`)
+        let caller_file: Option<String> = explicit_source_file
+            .map(String::from)
+            .or_else(|| {
+                frame
+                    .as_deref()
+                    .and_then(|f| f.source_file)
+                    .map(String::from)
+            })
+            .or_else(|| self.active_file.clone());
+        let caller_dir = caller_file.as_deref().map(matro_loader::parent_dir);
+
+        // 1. Method dispatch when first argument is a `classdef` Object or Handle (MATLAB syntax `method(obj, ...)`)
         if let Some(Value::Handle(h)) = call_args.first() {
             if h.class_name == "inputParser" {
                 return self.call_input_parser_method(h.id, name, &call_args[1..]);
@@ -3503,16 +3987,68 @@ impl Vm {
             _ => None,
         };
         if let Some(cname) = first_class {
-            if let Some(proto) = self.find_class_method(&cname, name) {
+            if let Some(proto) =
+                self.resolve_class_method(&cname, name, caller_dir.as_deref())?
+            {
                 return self.call_user_func(&proto, call_args, nargout, None, stdout);
             }
         }
 
+        // 2. File-local subfunction (or primary self-recursion) in caller's `.m` file
+        if let Some(ref cf) = caller_file {
+            if let Some(lf) = self.loaded_files.get(cf) {
+                if let Some(func) = lf.local_funcs.get(name).cloned() {
+                    return self.call_user_func(&func, call_args, nargout, None, stdout);
+                }
+                if lf.primary_name == name {
+                    if let Some(func) = lf.primary_func.clone() {
+                        return self.call_user_func(&func, call_args, nargout, None, stdout);
+                    }
+                }
+            }
+        }
+
+        // 3. Private function in `<caller_dir>/private/<name>.m`
+        if let Some(cd) = caller_dir.as_deref() {
+            if let Some(pm) = self.loader.resolve_private(name, cd) {
+                if let Some(lf) = self.load_file(&pm.path)? {
+                    if let Some(func) = lf.primary_func {
+                        return self.call_user_func(&func, call_args, nargout, None, stdout);
+                    }
+                }
+            }
+        }
+
+        // 4. Inline workspace functions / classes
         if let Some(func) = self.functions.get(name).cloned() {
-            self.call_user_func(&func, call_args, nargout, None, stdout)
-        } else if let Some(cls) = self.classes.get(name).cloned() {
-            Ok(vec![self.instantiate_class(&cls, call_args, stdout)?])
-        } else if let Some(res) = call_intrinsic(
+            return self.call_user_func(&func, call_args, nargout, None, stdout);
+        }
+        if let Some(cls) = self.classes.get(name).cloned() {
+            return Ok(vec![self.instantiate_class(&cls, call_args, stdout)?]);
+        }
+
+        // 5. External `.m` file (sibling dir -> cwd -> search_paths -> @ClassName -> imported +package)
+        let resolved_lf =
+            if let Some(m) = self.loader.resolve_in_context(name, caller_dir.as_deref()) {
+                self.load_file(&m.path)?
+            } else {
+                self.resolve_imported_file(name)?
+            };
+        if let Some(lf) = resolved_lf {
+            if let Some(func) = lf.primary_func {
+                return self.call_user_func(&func, call_args, nargout, None, stdout);
+            }
+            if let Some(cls) = lf.primary_class {
+                return Ok(vec![self.instantiate_class(&cls, call_args, stdout)?]);
+            }
+            if lf.is_script && call_args.is_empty() {
+                self.exec_script_file(&lf, frame.as_deref_mut(), stdout)?;
+                return Ok(vec![]);
+            }
+        }
+
+        // 6. Built-in intrinsics
+        if let Some(res) = call_intrinsic(
             name,
             call_args,
             nargout,
@@ -3524,14 +4060,6 @@ impl Vm {
             },
         ) {
             res
-        } else if self.try_autoload_symbol(name, stdout)? {
-            if let Some(func) = self.functions.get(name).cloned() {
-                self.call_user_func(&func, call_args, nargout, None, stdout)
-            } else if let Some(cls) = self.classes.get(name).cloned() {
-                Ok(vec![self.instantiate_class(&cls, call_args, stdout)?])
-            } else {
-                Err(MatroError::undefined(name))
-            }
         } else {
             Err(MatroError::undefined(name))
         }
@@ -3727,7 +4255,14 @@ impl Vm {
                     return self.call_closure(&inner, args, nargout, stdout);
                 }
             }
-            return self.invoke_named_callable(target_name, args, nargout, None, stdout);
+            return self.invoke_named_callable_in_file(
+                target_name,
+                args,
+                nargout,
+                None,
+                proto.source_file.as_deref(),
+                stdout,
+            );
         }
         let env_id = cl.env_id.or_else(|| {
             if proto.has_nested {
@@ -3738,7 +4273,13 @@ impl Vm {
                 None
             }
         });
-        let frame = LocalFrame::new(&proto.name, &proto.local_names, Some(&cl.captures), env_id);
+        let frame = LocalFrame::new(
+            &proto.name,
+            proto.source_file.as_deref(),
+            &proto.local_names,
+            Some(&cl.captures),
+            env_id,
+        );
         self.exec_user_func_with_frame(&proto, args, nargout, frame, stdout)
     }
 
@@ -3757,7 +4298,13 @@ impl Vm {
         } else {
             None
         };
-        let frame = LocalFrame::new(&proto.name, &proto.local_names, captures, env_id);
+        let frame = LocalFrame::new(
+            &proto.name,
+            proto.source_file.as_deref(),
+            &proto.local_names,
+            captures,
+            env_id,
+        );
         self.exec_user_func_with_frame(proto, args, nargout, frame, stdout)
     }
 
@@ -4225,6 +4772,7 @@ fn flatten_call_args(raw_args: Vec<StackItem>) -> Result<Vec<Value>> {
             StackItem::Val(v) => out.push(v),
             StackItem::Scalar(x) => out.push(Value::scalar(x)),
             StackItem::Spread(vs) => out.extend(vs),
+            StackItem::Void => out.push(Value::empty()),
             StackItem::Colon => {
                 return Err(MatroError::runtime("Unexpected ':' outside indexing"));
             }
@@ -4271,6 +4819,7 @@ fn resolve_indices(item: &StackItem, max_len: usize) -> Result<Vec<usize>> {
             })?;
             resolve_indices(&StackItem::Val(first.clone()), max_len)
         }
+        StackItem::Void => Ok(Vec::new()),
         StackItem::Val(v) => {
             let m = v.as_matrix()?;
             if m.is_logical() {
@@ -4575,6 +5124,7 @@ fn assign_matrix_index(m: &mut Matrix, args: &[StackItem], rhs: &Matrix) -> Resu
                         "Comma-separated list cannot be used as assignment index",
                     ));
                 }
+                StackItem::Void => Vec::new(),
                 StackItem::Val(v) => {
                     let idx_m = v.as_matrix()?;
                     if idx_m.is_logical() {
@@ -4634,6 +5184,7 @@ fn assign_matrix_index(m: &mut Matrix, args: &[StackItem], rhs: &Matrix) -> Resu
                     StackItem::Spread(_) => Err(MatroError::index(
                         "Comma-separated list cannot be used as assignment index",
                     )),
+                    StackItem::Void => Ok(Vec::new()),
                     StackItem::Val(v) => {
                         let idx_m = v.as_matrix()?;
                         if idx_m.is_logical() {
@@ -4715,6 +5266,7 @@ fn assign_matrix_index(m: &mut Matrix, args: &[StackItem], rhs: &Matrix) -> Resu
                             "Comma-separated list cannot be used as assignment index",
                         ));
                     }
+                    StackItem::Void => Vec::new(),
                     StackItem::Val(v) => v
                         .as_matrix()?
                         .data()

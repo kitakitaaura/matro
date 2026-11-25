@@ -639,3 +639,263 @@ fn core_end_keyword_universal_indexing() {
         "expected indexing error, got: {runtime_err}"
     );
 }
+
+#[test]
+fn core_multifile_function_resolution() {
+    let mut vm = Vm::new();
+
+    // 1. Two files with colliding file-local helper names + function handle to file-local helper
+    vm.mount_file(
+        "fileA.m",
+        r#"
+        function [y, fh] = fileA(x)
+            y = helper(x);
+            fh = @helper;
+        end
+        function z = helper(v)
+            z = v + 1;
+        end
+        "#,
+    )
+    .unwrap();
+    vm.mount_file(
+        "fileB.m",
+        r#"
+        function y = fileB(x)
+            y = helper(x);
+        end
+        function z = helper(v)
+            z = v * 10;
+        end
+        "#,
+    )
+    .unwrap();
+
+    // 2. Private directory scoping (`pkg_dir/private/secret_val.m`)
+    vm.mount_file(
+        "pkg_dir/pub_fn.m",
+        r#"
+        function y = pub_fn(x)
+            y = x + secret_val();
+        end
+        "#,
+    )
+    .unwrap();
+    vm.mount_file(
+        "pkg_dir/private/secret_val.m",
+        r#"
+        function k = secret_val()
+            k = 42;
+        end
+        "#,
+    )
+    .unwrap();
+    vm.mount_file(
+        "other_dir/try_priv.m",
+        r#"
+        function y = try_priv()
+            y = secret_val();
+        end
+        "#,
+    )
+    .unwrap();
+
+    // 3. Filename stem overrides internal header name (with recursion via internal name)
+    vm.mount_file(
+        "renamed_fact.m",
+        r#"
+        function y = internal_name(n)
+            if n <= 1
+                y = 1;
+            else
+                y = n * internal_name(n - 1);
+            end
+        end
+        "#,
+    )
+    .unwrap();
+
+    // 4. Bare script file mutating caller's workspace
+    vm.mount_file(
+        "setup_vars.m",
+        r#"
+        alpha = 11;
+        beta = alpha * 3;
+        "#,
+    )
+    .unwrap();
+
+    // 5. Cross-file classdef inheritance + @ClassName folder with separate method file
+    vm.mount_file(
+        "oop_lib/BaseItem.m",
+        r#"
+        classdef BaseItem
+            properties
+                Val = 0
+            end
+            methods
+                function obj = BaseItem(v)
+                    if nargin >= 1, obj.Val = v; end
+                end
+                function y = baseVal(obj)
+                    y = obj.Val;
+                end
+            end
+        end
+        "#,
+    )
+    .unwrap();
+    vm.mount_file(
+        "oop_lib/ChildItem.m",
+        r#"
+        classdef ChildItem < BaseItem
+            methods
+                function obj = ChildItem(v)
+                    obj.Val = v * 2;
+                end
+            end
+        end
+        "#,
+    )
+    .unwrap();
+    vm.mount_file(
+        "oop_lib/@BoxVal/BoxVal.m",
+        r#"
+        classdef BoxVal
+            properties
+                N = 0
+            end
+            methods
+                function obj = BoxVal(n)
+                    if nargin >= 1, obj.N = n; end
+                end
+            end
+        end
+        "#,
+    )
+    .unwrap();
+    vm.mount_file(
+        "oop_lib/@BoxVal/addN.m",
+        r#"
+        function y = addN(obj, k)
+            y = obj.N + k;
+        end
+        "#,
+    )
+    .unwrap();
+
+    // 6. Path precedence + genpath / rmpath
+    vm.mount_file("p1/shadow.m", "function y = shadow(); y = 1; end\n").unwrap();
+    vm.mount_file("p2/shadow.m", "function y = shadow(); y = 2; end\n").unwrap();
+    vm.mount_file("tree/sub/deep_fn.m", "function y = deep_fn(x); y = x + 7; end\n")
+        .unwrap();
+    vm.mount_file("tree/private/hidden_fn.m", "function y = hidden_fn(); y = 9; end\n")
+        .unwrap();
+
+    vm.eval(
+        r#"
+        % File-local helper isolation + handle capture of file-local helper
+        [a1, fhA] = fileA(5);
+        b1 = fileB(5);
+        a2 = fileA(5); % still calls fileA's helper after fileB loaded!
+        assert(a1 == 6 && b1 == 50 && a2 == 6);
+        assert(fhA(9) == 10);
+
+        % Calling private local helper from outside must fail
+        local_err = 0;
+        try
+            helper(5);
+        catch
+            local_err = 1;
+        end
+        assert(local_err == 1);
+
+        % Private directory visible to pkg_dir/pub_fn.m, hidden from outside & other_dir
+        addpath('pkg_dir', 'other_dir');
+        assert(pub_fn(8) == 50);
+        priv_err = 0;
+        try
+            secret_val();
+        catch
+            priv_err = 1;
+        end
+        assert(priv_err == 1);
+        other_priv_err = 0;
+        try
+            try_priv();
+        catch
+            other_priv_err = 1;
+        end
+        assert(other_priv_err == 1);
+
+        % Filename stem beats internal function name
+        assert(renamed_fact(5) == 120);
+
+        % Bare script execution in caller workspace
+        setup_vars;
+        assert(alpha == 11 && beta == 33);
+
+        % Cross-file class inheritance & @ClassName folder separate method file
+        addpath('oop_lib');
+        ch = ChildItem(7);
+        assert(ch.baseVal() == 14);
+        bv = BoxVal(20);
+        assert(bv.addN(5) == 25);
+        assert(addN(bv, 3) == 23);
+
+        % addpath (prepend), addpath('-end'), rmpath, genpath, which, exist
+        addpath('p1');
+        assert(shadow() == 1);
+        assert(strcmp(which('shadow'), 'p1/shadow.m'));
+        addpath('p2'); % prepends p2 ahead of p1
+        assert(shadow() == 2);
+        assert(strcmp(which('shadow'), 'p2/shadow.m'));
+        rmpath('p2');
+        assert(shadow() == 1);
+        addpath('p2', '-end');
+        assert(shadow() == 1);
+
+        gp = genpath('tree');
+        assert(contains(gp, 'tree/sub'));
+        assert(~contains(gp, 'private'));
+        addpath(gp);
+        assert(deep_fn(10) == 17);
+        assert(exist('deep_fn') == 2);
+
+        % Bottom-of-script local function (MATLAB R2016b+)
+        assert(bottom_sq(6) == 36);
+        function r = bottom_sq(x)
+            r = x * x;
+        end
+        "#,
+    )
+    .unwrap();
+
+    // 7. Hot-reload when a VFS .m file is modified (without vm.clear())
+    vm.mount_file("dyn_fn.m", "function y = dyn_fn(); y = 100; end\n")
+        .unwrap();
+    vm.eval("assert(dyn_fn() == 100);").unwrap();
+    vm.mount_file("dyn_fn.m", "function y = dyn_fn(); y = 200; end\n")
+        .unwrap();
+    vm.eval("assert(dyn_fn() == 200);").unwrap();
+
+    // 8. eval_file: sibling & private/ resolution without addpath + 0-arg function auto-invocation
+    vm.mount_file("proj/sibling.m", "function y = sibling(x); y = x + 3; end\n")
+        .unwrap();
+    vm.mount_file(
+        "proj/private/priv_mul.m",
+        "function y = priv_mul(x); y = x * 4; end\n",
+    )
+    .unwrap();
+    let entry_src = r#"
+        function out = entry_main()
+            out = priv_mul(sibling(7));
+            fprintf('entry_out=%d\n', out);
+        end
+    "#;
+    let out = vm
+        .eval_file(Some("proj/entry_main.m"), entry_src, true)
+        .unwrap();
+    assert!(out.stdout.contains("entry_out=40"));
+    assert_eq!(out.last_value.unwrap().as_scalar().unwrap(), 40.0);
+}

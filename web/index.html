@@ -779,11 +779,16 @@ ylabel('Magnitude (dB)');
       },
       vfs: {
         files: {
-          "lib/hypotenuse.m": "function h = hypotenuse(a, b)\n  h = sqrt(a.^2 + b.^2);\nend\n"
+          "lib/hypotenuse.m": "function h = hypotenuse(a, b)\n  h = scale_val(sqrt(a.^2 + b.^2));\nend\n\nfunction y = scale_val(x)\n  y = x;\nend\n",
+          "lib/private/secret_offset.m": "function k = secret_offset()\n  k = 100;\nend\n",
+          "lib/shifted_norm.m": "function v = shifted_norm(a, b)\n  v = hypotenuse(a, b) + secret_offset() + scale_val(2);\nend\n\nfunction y = scale_val(x)\n  y = x * 10;\nend\n"
         },
-        code: `% Multi-file VFS auto-loading, logical masks, try/catch, and solvers
-addpath('lib');
-fprintf('hypotenuse(3, 4) from lib/hypotenuse.m = %.2f\\n', hypotenuse(3, 4));
+        code: `% Multi-file function resolution: addpath(genpath), private/, file-local subfunctions, which()
+addpath(genpath('lib'));
+fprintf('which(hypotenuse) = %s\\n', which('hypotenuse'));
+fprintf('hypotenuse(3, 4)  = %.2f\\n', hypotenuse(3, 4));
+fprintf('shifted_norm(3,4) = %.2f (uses lib/private/secret_offset.m + isolated local scale_val)\\n', ...
+    shifted_norm(3, 4));
 
 % Logical mask indexing
 v = [-4, -1, 0, 2, 5, -3];
@@ -832,6 +837,7 @@ end
     let running = false;
     // path -> { kind: "text", data: string } | { kind: "bytes", data: Uint8Array }
     let mountedFiles = {};
+    let activeFilePath = "";
     let msgId = 0;
 
     function isTextFile(path) {
@@ -898,6 +904,7 @@ end
             li.className = "clickable";
             li.title = "Click to open in editor";
             li.addEventListener("click", () => {
+              activeFilePath = f;
               editor.value = entry.data;
               statusEl.textContent = `Opened ${f}`;
             });
@@ -971,12 +978,17 @@ end
         return;
       }
       consoleEl.innerHTML = "";
+      if (activeFilePath && mountedFiles[activeFilePath] && mountedFiles[activeFilePath].kind === "text") {
+        mountedFiles[activeFilePath] = { kind: "text", data: editor.value };
+        postMount(activeFilePath, mountedFiles[activeFilePath]);
+      }
       setRunning(true);
-      worker.postMessage({ id: ++msgId, type: "run_script", code: editor.value });
+      worker.postMessage({ id: ++msgId, type: "run_script", path: activeFilePath, code: editor.value });
     }
 
     function loadPreset(key) {
       const p = PRESETS[key];
+      activeFilePath = "";
       editor.value = p.code;
       mountedFiles = {};
       for (const [path, content] of Object.entries(p.files)) {
@@ -1019,6 +1031,7 @@ end
           mFiles.find((f) => isScriptSource(f.text)) ||
           (mFiles.length === 1 ? mFiles[0] : null);
         if (chosen) {
+          activeFilePath = chosen.path;
           editor.value = chosen.text;
           statusEl.textContent = `Loaded ${chosen.path}`;
           if (isScriptSource(chosen.text)) {

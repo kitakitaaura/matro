@@ -36,6 +36,7 @@ export interface PlotFigureJson {
 
 export class MatroSession {
   eval(code: string): EvalResult;
+  evalFile(path: string, code: string): EvalResult;
   disasm(code: string): EvalResult;
   mountFile(path: string, content: string): EvalResult;
   mountBytes(path: string, bytes: Uint8Array | ArrayBuffer): EvalResult;

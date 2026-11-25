@@ -18,7 +18,7 @@ self.onmessage = async (e) => {
     if (msg.type === "run_script") {
       rt.reset();
       const t0 = performance.now();
-      const res = rt.eval(msg.code);
+      const res = rt.evalFile(msg.path || "", msg.code);
       const dt = performance.now() - t0;
       const dis = rt.disasm(msg.code);
       self.postMessage({

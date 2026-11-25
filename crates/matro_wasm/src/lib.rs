@@ -154,6 +154,42 @@ pub unsafe extern "C" fn matro_eval(ptr: *const u8, len: usize) -> i32 {
     })
 }
 
+/// Evaluate a UTF-8 MATLAB/Octave file with active-file path context (enables sibling & `private/` resolution,
+/// and automatically invokes a 0-argument primary function file).
+/// Returns `0` on success or `1` on error.
+///
+/// # Safety
+/// Both pointer/length pairs must point to valid UTF-8 bytes in Wasm linear memory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn matro_eval_file(
+    path_ptr: *const u8,
+    path_len: usize,
+    src_ptr: *const u8,
+    src_len: usize,
+) -> i32 {
+    let p_bytes = unsafe { slice::from_raw_parts(path_ptr, path_len) };
+    let s_bytes = unsafe { slice::from_raw_parts(src_ptr, src_len) };
+    let (Ok(path), Ok(src)) = (std::str::from_utf8(p_bytes), std::str::from_utf8(s_bytes)) else {
+        set_output("Invalid UTF-8 input");
+        return 1;
+    };
+    let opt_path = if path.trim().is_empty() {
+        None
+    } else {
+        Some(path)
+    };
+    SESSION.with(|vm| match vm.borrow_mut().eval_file(opt_path, src, true) {
+        Ok(out) => {
+            set_output(&out.stdout);
+            0
+        }
+        Err(err) => {
+            set_output(&err.to_string());
+            1
+        }
+    })
+}
+
 /// Compile a UTF-8 MATLAB/Octave snippet and place its bytecode disassembly in the output buffer.
 ///
 /// # Safety

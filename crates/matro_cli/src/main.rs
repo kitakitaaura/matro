@@ -131,12 +131,12 @@ fn main() {
         return;
     }
 
-    let (src, script_dir) = if eval_mode {
+    let (src, script_path, script_dir) = if eval_mode {
         let Some(code) = positional.first() else {
             eprintln!("Error: expected code string after -e");
             process::exit(1);
         };
-        (code.clone(), None)
+        (code.clone(), None, None)
     } else {
         let Some(path) = positional.first() else {
             run_repl();
@@ -149,7 +149,7 @@ fn main() {
                     .and_then(|p| p.to_str())
                     .filter(|s| !s.is_empty())
                     .map(String::from);
-                (s, dir)
+                (s, Some(path.clone()), dir)
             }
             Err(e) => {
                 eprintln!("Error reading '{path}': {e}");
@@ -160,6 +160,7 @@ fn main() {
 
     run_source(
         &src,
+        script_path.as_deref(),
         script_dir.as_deref(),
         svg_out.as_deref(),
         mat_out.as_deref(),
@@ -168,6 +169,7 @@ fn main() {
 
 fn run_source(
     src: &str,
+    script_path: Option<&str>,
     script_dir: Option<&str>,
     svg_out: Option<&str>,
     mat_out: Option<&str>,
@@ -176,7 +178,12 @@ fn run_source(
     if let Some(dir) = script_dir {
         vm.add_path(dir);
     }
-    match vm.eval(src) {
+    let res = if script_path.is_some() {
+        vm.eval_file(script_path, src, true)
+    } else {
+        vm.eval(src)
+    };
+    match res {
         Ok(out) => {
             if !out.stdout.is_empty() {
                 print!("{}", out.stdout);

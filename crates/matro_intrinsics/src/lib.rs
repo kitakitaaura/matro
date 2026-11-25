@@ -364,6 +364,9 @@ pub fn call_intrinsic(
 
         // VFS & module path helpers
         "addpath" => fn_addpath(args, ctx.loader),
+        "rmpath" => fn_rmpath(args, ctx.loader),
+        "genpath" => fn_genpath(args, ctx.loader),
+        "path" => fn_path(args, ctx.loader),
         "csvread" => fn_csvread(args, ctx.loader),
         "csvwrite" => fn_csvwrite(args, ctx.loader),
         "fileread" => fn_fileread(args, ctx.loader),
@@ -1833,10 +1836,76 @@ pub fn format_printf(args: &[Value]) -> Result<String> {
 }
 
 fn fn_addpath(args: &[Value], loader: &mut ModuleLoader) -> Result<Vec<Value>> {
+    let prev = loader
+        .search_paths()
+        .iter()
+        .filter(|d| !d.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(":");
+    let mut at_end = false;
+    let mut dirs: Vec<&str> = Vec::new();
     for a in args {
-        loader.add_path(a.as_str()?);
+        let s = a.as_str()?;
+        match s {
+            "-end" | "-END" => at_end = true,
+            "-begin" | "-BEGIN" | "-frozen" => {}
+            _ => dirs.push(s),
+        }
     }
-    Ok(vec![])
+    if at_end {
+        for d in dirs {
+            loader.add_path_end(d);
+        }
+    } else {
+        for d in dirs.into_iter().rev() {
+            loader.add_path(d);
+        }
+    }
+    ok1(Value::String(prev))
+}
+
+fn fn_rmpath(args: &[Value], loader: &mut ModuleLoader) -> Result<Vec<Value>> {
+    let prev = loader
+        .search_paths()
+        .iter()
+        .filter(|d| !d.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(":");
+    for a in args {
+        loader.rm_path(a.as_str()?);
+    }
+    ok1(Value::String(prev))
+}
+
+fn fn_genpath(args: &[Value], loader: &ModuleLoader) -> Result<Vec<Value>> {
+    let root = if let Some(a) = args.first() {
+        a.as_str()?.to_string()
+    } else {
+        loader.vfs().cwd()
+    };
+    let dirs = loader.gen_path(&root);
+    ok1(Value::String(dirs.join(":")))
+}
+
+fn fn_path(args: &[Value], loader: &mut ModuleLoader) -> Result<Vec<Value>> {
+    if let Some(a) = args.first() {
+        let new_p = a.as_str()?;
+        loader.reset_search_paths();
+        loader.add_path_end(new_p);
+        if let Some(b) = args.get(1) {
+            loader.add_path_end(b.as_str()?);
+        }
+    }
+    let out = loader
+        .search_paths()
+        .iter()
+        .filter(|d| !d.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(":");
+    ok1(Value::String(out))
 }
 
 fn fn_csvread(args: &[Value], loader: &ModuleLoader) -> Result<Vec<Value>> {

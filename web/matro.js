@@ -44,6 +44,18 @@ export class MatroRuntime {
     return this._callWithString(this.exports.matro_eval, code);
   }
 
+  evalFile(path, code) {
+    if (typeof this.exports.matro_eval_file !== "function") {
+      return this.eval(code);
+    }
+    const p = this._allocStr(path || "");
+    const c = this._allocStr(code);
+    const status = this.exports.matro_eval_file(p.ptr, p.len, c.ptr, c.len);
+    this.exports.matro_free(p.ptr, p.len);
+    this.exports.matro_free(c.ptr, c.len);
+    return { ok: status === 0, output: this._readOutput() };
+  }
+
   disasm(code) {
     return this._callWithString(this.exports.matro_disasm, code);
   }

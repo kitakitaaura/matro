@@ -134,6 +134,8 @@ pub struct FunctionProto {
     pub arg_specs: Vec<CompiledArgSpec>,
     /// Names of all local slots `0..local_names.len()` (for disassembly & closure capture).
     pub local_names: Vec<String>,
+    /// Normalized VFS path of the `.m` file defining this function (for file-local & `private/` resolution).
+    pub source_file: Option<String>,
     pub chunk: Chunk,
 }
 
@@ -154,6 +156,8 @@ pub struct ClassProto {
     pub static_methods: Vec<String>,
     pub enumerations: Vec<(String, Vec<Chunk>)>,
     pub events: Vec<String>,
+    /// Normalized VFS path of the `.m` file defining this class.
+    pub source_file: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -210,6 +214,34 @@ impl Chunk {
     pub fn add_field_path(&mut self, path: Vec<String>) -> u32 {
         self.field_paths.push(path);
         (self.field_paths.len() - 1) as u32
+    }
+
+    /// Recursively stamp `source_file` on all functions, nested functions, closures, and class methods in this chunk.
+    pub fn set_source_file(&mut self, path: &str) {
+        for f in &mut self.functions {
+            f.source_file = Some(path.to_string());
+            f.chunk.set_source_file(path);
+        }
+        for c in &mut self.classes {
+            c.source_file = Some(path.to_string());
+            for m in &mut c.methods {
+                m.source_file = Some(path.to_string());
+                m.chunk.set_source_file(path);
+            }
+        }
+    }
+
+    /// True if this chunk contains only `DefineFunc` / `DefineClass` and a trailing `Return` (a function or classdef file).
+    pub fn is_definition_only(&self) -> bool {
+        let mut saw_def = false;
+        for op in &self.code {
+            match op {
+                OpCode::DefineFunc(_) | OpCode::DefineClass(_) => saw_def = true,
+                OpCode::Return => {}
+                _ => return false,
+            }
+        }
+        saw_def
     }
 
     /// Format a human-readable disassembly of this bytecode chunk (with source line numbers).

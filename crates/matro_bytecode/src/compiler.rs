@@ -37,8 +37,16 @@ impl Compiler {
             outer_locals: HashSet::new(),
             has_nested: false,
         };
+        // Hoist top-level function and classdef definitions (MATLAB R2016b+ allows local functions at bottom of scripts)
         for stmt in &program.statements {
-            compiler.compile_stmt(stmt)?;
+            if matches!(stmt.kind, StmtKind::Function { .. } | StmtKind::ClassDef { .. }) {
+                compiler.compile_stmt(stmt)?;
+            }
+        }
+        for stmt in &program.statements {
+            if !matches!(stmt.kind, StmtKind::Function { .. } | StmtKind::ClassDef { .. }) {
+                compiler.compile_stmt(stmt)?;
+            }
         }
         compiler.chunk.emit(OpCode::Return, 0);
         Ok(compiler.chunk)
@@ -335,6 +343,7 @@ impl Compiler {
             has_nested: sub.has_nested,
             arg_specs,
             local_names: sub.local_names,
+            source_file: None,
             chunk: sub.chunk,
         })
     }
@@ -1067,6 +1076,7 @@ impl Compiler {
                     static_methods,
                     enumerations: compiled_enums,
                     events: events.clone(),
+                    source_file: None,
                 });
                 self.chunk.emit(OpCode::DefineClass(idx), line);
             }
@@ -1266,6 +1276,7 @@ impl Compiler {
                     has_nested: false,
                     arg_specs: Vec::new(),
                     local_names: sub.local_names,
+                    source_file: None,
                     chunk: sub.chunk,
                 };
                 let idx = self.chunk.add_function(proto);

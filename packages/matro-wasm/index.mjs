@@ -38,6 +38,16 @@ export class MatroSession {
     return this._callWithString(this.exports.matro_eval, code);
   }
 
+  /** Evaluate MATLAB/Octave file source with active-file path context (sibling & private/ resolution, auto-invokes 0-arg primary functions). */
+  evalFile(path, code) {
+    const p = this._allocStr(path || "");
+    const c = this._allocStr(code);
+    const status = this.exports.matro_eval_file(p.ptr, p.len, c.ptr, c.len);
+    this.exports.matro_free(p.ptr, p.len);
+    this.exports.matro_free(c.ptr, c.len);
+    return { ok: status === 0, output: this._readOutput() };
+  }
+
   /** Disassemble MATLAB/Octave source into Matro bytecode without executing it. */
   disasm(code) {
     return this._callWithString(this.exports.matro_disasm, code);

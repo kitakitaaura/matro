@@ -44,8 +44,54 @@ pub trait Vfs: Debug {
     }
 
     fn list_files(&self) -> Vec<String>;
+    fn list_dirs(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn is_empty_fs(&self) -> bool {
+        false
+    }
     fn remove(&mut self, path: &str);
     fn clear(&mut self);
+}
+
+/// Parent directory of a normalized VFS path (empty string for root-level files).
+pub fn parent_dir(path: &str) -> String {
+    let norm = MemoryVfs::normalize(path);
+    match norm.rfind('/') {
+        Some(pos) => norm[..pos].to_string(),
+        None => String::new(),
+    }
+}
+
+/// Filename stem (without directory or `.m` extension).
+pub fn file_stem(path: &str) -> String {
+    let norm = MemoryVfs::normalize(path);
+    let base = match norm.rfind('/') {
+        Some(pos) => &norm[pos + 1..],
+        None => norm.as_str(),
+    };
+    base.strip_suffix(".m").unwrap_or(base).to_string()
+}
+
+/// Join a normalized directory (possibly empty for root) and a relative path.
+pub fn join_dir(dir: &str, rel: &str) -> String {
+    let d = MemoryVfs::normalize(dir);
+    let r = MemoryVfs::normalize(rel);
+    if d.is_empty() {
+        r
+    } else if r.is_empty() {
+        d
+    } else {
+        format!("{d}/{r}")
+    }
+}
+
+/// Result of resolving a `.m` function, script, or class file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModule {
+    pub path: String,
+    pub dir: String,
+    pub is_private: bool,
 }
 
 /// Pure in-memory virtual filesystem (default for Wasm & embedded sessions).
@@ -75,8 +121,14 @@ impl Vfs for MemoryVfs {
 
     fn write_bytes(&mut self, path: &str, data: &[u8]) -> Result<()> {
         let key = Self::normalize(path);
-        if let Some(pos) = key.rfind('/') {
-            self.dirs.insert(key[..pos].to_string());
+        let mut cur = key.as_str();
+        while let Some(pos) = cur.rfind('/') {
+            let parent = &cur[..pos];
+            if parent.is_empty() {
+                break;
+            }
+            self.dirs.insert(parent.to_string());
+            cur = parent;
         }
         self.files.insert(key, data.to_vec());
         Ok(())
@@ -135,6 +187,14 @@ impl Vfs for MemoryVfs {
 
     fn list_files(&self) -> Vec<String> {
         self.files.keys().cloned().collect()
+    }
+
+    fn list_dirs(&self) -> Vec<String> {
+        self.dirs.iter().cloned().collect()
+    }
+
+    fn is_empty_fs(&self) -> bool {
+        self.files.is_empty()
     }
 
     fn remove(&mut self, path: &str) {
@@ -215,6 +275,37 @@ impl Vfs for OsVfs {
         out
     }
 
+    fn list_dirs(&self) -> Vec<String> {
+        let mut out: BTreeSet<String> = self.overlay.list_dirs().into_iter().collect();
+        fn walk_os(dir: &std::path::Path, prefix: &str, out: &mut BTreeSet<String>, depth: usize) {
+            if depth > 12 {
+                return;
+            }
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if p.is_dir() {
+                    if let Some(name) = ent.file_name().to_str() {
+                        if name.starts_with('.') {
+                            continue;
+                        }
+                        let rel = if prefix.is_empty() {
+                            name.to_string()
+                        } else {
+                            format!("{prefix}/{name}")
+                        };
+                        out.insert(rel.clone());
+                        walk_os(&p, &rel, out, depth + 1);
+                    }
+                }
+            }
+        }
+        walk_os(std::path::Path::new("."), "", &mut out, 0);
+        out.into_iter().collect()
+    }
+
     fn remove(&mut self, path: &str) {
         self.overlay.remove(path);
         let _ = std::fs::remove_file(path);
@@ -231,6 +322,7 @@ pub struct ModuleLoader {
     vfs: Box<dyn Vfs>,
     search_paths: Vec<String>,
     cache: HashMap<String, Chunk>,
+    resolve_cache: HashMap<(Option<String>, String), Option<ResolvedModule>>,
 }
 
 impl Default for ModuleLoader {
@@ -245,6 +337,7 @@ impl ModuleLoader {
             vfs,
             search_paths: vec![String::new()],
             cache: HashMap::new(),
+            resolve_cache: HashMap::new(),
         }
     }
 
@@ -254,28 +347,101 @@ impl ModuleLoader {
 
     pub fn vfs_mut(&mut self) -> &mut dyn Vfs {
         self.cache.clear();
+        self.resolve_cache.clear();
         self.vfs.as_mut()
     }
 
     pub fn mount_file(&mut self, path: &str, content: &str) -> Result<()> {
         self.cache.clear();
+        self.resolve_cache.clear();
         self.vfs.write_string(path, content)
     }
 
     pub fn mount_bytes(&mut self, path: &str, data: &[u8]) -> Result<()> {
         self.cache.clear();
+        self.resolve_cache.clear();
         self.vfs.write_bytes(path, data)
     }
 
-    pub fn add_path(&mut self, dir: &str) {
-        let clean = MemoryVfs::normalize(dir);
-        if !self.search_paths.contains(&clean) {
-            self.search_paths.push(clean);
+    /// Prepend one or more (`:` / `;` separated) directories to the front of MATLAB's search path.
+    pub fn add_path(&mut self, dirs: &str) {
+        self.resolve_cache.clear();
+        let parts: Vec<String> = dirs
+            .split([':', ';'])
+            .map(MemoryVfs::normalize)
+            .filter(|s| !s.is_empty())
+            .collect();
+        for clean in parts.into_iter().rev() {
+            self.search_paths.retain(|d| d != &clean);
+            self.search_paths.insert(0, clean);
         }
+    }
+
+    /// Append one or more (`:` / `;` separated) directories to the end of MATLAB's search path.
+    pub fn add_path_end(&mut self, dirs: &str) {
+        self.resolve_cache.clear();
+        for raw in dirs.split([':', ';']) {
+            let clean = MemoryVfs::normalize(raw);
+            if !clean.is_empty() && !self.search_paths.contains(&clean) {
+                self.search_paths.push(clean);
+            }
+        }
+    }
+
+    /// Remove one or more (`:` / `;` separated) directories from MATLAB's search path.
+    pub fn rm_path(&mut self, dirs: &str) {
+        self.resolve_cache.clear();
+        for raw in dirs.split([':', ';']) {
+            let clean = MemoryVfs::normalize(raw);
+            if !clean.is_empty() {
+                self.search_paths.retain(|d| d != &clean);
+            }
+        }
+    }
+
+    pub fn search_paths(&self) -> &[String] {
+        &self.search_paths
+    }
+
+    pub fn reset_search_paths(&mut self) {
+        self.search_paths = vec![String::new()];
+        self.resolve_cache.clear();
+    }
+
+    /// MATLAB `genpath(root)`: return `root` and all non-`private`, non-`@`, non-`+` subdirectories.
+    pub fn gen_path(&self, root: &str) -> Vec<String> {
+        let norm_root = MemoryVfs::normalize(root);
+        let is_excluded = |d: &str| -> bool {
+            d.split('/').any(|seg| {
+                seg == "private" || seg.starts_with('@') || seg.starts_with('+') || seg.starts_with('.')
+            })
+        };
+        let mut out = Vec::new();
+        if !norm_root.is_empty() && !is_excluded(&norm_root) && self.vfs.is_dir(&norm_root) {
+            out.push(norm_root.clone());
+        }
+        let prefix = if norm_root.is_empty() {
+            String::new()
+        } else {
+            format!("{norm_root}/")
+        };
+        for d in self.vfs.list_dirs() {
+            let dn = MemoryVfs::normalize(&d);
+            if dn.is_empty() || is_excluded(&dn) {
+                continue;
+            }
+            if norm_root.is_empty() || dn.starts_with(&prefix) {
+                if !out.contains(&dn) {
+                    out.push(dn);
+                }
+            }
+        }
+        out
     }
 
     pub fn clear_cache(&mut self) {
         self.cache.clear();
+        self.resolve_cache.clear();
     }
 
     /// Convert a dotted package name `"a.b"` to `"+a/+b"`.
@@ -288,11 +454,15 @@ impl ModuleLoader {
             .join("/")
     }
 
-    /// Check whether a MATLAB `+package` directory exists on disk/VFS or along `search_paths`.
+    /// Check whether a MATLAB `+package` directory exists on disk/VFS, in `cwd`, or along `search_paths`.
     pub fn has_package(&self, dotted: &str) -> bool {
         let pdir = Self::package_dir(dotted);
         if pdir.is_empty() {
             return false;
+        }
+        let cwd = MemoryVfs::normalize(&self.vfs.cwd());
+        if !cwd.is_empty() && self.vfs.is_dir(&join_dir(&cwd, &pdir)) {
+            return true;
         }
         if self.vfs.is_dir(&pdir) {
             return true;
@@ -316,6 +486,13 @@ impl ModuleLoader {
             return None;
         }
         let rel = format!("{pdir}/{member}.m");
+        let cwd = MemoryVfs::normalize(&self.vfs.cwd());
+        if !cwd.is_empty() {
+            let cwd_path = join_dir(&cwd, &rel);
+            if self.vfs.exists(&cwd_path) {
+                return Some(cwd_path);
+            }
+        }
         if self.vfs.exists(&rel) {
             return Some(rel);
         }
@@ -331,16 +508,203 @@ impl ModuleLoader {
         None
     }
 
-    /// Resolve a bare module or script path across `search_paths`.
+    fn probe_dir_for_name(&self, dir: &str, name: &str) -> Option<ResolvedModule> {
+        let direct = join_dir(dir, &format!("{name}.m"));
+        if self.vfs.exists(&direct) {
+            return Some(ResolvedModule {
+                dir: parent_dir(&direct),
+                path: direct,
+                is_private: false,
+            });
+        }
+        let class_folder = join_dir(dir, &format!("@{name}/{name}.m"));
+        if self.vfs.exists(&class_folder) {
+            return Some(ResolvedModule {
+                dir: parent_dir(&class_folder),
+                path: class_folder,
+                is_private: false,
+            });
+        }
+        None
+    }
+
+    /// Resolve a `private/<name>.m` helper scoped strictly to `caller_dir`.
+    pub fn resolve_private(&self, name: &str, caller_dir: &str) -> Option<ResolvedModule> {
+        if self.vfs.is_empty_fs() || name.contains('/') || name.contains('\\') || name.contains('.') {
+            return None;
+        }
+        let priv_path = join_dir(&join_dir(caller_dir, "private"), &format!("{name}.m"));
+        if self.vfs.exists(&priv_path) {
+            return Some(ResolvedModule {
+                dir: parent_dir(&priv_path),
+                path: priv_path,
+                is_private: true,
+            });
+        }
+        None
+    }
+
+    /// Resolve a function, script, or class `.m` file in full MATLAB precedence order:
+    /// 1. `<caller_dir>/private/<name>.m`
+    /// 2. `<caller_dir>/<name>.m` or `<caller_dir>/@<name>/<name>.m`
+    /// 3. `<cwd>/<name>.m` or `<cwd>/@<name>/<name>.m`
+    /// 4. `<search_paths[i]>/<name>.m` or `<search_paths[i]>/@<name>/<name>.m`
+    pub fn resolve_in_context(
+        &mut self,
+        name: &str,
+        caller_dir: Option<&str>,
+    ) -> Option<ResolvedModule> {
+        if self.vfs.is_empty_fs() || name.is_empty() {
+            return None;
+        }
+        let norm_caller = caller_dir.map(MemoryVfs::normalize);
+        let key = (norm_caller.clone(), name.to_string());
+        if let Some(cached) = self.resolve_cache.get(&key) {
+            return cached.clone();
+        }
+        let found = self.resolve_in_context_uncached(name, norm_caller.as_deref());
+        self.resolve_cache.insert(key, found.clone());
+        found
+    }
+
+    fn resolve_in_context_uncached(
+        &self,
+        name: &str,
+        caller_dir: Option<&str>,
+    ) -> Option<ResolvedModule> {
+        // Explicit relative/nested path (e.g. "sub/foo.m")
+        if name.contains('/') || name.contains('\\') || name.ends_with(".m") {
+            let target = if name.ends_with(".m") {
+                name.to_string()
+            } else {
+                format!("{name}.m")
+            };
+            if let Some(cd) = caller_dir {
+                let p = join_dir(cd, &target);
+                if self.vfs.exists(&p) {
+                    return Some(ResolvedModule {
+                        dir: parent_dir(&p),
+                        path: p,
+                        is_private: false,
+                    });
+                }
+            }
+            let cwd = MemoryVfs::normalize(&self.vfs.cwd());
+            if !cwd.is_empty() {
+                let p = join_dir(&cwd, &target);
+                if self.vfs.exists(&p) {
+                    return Some(ResolvedModule {
+                        dir: parent_dir(&p),
+                        path: p,
+                        is_private: false,
+                    });
+                }
+            }
+            let norm = MemoryVfs::normalize(&target);
+            if self.vfs.exists(&norm) {
+                return Some(ResolvedModule {
+                    dir: parent_dir(&norm),
+                    path: norm,
+                    is_private: false,
+                });
+            }
+            for dir in &self.search_paths {
+                let p = join_dir(dir, &target);
+                if self.vfs.exists(&p) {
+                    return Some(ResolvedModule {
+                        dir: parent_dir(&p),
+                        path: p,
+                        is_private: false,
+                    });
+                }
+            }
+            return None;
+        }
+
+        // 1. Caller directory's `private/` folder (highest file-resolution priority)
+        if let Some(cd) = caller_dir {
+            if let Some(m) = self.resolve_private(name, cd) {
+                return Some(m);
+            }
+            // 2. Sibling file / @Class folder in caller's directory
+            if let Some(m) = self.probe_dir_for_name(cd, name) {
+                return Some(m);
+            }
+        }
+
+        // 3. Current working directory
+        let cwd = MemoryVfs::normalize(&self.vfs.cwd());
+        if caller_dir != Some(cwd.as_str()) {
+            if let Some(m) = self.probe_dir_for_name(&cwd, name) {
+                return Some(m);
+            }
+        }
+
+        // 4. Configured `search_paths` (in MATLAB precedence order)
+        for dir in &self.search_paths {
+            if let Some(m) = self.probe_dir_for_name(dir, name) {
+                return Some(m);
+            }
+        }
+        None
+    }
+
+    /// Resolve a separate method file inside an `@ClassName/` class folder (`@ClassName/<method>.m`).
+    pub fn resolve_class_method_file(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        caller_dir: Option<&str>,
+    ) -> Option<String> {
+        if self.vfs.is_empty_fs() {
+            return None;
+        }
+        let rel = format!("@{class_name}/{method_name}.m");
+        if let Some(cd) = caller_dir {
+            let p = join_dir(cd, &rel);
+            if self.vfs.exists(&p) {
+                return Some(p);
+            }
+        }
+        let cwd = MemoryVfs::normalize(&self.vfs.cwd());
+        if !cwd.is_empty() {
+            let p = join_dir(&cwd, &rel);
+            if self.vfs.exists(&p) {
+                return Some(p);
+            }
+        }
+        if self.vfs.exists(&rel) {
+            return Some(rel);
+        }
+        for dir in &self.search_paths {
+            if dir.is_empty() {
+                continue;
+            }
+            let p = join_dir(dir, &rel);
+            if self.vfs.exists(&p) {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    /// Resolve a bare module or script path across `cwd` and `search_paths`.
     pub fn resolve_path(&self, name_or_path: &str) -> Option<String> {
         let candidates = if name_or_path.contains('.') {
             vec![name_or_path.to_string()]
         } else {
             vec![format!("{name_or_path}.m"), name_or_path.to_string()]
         };
+        let cwd = MemoryVfs::normalize(&self.vfs.cwd());
         for cand in &candidates {
+            if !cwd.is_empty() {
+                let cwd_p = join_dir(&cwd, cand);
+                if self.vfs.exists(&cwd_p) {
+                    return Some(cwd_p);
+                }
+            }
             if self.vfs.exists(cand) {
-                return Some(cand.clone());
+                return Some(MemoryVfs::normalize(cand));
             }
             for dir in &self.search_paths {
                 if dir.is_empty() {
@@ -348,11 +712,26 @@ impl ModuleLoader {
                 }
                 let joined = format!("{dir}/{cand}");
                 if self.vfs.exists(&joined) {
-                    return Some(joined);
+                    return Some(MemoryVfs::normalize(&joined));
                 }
             }
         }
         None
+    }
+
+    /// Load and compile a `.m` file at an already-resolved path (cached & stamped with `source_file`).
+    pub fn load_module_at(&mut self, resolved_path: &str) -> Result<Option<Chunk>> {
+        let key = MemoryVfs::normalize(resolved_path);
+        if let Some(chunk) = self.cache.get(&key) {
+            return Ok(Some(chunk.clone()));
+        }
+        let Some(src) = self.vfs.read_to_string(&key) else {
+            return Ok(None);
+        };
+        let mut chunk = compile(&src)?;
+        chunk.set_source_file(&key);
+        self.cache.insert(key, chunk.clone());
+        Ok(Some(chunk))
     }
 
     /// Load and compile a `.m` file by function/script name (cached by resolved path).
@@ -360,15 +739,7 @@ impl ModuleLoader {
         let Some(resolved) = self.resolve_path(name_or_path) else {
             return Ok(None);
         };
-        if let Some(chunk) = self.cache.get(&resolved) {
-            return Ok(Some(chunk.clone()));
-        }
-        let Some(src) = self.vfs.read_to_string(&resolved) else {
-            return Ok(None);
-        };
-        let chunk = compile(&src)?;
-        self.cache.insert(resolved, chunk.clone());
-        Ok(Some(chunk))
+        self.load_module_at(&resolved)
     }
 
     /// Save variables to a MATLAB Level 5 `.mat` file in the VFS.
